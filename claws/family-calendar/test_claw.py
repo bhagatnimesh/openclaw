@@ -5,8 +5,12 @@ from io import StringIO
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from claw import FamilyCalendarClaw, match_events, run_cli
-from intent import extract_intent
+from claw import FamilyCalendarClaw, _format_created_event_message, match_events, run_cli
+from intent import (
+    extract_intent,
+    read_metadata_from_description,
+    write_metadata_to_description,
+)
 from tools import DEFAULT_TIMEZONE
 
 
@@ -30,6 +34,7 @@ class FakeProvider:
     ):
         event = {
             "id": "event-123",
+            "htmlLink": "https://calendar.google.com/calendar/event?eid=event-123",
             "summary": title,
             "start": {"dateTime": start_time, "timeZone": timezone},
             "end": {"dateTime": end_time, "timeZone": timezone},
@@ -76,7 +81,41 @@ class FakeProvider:
         return event
 
 
+def _fake_event(
+    summary,
+    start,
+    end,
+    description=None,
+    location=None,
+):
+    return {
+        "id": summary.lower().replace(" ", "-"),
+        "summary": summary,
+        "start": {"dateTime": start},
+        "end": {"dateTime": end},
+        "description": description,
+        "location": location,
+    }
+
+
 class FamilyCalendarClawTest(unittest.TestCase):
+    def test_created_event_message_falls_back_to_event_id_without_link(self):
+        start = datetime(2026, 7, 3, 19, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        end = datetime(2026, 7, 3, 20, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = _format_created_event_message(
+            event_title="Dinner",
+            start=start,
+            end=end,
+            timezone=DEFAULT_TIMEZONE,
+            recurrence=None,
+            recurrence_label=None,
+            event_link=None,
+            event_id="event-123",
+        )
+
+        self.assertIn("(event id: event-123)", message)
+
     def test_create_event_from_simple_request(self):
         provider = FakeProvider()
         claw = FamilyCalendarClaw.from_provider(provider)
@@ -91,8 +130,12 @@ class FamilyCalendarClawTest(unittest.TestCase):
 
         self.assertIn("Created calendar event: Dinner", message)
         self.assertIn("Created calendar event: Dinner", output.getvalue())
+        self.assertIn("https://calendar.google.com/calendar/event?eid=event-123", message)
+        self.assertNotIn("event id:", message)
         self.assertEqual(provider.created[0]["summary"], "Dinner")
-        self.assertEqual(provider.created[0]["description"], "with Rahul")
+        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        self.assertEqual(notes, "with Rahul")
+        self.assertEqual(metadata["owner"], "unknown")
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-03T19:00:00-07:00")
         self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-03T20:00:00-07:00")
         self.assertEqual(provider.created[0]["start"]["timeZone"], DEFAULT_TIMEZONE)
@@ -111,7 +154,9 @@ class FamilyCalendarClawTest(unittest.TestCase):
             )
 
         self.assertEqual(provider.created[0]["summary"], "Great Mall shopping for India trip")
-        self.assertEqual(provider.created[0]["description"], "get some tshirts for India trip")
+        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        self.assertEqual(notes, "get some tshirts for India trip")
+        self.assertEqual(metadata["category"], "shopping")
         self.assertEqual(provider.created[0]["location"], "Great Mall")
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-03T13:00:00-07:00")
         self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-03T14:00:00-07:00")
@@ -130,7 +175,9 @@ class FamilyCalendarClawTest(unittest.TestCase):
 
         self.assertEqual(provider.created[0]["summary"], "Leave for SFO flight")
         self.assertEqual(provider.created[0]["location"], "SFO")
-        self.assertEqual(provider.created[0]["description"], "Flight from SFO at 2:00 PM")
+        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        self.assertEqual(notes, "Flight from SFO at 2:00 PM")
+        self.assertEqual(metadata["category"], "travel")
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-10T11:30:00-07:00")
         self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-10T12:30:00-07:00")
 
@@ -153,8 +200,116 @@ class FamilyCalendarClawTest(unittest.TestCase):
         with redirect_stdout(output):
             message = claw.create_event_from_request("Add appointment Friday")
 
-        self.assertEqual(message, "Please provide: time.")
+        self.assertEqual(message, "Please provide a time for Appointment on Friday, July 3.")
         self.assertEqual(provider.created, [])
+
+    def test_pickup_without_time_asks_for_time_with_parsed_event(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "Niyati picks up Navya from school on Tuesday next week",
+                reference_time=reference,
+            )
+
+        self.assertEqual(
+            message,
+            "Please provide a time for Navya school pickup on Tuesday, July 7.",
+        )
+        self.assertEqual(provider.created, [])
+
+    def test_pickup_missing_time_followup_creates_original_event(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "Niyati picks up Navya from school on Tuesday next week",
+                reference_time=reference,
+            )
+
+        self.assertEqual(
+            message,
+            "Please provide a time for Navya school pickup on Tuesday, July 7.",
+        )
+        self.assertIsNotNone(claw.pending_action)
+
+        with redirect_stdout(StringIO()):
+            handled = claw.handle_pending_response("6 PM")
+
+        self.assertTrue(handled)
+        self.assertIsNone(claw.pending_action)
+        self.assertEqual(provider.created[0]["summary"], "Navya school pickup")
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-07T18:00:00-07:00")
+        self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-07T19:00:00-07:00")
+        self.assertEqual(provider.created[0]["location"], "school")
+        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        self.assertEqual(notes, "Niyati picks up Navya from school")
+        self.assertEqual(metadata["owner"], "mom")
+        self.assertEqual(metadata["person"], "Navya")
+        self.assertEqual(metadata["category"], "school")
+
+    def test_preparation_followup_updates_last_created_event(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Kids should be picked Thursday from school at 6 PM",
+                reference_time=reference,
+            )
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "add carry snacks for the kids they will be hungry",
+                reference_time=reference,
+            )
+
+        self.assertEqual(message, "Added preparation notes to Kids should be picked from school.")
+        self.assertEqual(provider.updated[0]["id"], "event-123")
+        self.assertEqual(provider.updated[0]["summary"], "Kids should be picked from school")
+        self.assertEqual(provider.updated[0]["start"]["dateTime"], "2026-07-09T18:00:00-07:00")
+        notes, metadata = read_metadata_from_description(provider.updated[0]["description"])
+        self.assertEqual(notes, "Preparation: carry snacks for the kids they will be hungry")
+        self.assertTrue(metadata["preparation_needed"])
+        self.assertEqual(
+            metadata["preparation_notes"],
+            "carry snacks for the kids they will be hungry",
+        )
+
+    def test_context_followup_updates_last_created_event_after_preparation(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Kids should be picked Thursday from school at 8 PM",
+                reference_time=reference,
+            )
+            claw.create_event_from_request(
+                "add carry snacks for the kids they will be hungry",
+                reference_time=reference,
+            )
+            message = claw.create_event_from_request(
+                "one more thing Nysha needs to be taken to art class",
+                reference_time=reference,
+            )
+
+        self.assertEqual(message, "Added note to Kids should be picked from school.")
+        self.assertEqual(provider.updated[-1]["id"], "event-123")
+        notes, metadata = read_metadata_from_description(provider.updated[-1]["description"])
+        self.assertIn("Preparation: carry snacks for the kids they will be hungry", notes)
+        self.assertIn("Note: Nysha needs to be taken to art class", notes)
+        self.assertTrue(metadata["preparation_needed"])
+        self.assertEqual(
+            metadata["preparation_notes"],
+            "carry snacks for the kids they will be hungry",
+        )
 
     def test_create_recurring_weekday_event(self):
         provider = FakeProvider()
@@ -269,6 +424,206 @@ class FamilyCalendarClawTest(unittest.TestCase):
 
         self.assertEqual(provider.list_calls[0]["time_min"], "2026-07-02T12:00:00-07:00")
         self.assertEqual(provider.list_calls[0]["time_max"], "2026-07-09T12:00:00-07:00")
+
+    def test_list_events_filters_dad_responsibility_tomorrow(self):
+        provider = FakeProvider()
+        provider.events = [
+            {
+                "id": "nysha-dentist",
+                "summary": "Nysha dentist appointment",
+                "start": {"dateTime": "2026-07-03T15:00:00-07:00"},
+                "end": {"dateTime": "2026-07-03T16:00:00-07:00"},
+                "description": write_metadata_to_description(
+                    None,
+                    {
+                        "owner": "dad",
+                        "person": "Nysha",
+                        "category": "medical",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            },
+            {
+                "id": "navya-gymnastics",
+                "summary": "Navya gymnastics",
+                "start": {"dateTime": "2026-07-03T10:00:00-07:00"},
+                "end": {"dateTime": "2026-07-03T11:00:00-07:00"},
+                "description": write_metadata_to_description(
+                    None,
+                    {
+                        "owner": "mom",
+                        "person": "Navya",
+                        "category": "activity",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            },
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.list_events_from_request(
+                "What am I responsible for tomorrow?",
+                reference_time=reference,
+            )
+
+        self.assertIn("Nysha dentist appointment", message)
+        self.assertNotIn("Navya gymnastics", message)
+
+    def test_list_events_filters_mom_weekend(self):
+        provider = FakeProvider()
+        provider.events = [
+            {
+                "id": "dad-errand",
+                "summary": "Dad errand",
+                "start": {"dateTime": "2026-07-04T09:00:00-07:00"},
+                "end": {"dateTime": "2026-07-04T10:00:00-07:00"},
+                "description": write_metadata_to_description(
+                    None,
+                    {
+                        "owner": "dad",
+                        "person": "family",
+                        "category": "household",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            },
+            {
+                "id": "navya-gymnastics",
+                "summary": "Navya gymnastics",
+                "start": {"dateTime": "2026-07-04T10:00:00-07:00"},
+                "end": {"dateTime": "2026-07-04T11:00:00-07:00"},
+                "description": write_metadata_to_description(
+                    None,
+                    {
+                        "owner": "mom",
+                        "person": "Navya",
+                        "category": "activity",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            },
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.list_events_from_request(
+                "What is mom handling this weekend?",
+                reference_time=reference,
+            )
+
+        self.assertEqual(provider.list_calls[0]["time_min"], "2026-07-04T00:00:00-07:00")
+        self.assertEqual(provider.list_calls[0]["time_max"], "2026-07-06T00:00:00-07:00")
+        self.assertIn("Navya gymnastics", message)
+        self.assertNotIn("Dad errand", message)
+
+    def test_list_events_filters_preparation_next_week(self):
+        provider = FakeProvider()
+        provider.events = [
+            {
+                "id": "passport",
+                "summary": "Passport renewal appointment",
+                "start": {"dateTime": "2026-07-10T11:00:00-07:00"},
+                "end": {"dateTime": "2026-07-10T12:00:00-07:00"},
+                "description": write_metadata_to_description(
+                    "need documents",
+                    {
+                        "owner": "unknown",
+                        "person": "family",
+                        "category": "travel",
+                        "preparation_needed": True,
+                        "preparation_notes": "need documents",
+                    },
+                ),
+            },
+            {
+                "id": "dinner",
+                "summary": "Dinner",
+                "start": {"dateTime": "2026-07-08T19:00:00-07:00"},
+                "end": {"dateTime": "2026-07-08T20:00:00-07:00"},
+                "description": write_metadata_to_description(
+                    None,
+                    {
+                        "owner": "unknown",
+                        "person": "family",
+                        "category": "social",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            },
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.list_events_from_request(
+                "What needs preparation next week?",
+                reference_time=reference,
+            )
+
+        self.assertEqual(provider.list_calls[0]["time_min"], "2026-07-06T00:00:00-07:00")
+        self.assertEqual(provider.list_calls[0]["time_max"], "2026-07-13T00:00:00-07:00")
+        self.assertIn("Passport renewal appointment", message)
+        self.assertIn("(prep: need documents)", message)
+        self.assertNotIn("Dinner", message)
+
+    def test_list_events_for_named_pickup_adult_without_date(self):
+        provider = FakeProvider()
+        provider.events = [
+            {
+                "id": "art-pickup",
+                "summary": "Nysha art class pickup",
+                "start": {"dateTime": "2026-07-06T18:00:00-07:00"},
+                "end": {"dateTime": "2026-07-06T19:00:00-07:00"},
+                "location": "art class",
+                "description": write_metadata_to_description(
+                    "Niyati picks up Nysha from art class",
+                    {
+                        "owner": "unknown",
+                        "person": "Nysha",
+                        "category": "school",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            },
+            {
+                "id": "gymnastics",
+                "summary": "Navya gymnastics",
+                "start": {"dateTime": "2026-07-04T10:00:00-07:00"},
+                "end": {"dateTime": "2026-07-04T11:00:00-07:00"},
+                "description": write_metadata_to_description(
+                    None,
+                    {
+                        "owner": "mom",
+                        "person": "Navya",
+                        "category": "activity",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            },
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.list_events_from_request(
+                "what events are for Niyati",
+                reference_time=reference,
+            )
+
+        self.assertEqual(provider.list_calls[0]["time_min"], "2026-07-02T12:00:00-07:00")
+        self.assertEqual(provider.list_calls[0]["time_max"], "2026-08-01T12:00:00-07:00")
+        self.assertIn("Nysha art class pickup", message)
+        self.assertNotIn("Navya gymnastics", message)
 
     def test_list_events_reports_no_events(self):
         provider = FakeProvider()
@@ -930,6 +1285,264 @@ class MilestoneOneRegressionTest(unittest.TestCase):
         self.assertEqual(provider.list_calls[0]["time_min"], "2026-07-03T00:00:00-07:00")
         self.assertIn("I found this event: Leave for SFO flight", message)
         self.assertIn("Delete it? yes/no", message)
+
+    def test_next_week_family_briefing_groups_metadata_and_planning_items(self):
+        provider = FakeProvider()
+        provider.events = [
+            _fake_event(
+                "Navya school pickup",
+                "2026-07-06T18:00:00-07:00",
+                "2026-07-06T19:00:00-07:00",
+                write_metadata_to_description(
+                    "Niyati picks up Navya from school",
+                    {
+                        "owner": "mom",
+                        "person": "Navya",
+                        "category": "school",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            ),
+            _fake_event(
+                "Passport renewal appointment",
+                "2026-07-07T11:00:00-07:00",
+                "2026-07-07T12:00:00-07:00",
+                write_metadata_to_description(
+                    "Need documents",
+                    {
+                        "owner": "unknown",
+                        "person": "family",
+                        "category": "household",
+                        "preparation_needed": True,
+                        "preparation_notes": "Bring birth certificates and photos",
+                    },
+                ),
+            ),
+            _fake_event(
+                "Nysha dentist appointment",
+                "2026-07-07T11:30:00-07:00",
+                "2026-07-07T12:30:00-07:00",
+                write_metadata_to_description(
+                    "",
+                    {
+                        "owner": "dad",
+                        "person": "Nysha",
+                        "category": "medical",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            ),
+            _fake_event(
+                "Family photos",
+                "2026-07-09T10:00:00-07:00",
+                "2026-07-09T11:00:00-07:00",
+            ),
+            _fake_event(
+                "Navya art class",
+                "2026-07-09T15:00:00-07:00",
+                "2026-07-09T16:00:00-07:00",
+                write_metadata_to_description(
+                    "",
+                    {
+                        "owner": "mom",
+                        "person": "Navya",
+                        "category": "activity",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            ),
+            _fake_event(
+                "Grocery pickup",
+                "2026-07-09T17:00:00-07:00",
+                "2026-07-09T18:00:00-07:00",
+                write_metadata_to_description(
+                    "",
+                    {
+                        "owner": "dad",
+                        "person": "family",
+                        "category": "shopping",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            ),
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.briefing_from_request(
+                "What is coming up next week?",
+                reference_time=reference,
+            )
+
+        self.assertEqual(provider.list_calls[0]["time_min"], "2026-07-06T00:00:00-07:00")
+        self.assertEqual(provider.list_calls[0]["time_max"], "2026-07-13T00:00:00-07:00")
+        self.assertEqual(provider.list_calls[0]["max_results"], 100)
+        self.assertIn("Family calendar briefing for next week:", message)
+        self.assertIn(
+            "Next week has 6 events. Thursday is busiest with 3 events. "
+            "There is 1 conflict and 1 prep-needed item.",
+            message,
+        )
+        self.assertIn("Events by day:", message)
+        self.assertIn("- Monday, July 6:", message)
+        self.assertIn("Navya school pickup (mom, Navya)", message)
+        self.assertIn("Passport renewal appointment (unassigned prep needed)", message)
+        self.assertIn("Preparation-needed events:", message)
+        self.assertIn("- Passport renewal appointment: Bring birth certificates and photos", message)
+        self.assertIn("Unassigned events:", message)
+        self.assertIn("- Passport renewal appointment", message)
+        self.assertIn("Potential conflicts or busy days:", message)
+        self.assertIn(
+            "- Tuesday, July 7: Passport renewal appointment overlaps Nysha dentist appointment",
+            message,
+        )
+        self.assertIn("- Thursday, July 9: 3 events", message)
+        self.assertIn("Things to clarify:", message)
+        self.assertIn("- Who owns Passport renewal appointment?", message)
+        self.assertNotIn("- Does Family photos need preparation?", message)
+
+    def test_briefing_deduplicates_unassigned_and_caps_clarifications(self):
+        provider = FakeProvider()
+        provider.events = [
+            _fake_event(
+                "Passport renewal appointment",
+                "2026-07-06T09:00:00-07:00",
+                "2026-07-06T10:00:00-07:00",
+                write_metadata_to_description(
+                    "",
+                    {
+                        "owner": "unknown",
+                        "person": "family",
+                        "category": "travel",
+                        "preparation_needed": True,
+                        "preparation_notes": "",
+                    },
+                ),
+            ),
+            _fake_event(
+                "Nysha dentist appointment",
+                "2026-07-06T09:30:00-07:00",
+                "2026-07-06T10:30:00-07:00",
+                write_metadata_to_description(
+                    "",
+                    {
+                        "owner": "unknown",
+                        "person": "Nysha",
+                        "category": "medical",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            ),
+            _fake_event(
+                "Navya school pickup",
+                "2026-07-07T15:00:00-07:00",
+                "2026-07-07T16:00:00-07:00",
+                write_metadata_to_description(
+                    "",
+                    {
+                        "owner": "unknown",
+                        "person": "Navya",
+                        "category": "school",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            ),
+            _fake_event(
+                "Airport ride",
+                "2026-07-08T12:00:00-07:00",
+                "2026-07-08T13:00:00-07:00",
+                write_metadata_to_description(
+                    "",
+                    {
+                        "owner": "unknown",
+                        "person": "family",
+                        "category": "travel",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            ),
+            _fake_event(
+                "School form deadline",
+                "2026-07-09T08:00:00-07:00",
+                "2026-07-09T09:00:00-07:00",
+            ),
+            _fake_event(
+                "Family photos",
+                "2026-07-10T10:00:00-07:00",
+                "2026-07-10T11:00:00-07:00",
+            ),
+            _fake_event(
+                "Family photos",
+                "2026-07-10T10:00:00-07:00",
+                "2026-07-10T11:00:00-07:00",
+            ),
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.briefing_from_request(
+                "Give me next week's family calendar briefing",
+                reference_time=reference,
+            )
+
+        unassigned_section = message.split("Unassigned events:\n", 1)[1].split(
+            "\nPotential conflicts or busy days:",
+            1,
+        )[0]
+        clarify_section = message.split("Things to clarify:\n", 1)[1]
+        clarify_questions = [
+            line for line in clarify_section.splitlines() if line.startswith("- ")
+        ]
+
+        self.assertEqual(unassigned_section.count("- Family photos"), 1)
+        self.assertLessEqual(len(clarify_questions), 5)
+        self.assertIn("- Who owns Passport renewal appointment?", clarify_section)
+        self.assertIn("- What preparation is needed for Passport renewal appointment?", clarify_section)
+        self.assertIn(
+            "- Can Passport renewal appointment and Nysha dentist appointment both be covered?",
+            clarify_section,
+        )
+        self.assertNotIn("- Does Family photos need preparation?", clarify_section)
+
+    def test_briefing_accepts_schedule_summary_wording(self):
+        provider = FakeProvider()
+        provider.events = [
+            _fake_event(
+                "Navya gymnastics",
+                "2026-07-06T10:00:00-07:00",
+                "2026-07-06T11:00:00-07:00",
+                write_metadata_to_description(
+                    "",
+                    {
+                        "owner": "mom",
+                        "person": "Navya",
+                        "category": "activity",
+                        "preparation_needed": False,
+                        "preparation_notes": "",
+                    },
+                ),
+            )
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.briefing_from_request(
+                "Can you summarize our schedule next week?",
+                reference_time=reference,
+            )
+
+        self.assertIn("Family calendar briefing for next week:", message)
+        self.assertIn("Navya gymnastics (mom, Navya)", message)
 
 
 if __name__ == "__main__":

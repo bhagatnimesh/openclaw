@@ -7,7 +7,12 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from intent import extract_intent
+from intent import (
+    METADATA_MARKER,
+    extract_intent,
+    read_metadata_from_description,
+    write_metadata_to_description,
+)
 from prompts import SYSTEM_PROMPT, TOOL_GUIDANCE
 from tools import DEFAULT_TIMEZONE, CalendarProvider, CalendarTools, build_default_tools
 
@@ -31,6 +36,11 @@ RRULE_WEEKDAY_LABELS = {
     "SA": "Saturday",
     "SU": "Sunday",
 }
+
+BUSY_DAY_EVENT_COUNT = 3
+MAX_BRIEFING_CLARIFICATIONS = 5
+PREP_RELEVANT_CATEGORIES = {"travel", "medical", "school", "shopping"}
+CHILD_NAMES = {"nysha", "navya", "kids", "children"}
 
 
 def _parse_event_time(value: str | None) -> datetime | None:
@@ -89,6 +99,35 @@ def _event_match_text(event: dict[str, Any]) -> str:
             if part
         )
     )
+
+
+def _event_matches_metadata_filter(
+    event: dict[str, Any],
+    metadata_filter: dict[str, Any],
+) -> bool:
+    if not metadata_filter:
+        return True
+
+    _, metadata = read_metadata_from_description(event.get("description"))
+    owner = metadata_filter.get("owner")
+    if owner is not None:
+        event_owner = metadata.get("owner")
+        if event_owner not in (owner, "both"):
+            return False
+
+    preparation_needed = metadata_filter.get("preparation_needed")
+    if preparation_needed is not None and metadata.get("preparation_needed") != preparation_needed:
+        return False
+
+    person = metadata_filter.get("person")
+    if person is not None and metadata.get("person") != person:
+        text_query = metadata_filter.get("text_query")
+        if text_query is None:
+            return False
+        if _normalize_match_text(str(text_query)) not in _event_match_text(event):
+            return False
+
+    return True
 
 
 def _expanded_query_terms(query: str) -> set[str]:
@@ -167,6 +206,241 @@ def _format_event_choice(event: dict[str, Any]) -> str:
     return f"{title}: {start_label} to {end_label}{location_suffix}"
 
 
+def _event_end(event: dict[str, Any]) -> datetime:
+    end = event.get("end", {})
+    parsed = _parse_event_time(end.get("dateTime"))
+    if parsed is not None:
+        return parsed
+
+    parsed_date = _parse_event_time(end.get("date"))
+    return parsed_date or datetime.max
+
+
+def _has_metadata(description: str | None) -> bool:
+    return bool(description and METADATA_MARKER in description)
+
+
+def _owner_label(owner: str) -> str:
+    labels = {
+        "dad": "dad",
+        "mom": "mom",
+        "both": "both",
+        "unknown": "unassigned",
+    }
+    return labels.get(owner, "unassigned")
+
+
+def _format_briefing_event(event: dict[str, Any]) -> str:
+    title = event.get("summary") or "Untitled event"
+    start_label = _format_event_time(event.get("start", {}))
+    end_label = _format_event_time(event.get("end", {}))
+    _, metadata = read_metadata_from_description(event.get("description"))
+    owner = _owner_label(str(metadata.get("owner") or "unknown"))
+    person = metadata.get("person")
+    person_suffix = f", {person}" if person and person != "family" else ""
+    prep_suffix = " prep needed" if metadata.get("preparation_needed") else ""
+    return f"{start_label}-{end_label} {title} ({owner}{person_suffix}{prep_suffix})"
+
+
+def _briefing_event_key(event: dict[str, Any]) -> tuple[str, str, str, str]:
+    title = event.get("summary") or "Untitled event"
+    start = _event_start(event)
+    day_label = start.strftime("%Y-%m-%d") if start != datetime.max else "unscheduled"
+    start_label = _format_event_time(event.get("start", {}))
+    end_label = _format_event_time(event.get("end", {}))
+    return (_normalize_match_text(title), day_label, start_label, end_label)
+
+
+def _briefing_category(event: dict[str, Any], metadata: dict[str, Any]) -> str:
+    category = str(metadata.get("category") or "")
+    if category:
+        return category
+
+    text = _event_match_text(event)
+    hints = {
+        "travel": ("flight", "airport", "passport", "visa", "trip", "travel"),
+        "medical": ("doctor", "dentist", "dental", "medical", "therapy"),
+        "school": ("school", "class", "teacher", "homework", "pickup"),
+        "shopping": ("shopping", "shop", "buy", "store", "grocery"),
+        "activity": ("gymnastics", "soccer", "piano", "practice", "game"),
+        "social": ("dinner", "party", "birthday", "playdate", "meet"),
+        "household": ("trash", "repair", "clean", "house", "home"),
+    }
+    for inferred, words in hints.items():
+        if any(re.search(rf"\b{re.escape(word)}s?\b", text) for word in words):
+            return inferred
+
+    return ""
+
+
+def _is_child_related(event: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    person = str(metadata.get("person") or "").lower()
+    if person in CHILD_NAMES:
+        return True
+
+    text = _event_match_text(event)
+    return any(re.search(rf"\b{re.escape(name)}\b", text) for name in CHILD_NAMES)
+
+
+def _clarification_score(
+    event: dict[str, Any],
+    metadata: dict[str, Any],
+) -> int:
+    score = 0
+    if metadata.get("preparation_needed") and metadata.get("owner") == "unknown":
+        score += 100
+    if _is_child_related(event, metadata):
+        score += 30
+    if _briefing_category(event, metadata) in PREP_RELEVANT_CATEGORIES:
+        score += 20
+    if metadata.get("owner") == "unknown":
+        score += 10
+    return score
+
+
+def _briefing_summary_sentence(
+    label: str,
+    event_count: int,
+    busiest_day: tuple[str, int] | None,
+    prep_count: int,
+    conflict_count: int,
+) -> str:
+    display_label = label[:1].upper() + label[1:]
+    event_word = "event" if event_count == 1 else "events"
+    conflict_word = "conflict" if conflict_count == 1 else "conflicts"
+    prep_word = "item" if prep_count == 1 else "items"
+    if busiest_day is None:
+        busiest = "No day is busy."
+    else:
+        busy_word = "event" if busiest_day[1] == 1 else "events"
+        busiest = f"{busiest_day[0].split(',')[0]} is busiest with {busiest_day[1]} {busy_word}."
+    return (
+        f"{display_label} has {event_count} {event_word}. {busiest} "
+        f"There {'is' if conflict_count == 1 else 'are'} {conflict_count} "
+        f"{conflict_word} and {prep_count} prep-needed {prep_word}."
+    )
+
+
+def _format_briefing(
+    events: list[dict[str, Any]],
+    label: str,
+) -> str:
+    if not events:
+        return f"Family calendar briefing for {label}:\nNo calendar events found."
+
+    sorted_events = sorted(events, key=_event_start)
+    events_by_day: dict[str, list[dict[str, Any]]] = {}
+    for event in sorted_events:
+        start = _event_start(event)
+        day_label = start.strftime("%A, %B %-d") if start != datetime.max else "Unscheduled"
+        events_by_day.setdefault(day_label, []).append(event)
+
+    prep_events = []
+    unassigned_events: dict[tuple[str, str, str, str], str] = {}
+    clarify_candidates: list[tuple[int, str, str]] = []
+    for event in sorted_events:
+        title = event.get("summary") or "Untitled event"
+        description = event.get("description")
+        _, metadata = read_metadata_from_description(description)
+        category = _briefing_category(event, metadata)
+        if metadata.get("preparation_needed"):
+            prep_note = metadata.get("preparation_notes") or "needs preparation"
+            prep_events.append(f"- {title}: {prep_note}")
+        if metadata.get("owner") == "unknown":
+            unassigned_events.setdefault(_briefing_event_key(event), f"- {title}")
+            owner_score = _clarification_score(event, metadata)
+            clarify_candidates.append((owner_score, f"owner:{title}", f"- Who owns {title}?"))
+        if not _has_metadata(description) and category in PREP_RELEVANT_CATEGORIES:
+            clarify_candidates.append(
+                (
+                    _clarification_score(event, metadata) - 1,
+                    f"prep:{title}",
+                    f"- Does {title} need preparation?",
+                )
+            )
+        elif metadata.get("preparation_needed") and not metadata.get("preparation_notes"):
+            clarify_candidates.append(
+                (
+                    _clarification_score(event, metadata) + 20,
+                    f"prep-notes:{title}",
+                    f"- What preparation is needed for {title}?",
+                )
+            )
+
+    conflicts = []
+    conflict_questions = []
+    busy_days = []
+    for day_label, day_events in events_by_day.items():
+        if len(day_events) >= BUSY_DAY_EVENT_COUNT:
+            busy_days.append(f"- {day_label}: {len(day_events)} events")
+        ordered = sorted(day_events, key=_event_start)
+        for previous, current in zip(ordered, ordered[1:]):
+            previous_end = _event_end(previous)
+            current_start = _event_start(current)
+            if previous_end != datetime.max and current_start < previous_end:
+                previous_title = previous.get("summary") or "Untitled event"
+                current_title = current.get("summary") or "Untitled event"
+                conflicts.append(f"- {day_label}: {previous_title} overlaps {current_title}")
+                conflict_questions.append(
+                    (
+                        80,
+                        f"conflict:{day_label}:{previous_title}:{current_title}",
+                        f"- Can {previous_title} and {current_title} both be covered?",
+                    )
+                )
+
+    clarify_candidates.extend(conflict_questions)
+    seen_questions = set()
+    clarify_items = []
+    for _, key, question in sorted(
+        clarify_candidates,
+        key=lambda item: (-item[0], item[1]),
+    ):
+        if key in seen_questions:
+            continue
+        seen_questions.add(key)
+        clarify_items.append(question)
+        if len(clarify_items) == MAX_BRIEFING_CLARIFICATIONS:
+            break
+
+    busiest_day = None
+    if events_by_day:
+        busiest_day = max(events_by_day.items(), key=lambda item: len(item[1]))
+        busiest_day = (busiest_day[0], len(busiest_day[1]))
+
+    lines = [
+        f"Family calendar briefing for {label}:",
+        _briefing_summary_sentence(
+            label,
+            len(sorted_events),
+            busiest_day,
+            len(prep_events),
+            len(conflicts),
+        ),
+        "Events by day:",
+    ]
+
+    for day_label, day_events in events_by_day.items():
+        lines.append(f"- {day_label}:")
+        for event in day_events:
+            lines.append(f"  - {_format_briefing_event(event)}")
+
+    lines.append("Preparation-needed events:")
+    lines.extend(prep_events or ["- None"])
+
+    lines.append("Unassigned events:")
+    lines.extend(list(unassigned_events.values()) or ["- None"])
+
+    lines.append("Potential conflicts or busy days:")
+    risk_items = conflicts + busy_days
+    lines.extend(risk_items or ["- None"])
+
+    lines.append("Things to clarify:")
+    lines.extend(clarify_items or ["- None"])
+
+    return "\n".join(lines)
+
+
 def _format_confirmation_event(event: dict[str, Any]) -> str:
     title = event.get("summary") or "Untitled event"
     start = _event_start(event)
@@ -204,9 +478,13 @@ def _format_created_event_message(
     timezone: str,
     recurrence: list[str] | None,
     recurrence_label: str | None,
+    event_link: str | None,
     event_id: str | None,
 ) -> str:
-    id_suffix = f" (event id: {event_id})" if event_id else ""
+    if event_link:
+        event_suffix = f" (open: {event_link})"
+    else:
+        event_suffix = f" (event id: {event_id})" if event_id else ""
     rrule = _parse_rrule_parts(recurrence)
     count = int(rrule["COUNT"]) if rrule.get("COUNT", "").isdigit() else None
     weekday = RRULE_WEEKDAY_LABELS.get(rrule.get("BYDAY", ""))
@@ -218,7 +496,7 @@ def _format_created_event_message(
             f"{start.strftime('%A, %B %-d')} through "
             f"{final_date.strftime('%A, %B %-d')}, {count} occurrences, "
             f"{start.strftime('%-I:%M %p')}–{end.strftime('%-I:%M %p')} "
-            f"{timezone}{id_suffix}."
+            f"{timezone}{event_suffix}."
         )
 
     recurrence_suffix = ""
@@ -227,8 +505,119 @@ def _format_created_event_message(
     return (
         f"Created calendar event: {event_title} on "
         f"{start.strftime('%A, %B %-d')} from {start.strftime('%-I:%M %p')} "
-        f"to {end.strftime('%-I:%M %p')} {timezone}{recurrence_suffix}{id_suffix}."
+        f"to {end.strftime('%-I:%M %p')} {timezone}{recurrence_suffix}{event_suffix}."
     )
+
+
+def _format_missing_create_message(intent: dict[str, Any], missing: list[str]) -> str:
+    if missing == ["time"] and intent.get("title") and intent.get("date"):
+        timezone = intent.get("timezone") or DEFAULT_TIMEZONE
+        event_date = datetime.fromisoformat(f"{intent['date']}T00:00:00")
+        event_date = event_date.replace(tzinfo=ZoneInfo(timezone))
+        return (
+            f"Please provide a time for {intent['title']} on "
+            f"{event_date.strftime('%A, %B %-d')}."
+        )
+
+    return "Please provide: " + ", ".join(missing) + "."
+
+
+def _merge_create_intent(
+    pending: dict[str, Any],
+    followup: dict[str, Any],
+) -> dict[str, Any]:
+    merged = deepcopy(pending)
+    for field in ("title", "date", "start_time", "location", "description"):
+        if not merged.get(field) and followup.get(field):
+            merged[field] = followup[field]
+    if followup.get("duration_minutes") and not merged.get("duration_minutes"):
+        merged["duration_minutes"] = followup["duration_minutes"]
+
+    missing_fields = []
+    if merged.get("title") is None:
+        missing_fields.append("title")
+    if merged.get("date") is None:
+        missing_fields.append("date")
+    if merged.get("start_time") is None:
+        missing_fields.append("time")
+    merged["missing_fields"] = missing_fields
+    return merged
+
+
+def _extract_preparation_followup(request: str) -> str | None:
+    cleaned = request.strip().lstrip("> ").strip().strip(".")
+    cleaned = re.sub(r"^(?:please\s+)?(?:also\s+)?add\s+", "", cleaned, flags=re.IGNORECASE)
+    if not re.search(r"\b(?:carry|bring|pack|prepare|need|snacks?|documents?)\b", cleaned, re.IGNORECASE):
+        return None
+
+    return cleaned[:1].lower() + cleaned[1:] if cleaned else None
+
+
+def _append_preparation_note(existing_notes: str, preparation_note: str) -> str:
+    line = f"Preparation: {preparation_note}"
+    if not existing_notes:
+        return line
+    if line.lower() in existing_notes.lower():
+        return existing_notes
+    return f"{existing_notes}\n{line}"
+
+
+def _extract_context_followup(request: str) -> str | None:
+    cleaned = request.strip().lstrip("> ").strip().strip(".")
+    patterns = (
+        r"^(?:one\s+more\s+thing|also|another\s+thing)[:,]?\s+",
+        r"^(?:please\s+)?(?:add|capture|remember)\s+(?:a\s+)?(?:note|context)\s+",
+        r"^(?:note|context|fyi|remember)[:,]?\s+",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+        if match is None:
+            continue
+
+        note = cleaned[match.end() :].strip()
+        return note[:1].upper() + note[1:] if note else None
+
+    return None
+
+
+def _is_likely_recent_event_context(request: str) -> bool:
+    cleaned = request.strip().lstrip("> ").strip().strip(".")
+    lowered = cleaned.lower()
+    if re.search(
+        r"\b(?:date|time|when|what|where|who|which|cancel|delete|remove|move|reschedule|change)\b",
+        lowered,
+    ):
+        return False
+
+    if re.search(
+        r"\b(?:also|another|note|context|remember|fyi|add|include|kids?|children|nysha|navya|"
+        r"needs?|should|hungry|snacks?|art class|school)\b",
+        lowered,
+    ):
+        return True
+
+    return False
+
+
+def _extract_recent_event_context_followup(request: str) -> str | None:
+    explicit = _extract_context_followup(request)
+    if explicit is not None:
+        return explicit
+    if not _is_likely_recent_event_context(request):
+        return None
+
+    cleaned = request.strip().lstrip("> ").strip().strip(".")
+    cleaned = re.sub(r"^(?:please\s+)?(?:add|include)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned[:1].upper() + cleaned[1:] if cleaned else None
+
+
+def _append_context_note(existing_notes: str, context_note: str) -> str:
+    line = f"Note: {context_note}"
+    if not existing_notes:
+        return line
+    if line.lower() in existing_notes.lower():
+        return existing_notes
+    return f"{existing_notes}\n{line}"
 
 
 @dataclass
@@ -251,6 +640,7 @@ class FamilyCalendarClaw:
     system_prompt: str = SYSTEM_PROMPT
     tool_guidance: str = TOOL_GUIDANCE
     pending_action: PendingAction | None = None
+    last_created_event: dict[str, Any] | None = None
 
     @classmethod
     def from_provider(cls, provider: CalendarProvider) -> "FamilyCalendarClaw":
@@ -284,10 +674,35 @@ class FamilyCalendarClaw:
         intent = extract_intent(request, now=reference_time)
         missing = intent.get("missing_fields", [])
         if missing:
-            message = "Please provide: " + ", ".join(missing) + "."
+            preparation_note = _extract_preparation_followup(request)
+            if preparation_note is not None and self.last_created_event is not None:
+                message = self._add_preparation_to_event(
+                    self.last_created_event,
+                    preparation_note,
+                )
+                print(message)
+                return message
+
+            context_note = _extract_recent_event_context_followup(request)
+            if context_note is not None and self.last_created_event is not None:
+                message = self._add_context_to_event(
+                    self.last_created_event,
+                    context_note,
+                )
+                print(message)
+                return message
+
+            self.pending_action = PendingAction(action="create", payload=intent)
+            message = _format_missing_create_message(intent, missing)
             print(message)
             return message
 
+        return self._create_event_from_intent(intent)
+
+    def _create_event_from_intent(
+        self,
+        intent: dict[str, Any],
+    ) -> str:
         timezone = intent.get("timezone") or DEFAULT_TIMEZONE
         start = datetime.fromisoformat(f"{intent['date']}T{intent['start_time']}:00")
         start = start.replace(tzinfo=ZoneInfo(timezone))
@@ -297,7 +712,10 @@ class FamilyCalendarClaw:
             start_time=start.isoformat(),
             end_time=end.isoformat(),
             timezone=timezone,
-            description=intent.get("description"),
+            description=write_metadata_to_description(
+                intent.get("description"),
+                intent.get("metadata"),
+            ),
             location=intent.get("location"),
             recurrence=intent.get("recurrence"),
         )
@@ -307,7 +725,9 @@ class FamilyCalendarClaw:
             return message
 
         event = response.get("data", {}).get("event", {})
+        self.last_created_event = event
         event_title = event.get("summary", intent["title"])
+        event_link = event.get("htmlLink")
         event_id = event.get("id")
         message = _format_created_event_message(
             event_title=event_title,
@@ -316,10 +736,85 @@ class FamilyCalendarClaw:
             timezone=timezone,
             recurrence=intent.get("recurrence"),
             recurrence_label=intent.get("recurrence_label"),
+            event_link=event_link,
             event_id=event_id,
         )
         print(message)
         return message
+
+    def _add_preparation_to_event(
+        self,
+        event: dict[str, Any],
+        preparation_note: str,
+    ) -> str:
+        event_id = event.get("id")
+        start = event.get("start", {})
+        end = event.get("end", {})
+        start_time = start.get("dateTime")
+        end_time = end.get("dateTime")
+        if not event_id or not start_time or not end_time:
+            return "I could not update the previous event because it is missing Google Calendar details."
+
+        notes, metadata = read_metadata_from_description(event.get("description"))
+        metadata["preparation_needed"] = True
+        metadata["preparation_notes"] = preparation_note
+        description = write_metadata_to_description(
+            _append_preparation_note(notes, preparation_note),
+            metadata,
+        )
+        response = self.tools.update_calendar_event(
+            event_id=event_id,
+            title=event.get("summary") or "Untitled event",
+            start_time=start_time,
+            end_time=end_time,
+            timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
+            description=description,
+            location=event.get("location"),
+        )
+        if response["status"] != "ok":
+            return response["message"]
+
+        updated = deepcopy(event)
+        updated.update(response.get("data", {}).get("event", {}))
+        updated["description"] = description
+        self.last_created_event = updated
+        return f"Added preparation notes to {updated.get('summary') or 'the previous event'}."
+
+    def _add_context_to_event(
+        self,
+        event: dict[str, Any],
+        context_note: str,
+    ) -> str:
+        event_id = event.get("id")
+        start = event.get("start", {})
+        end = event.get("end", {})
+        start_time = start.get("dateTime")
+        end_time = end.get("dateTime")
+        if not event_id or not start_time or not end_time:
+            return "I could not update the previous event because it is missing Google Calendar details."
+
+        notes, metadata = read_metadata_from_description(event.get("description"))
+        description = write_metadata_to_description(
+            _append_context_note(notes, context_note),
+            metadata,
+        )
+        response = self.tools.update_calendar_event(
+            event_id=event_id,
+            title=event.get("summary") or "Untitled event",
+            start_time=start_time,
+            end_time=end_time,
+            timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
+            description=description,
+            location=event.get("location"),
+        )
+        if response["status"] != "ok":
+            return response["message"]
+
+        updated = deepcopy(event)
+        updated.update(response.get("data", {}).get("event", {}))
+        updated["description"] = description
+        self.last_created_event = updated
+        return f"Added note to {updated.get('summary') or 'the previous event'}."
 
     def list_events_from_request(
         self,
@@ -346,7 +841,14 @@ class FamilyCalendarClaw:
             return message
 
         events = sorted(
-            response.get("data", {}).get("events", []),
+            (
+                event
+                for event in response.get("data", {}).get("events", [])
+                if _event_matches_metadata_filter(
+                    event,
+                    intent.get("metadata_filter", {}),
+                )
+            ),
             key=_event_start,
         )
         if not events:
@@ -355,6 +857,7 @@ class FamilyCalendarClaw:
             return message
 
         lines = ["Calendar events:"]
+        metadata_filter = intent.get("metadata_filter", {})
         for event in events:
             title = event.get("summary") or "Untitled event"
             start_part = event.get("start", {})
@@ -363,9 +866,40 @@ class FamilyCalendarClaw:
             end_label = _format_event_time(end_part)
             location = event.get("location")
             location_suffix = f" at {location}" if location else ""
-            lines.append(f"- {title}: {start_label} to {end_label}{location_suffix}")
+            metadata_suffix = ""
+            if metadata_filter.get("preparation_needed") is True:
+                _, metadata = read_metadata_from_description(event.get("description"))
+                preparation_notes = metadata.get("preparation_notes")
+                if preparation_notes:
+                    metadata_suffix = f" (prep: {preparation_notes})"
+            lines.append(
+                f"- {title}: {start_label} to {end_label}{location_suffix}{metadata_suffix}"
+            )
 
         message = "\n".join(lines)
+        print(message)
+        return message
+
+    def briefing_from_request(
+        self,
+        request: str,
+        reference_time: datetime | None = None,
+    ) -> str:
+        intent = extract_intent(request, now=reference_time)
+        response = self.tools.list_calendar_events(
+            time_min=intent["start"],
+            time_max=intent["end"],
+            max_results=100,
+        )
+        if response["status"] != "ok":
+            message = response["message"]
+            print(message)
+            return message
+
+        message = _format_briefing(
+            response.get("data", {}).get("events", []),
+            intent.get("label", "this week"),
+        )
         print(message)
         return message
 
@@ -584,8 +1118,25 @@ class FamilyCalendarClaw:
 
         pending = self.pending_action
         if command in ("no", "n", "cancel"):
+            if pending.action == "create":
+                self.pending_action = None
+                print("Okay, I did not create anything.")
+                return True
             self.pending_action = None
             print("Okay, I did not delete anything.")
+            return True
+
+        if pending.action == "create":
+            followup = extract_intent(response)
+            merged = _merge_create_intent(pending.payload or {}, followup)
+            missing = merged.get("missing_fields", [])
+            if missing:
+                self.pending_action = PendingAction(action="create", payload=merged)
+                print(_format_missing_create_message(merged, missing))
+                return True
+
+            self.pending_action = None
+            self._create_event_from_intent(merged)
             return True
 
         if pending.choices is not None and command.isdigit():
@@ -654,7 +1205,9 @@ def run_cli(claw: FamilyCalendarClaw | None = None) -> None:
             continue
 
         intent = extract_intent(command)
-        if intent["intent"] == "list_events":
+        if intent["intent"] == "family_briefing":
+            active_claw.briefing_from_request(command)
+        elif intent["intent"] == "list_events":
             active_claw.list_events_from_request(command)
         elif intent["intent"] == "delete_event":
             active_claw.delete_event_from_request(command)

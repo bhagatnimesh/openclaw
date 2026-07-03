@@ -2,7 +2,12 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from intent import DEFAULT_TIMEZONE, extract_intent
+from intent import (
+    DEFAULT_TIMEZONE,
+    extract_intent,
+    read_metadata_from_description,
+    write_metadata_to_description,
+)
 
 
 class IntentExtractionTest(unittest.TestCase):
@@ -101,7 +106,76 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(intent["intent"], "list_events")
         self.assertEqual(intent["start"], "2026-07-03T00:00:00-07:00")
         self.assertEqual(intent["end"], "2026-07-04T00:00:00-07:00")
+        self.assertEqual(intent["metadata_filter"], {})
         self.assertEqual(intent["missing_fields"], [])
+
+    def test_list_responsibility_filter_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("What am I responsible for tomorrow?", now=now)
+
+        self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(intent["start"], "2026-07-03T00:00:00-07:00")
+        self.assertEqual(intent["metadata_filter"], {"owner": "dad"})
+
+    def test_list_mom_weekend_filter_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("What is mom handling this weekend?", now=now)
+
+        self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(intent["start"], "2026-07-04T00:00:00-07:00")
+        self.assertEqual(intent["end"], "2026-07-06T00:00:00-07:00")
+        self.assertEqual(intent["metadata_filter"], {"owner": "mom"})
+
+    def test_list_preparation_next_week_filter_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("What needs preparation next week?", now=now)
+
+        self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(intent["start"], "2026-07-06T00:00:00-07:00")
+        self.assertEqual(intent["end"], "2026-07-13T00:00:00-07:00")
+        self.assertEqual(intent["metadata_filter"], {"preparation_needed": True})
+
+    def test_this_week_briefing_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Give me this week's family calendar briefing", now=now)
+
+        self.assertEqual(intent["intent"], "family_briefing")
+        self.assertEqual(intent["start"], "2026-06-29T00:00:00-07:00")
+        self.assertEqual(intent["end"], "2026-07-06T00:00:00-07:00")
+        self.assertEqual(intent["label"], "this week")
+
+    def test_plan_this_week_briefing_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("What should we plan for this week?", now=now)
+
+        self.assertEqual(intent["intent"], "family_briefing")
+        self.assertEqual(intent["start"], "2026-06-29T00:00:00-07:00")
+        self.assertEqual(intent["label"], "this week")
+
+    def test_next_week_briefing_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("What is coming up next week?", now=now)
+
+        self.assertEqual(intent["intent"], "family_briefing")
+        self.assertEqual(intent["start"], "2026-07-06T00:00:00-07:00")
+        self.assertEqual(intent["end"], "2026-07-13T00:00:00-07:00")
+        self.assertEqual(intent["label"], "next week")
+
+    def test_next_week_schedule_summary_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Can you summarize our schedule next week?", now=now)
+
+        self.assertEqual(intent["intent"], "family_briefing")
+        self.assertEqual(intent["start"], "2026-07-06T00:00:00-07:00")
+        self.assertEqual(intent["end"], "2026-07-13T00:00:00-07:00")
+        self.assertEqual(intent["label"], "next week")
 
     def test_delete_event_intent(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -149,6 +223,116 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(intent["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SA"])
         self.assertEqual(intent["recurrence_label"], "every Saturday")
         self.assertEqual(intent["missing_fields"], [])
+
+    def test_nysha_dentist_metadata(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add Nysha dentist appointment tomorrow at 3pm, I will take her",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Nysha dentist appointment")
+        self.assertEqual(intent["date"], "2026-07-03")
+        self.assertEqual(intent["start_time"], "15:00")
+        self.assertEqual(intent["metadata"]["owner"], "dad")
+        self.assertEqual(intent["metadata"]["person"], "Nysha")
+        self.assertEqual(intent["metadata"]["category"], "medical")
+        self.assertFalse(intent["metadata"]["preparation_needed"])
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_navya_gymnastics_metadata(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add Navya gymnastics every Saturday at 10am, mom will take her",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Navya gymnastics")
+        self.assertEqual(intent["date"], "2026-07-04")
+        self.assertEqual(intent["start_time"], "10:00")
+        self.assertEqual(intent["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SA"])
+        self.assertEqual(intent["metadata"]["owner"], "mom")
+        self.assertEqual(intent["metadata"]["person"], "Navya")
+        self.assertEqual(intent["metadata"]["category"], "activity")
+        self.assertFalse(intent["metadata"]["preparation_needed"])
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_passport_renewal_metadata(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add passport renewal appointment next Friday at 11am, need documents",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Passport renewal appointment")
+        self.assertEqual(intent["date"], "2026-07-03")
+        self.assertEqual(intent["start_time"], "11:00")
+        self.assertEqual(intent["description"], "need documents")
+        self.assertEqual(intent["metadata"]["owner"], "unknown")
+        self.assertEqual(intent["metadata"]["person"], "family")
+        self.assertEqual(intent["metadata"]["category"], "travel")
+        self.assertTrue(intent["metadata"]["preparation_needed"])
+        self.assertEqual(intent["metadata"]["preparation_notes"], "need documents")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_pickup_phrase_metadata_and_title(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Niyati picks up Nysha on Monday at 6 PM from art class",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Nysha art class pickup")
+        self.assertEqual(intent["date"], "2026-07-06")
+        self.assertEqual(intent["start_time"], "18:00")
+        self.assertEqual(intent["location"], "art class")
+        self.assertEqual(intent["description"], "Niyati picks up Nysha from art class")
+        self.assertEqual(intent["metadata"]["owner"], "mom")
+        self.assertEqual(intent["metadata"]["person"], "Nysha")
+        self.assertEqual(intent["metadata"]["category"], "school")
+        self.assertFalse(intent["metadata"]["preparation_needed"])
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_named_person_query_defaults_to_next_thirty_days(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("what events are for Niyati", now=now)
+
+        self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(intent["start"], "2026-07-02T12:00:00-07:00")
+        self.assertEqual(intent["end"], "2026-08-01T12:00:00-07:00")
+        self.assertEqual(
+            intent["metadata_filter"],
+            {"person": "Niyati", "text_query": "Niyati"},
+        )
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_metadata_description_helpers_preserve_notes(self):
+        description = write_metadata_to_description(
+            "Buy T-shirts for India trip.",
+            {
+                "owner": "dad",
+                "person": "family",
+                "category": "shopping",
+                "preparation_needed": False,
+                "preparation_notes": "",
+            },
+        )
+
+        notes, metadata = read_metadata_from_description(description)
+
+        self.assertEqual(notes, "Buy T-shirts for India trip.")
+        self.assertIn("N4OS_METADATA:", description)
+        self.assertEqual(metadata["owner"], "dad")
+        self.assertEqual(metadata["category"], "shopping")
 
     def test_recurring_natural_order_with_count(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))

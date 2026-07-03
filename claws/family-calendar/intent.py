@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
+import json
 import re
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -28,9 +29,97 @@ WEEKDAY_RRULE_CODES = {
     "sunday": "SU",
 }
 
+METADATA_MARKER = "N4OS_METADATA:"
+
+DEFAULT_METADATA = {
+    "owner": "unknown",
+    "person": "family",
+    "category": "",
+    "preparation_needed": False,
+    "preparation_notes": "",
+}
+
+VALID_OWNERS = {"dad", "mom", "both", "unknown"}
+
+OWNER_NAME_ALIASES = {
+    "niyati": "mom",
+}
+
+CATEGORY_HINTS = {
+    "school": ("school", "pickup", "class", "teacher", "homework"),
+    "medical": ("doctor", "dentist", "dental", "medical", "therapy"),
+    "shopping": ("shopping", "shop", "buy", "mall", "store", "tshirt", "shirt"),
+    "travel": ("flight", "airport", "passport", "visa", "trip", "travel", "sfo"),
+    "activity": ("gymnastics", "soccer", "piano", "practice", "game", "class"),
+    "social": ("dinner", "party", "birthday", "playdate", "meet", "rahul"),
+    "household": ("trash", "repair", "clean", "house", "home", "groceries"),
+}
+
 
 def _clean_spaces(value: str) -> str:
     return " ".join(value.split()).strip()
+
+
+def _clean_human_notes(description: str | None) -> str:
+    if description is None:
+        return ""
+
+    notes = description.strip()
+    if notes.lower().startswith("notes:"):
+        notes = notes[len("notes:") :].strip()
+    return notes
+
+
+def _default_metadata() -> dict[str, Any]:
+    return dict(DEFAULT_METADATA)
+
+
+def _normalize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = _default_metadata()
+    if metadata is not None:
+        normalized.update(metadata)
+
+    owner = str(normalized.get("owner") or "unknown").lower()
+    normalized["owner"] = owner if owner in VALID_OWNERS else "unknown"
+    normalized["person"] = str(normalized.get("person") or "family")
+    normalized["category"] = str(normalized.get("category") or "")
+    normalized["preparation_needed"] = bool(normalized.get("preparation_needed"))
+    normalized["preparation_notes"] = str(normalized.get("preparation_notes") or "")
+    return normalized
+
+
+def read_metadata_from_description(description: str | None) -> tuple[str, dict[str, Any]]:
+    if not description:
+        return "", _default_metadata()
+
+    marker_index = description.find(METADATA_MARKER)
+    if marker_index < 0:
+        return _clean_human_notes(description), _default_metadata()
+
+    notes = _clean_human_notes(description[:marker_index])
+    raw_metadata = description[marker_index + len(METADATA_MARKER) :].strip()
+    try:
+        parsed = json.loads(raw_metadata)
+    except json.JSONDecodeError:
+        parsed = {}
+
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    return notes, _normalize_metadata(parsed)
+
+
+def write_metadata_to_description(
+    notes: str | None,
+    metadata: dict[str, Any] | None,
+) -> str:
+    clean_notes, _ = read_metadata_from_description(notes)
+    normalized = _normalize_metadata(metadata)
+    metadata_json = json.dumps(normalized, indent=2)
+    if clean_notes:
+        return f"Notes:\n{clean_notes}\n\n{METADATA_MARKER}\n{metadata_json}"
+
+    return f"{METADATA_MARKER}\n{metadata_json}"
 
 
 def _default_now(now: datetime | None) -> datetime:
@@ -105,6 +194,10 @@ def _extract_list_range(
         saturday = _current_or_next_weekday(reference, WEEKDAYS["saturday"])
         start = _start_of_day(saturday)
         return start, start + timedelta(days=2)
+    if "next week" in lowered:
+        monday = _weekday_in_next_calendar_week(reference, WEEKDAYS["monday"])
+        start = _start_of_day(monday)
+        return start, start + timedelta(days=7)
 
     for name, weekday in WEEKDAYS.items():
         if re.search(rf"\b{name}\b", lowered):
@@ -113,6 +206,69 @@ def _extract_list_range(
             return start, start + timedelta(days=1)
 
     return None, None
+
+
+def _extract_week_briefing_range(
+    user_text: str,
+    reference: datetime,
+) -> tuple[datetime, datetime, str]:
+    lowered = user_text.lower()
+    if "next week" in lowered:
+        monday = _weekday_in_next_calendar_week(reference, WEEKDAYS["monday"])
+        start = _start_of_day(monday)
+        return start, start + timedelta(days=7), "next week"
+
+    monday = reference - timedelta(days=reference.weekday())
+    start = _start_of_day(monday)
+    return start, start + timedelta(days=7), "this week"
+
+
+def _extract_named_person_query(user_text: str) -> str | None:
+    match = re.search(
+        r"\b(?:for|about)\s+([A-Z][a-z]+)\b",
+        user_text,
+    )
+    if match is None:
+        return None
+
+    return match.group(1)
+
+
+def _extract_list_metadata_filter(user_text: str) -> dict[str, Any]:
+    lowered = user_text.lower()
+    filters: dict[str, Any] = {}
+    owner_context = re.search(
+        r"\b(?:responsible|handling|handle|taking|take|bring|drive)\b",
+        lowered,
+    )
+
+    if owner_context is not None:
+        if re.search(r"\b(?:i|me|my|am i)\b", lowered):
+            filters["owner"] = "dad"
+        elif "mom" in lowered:
+            filters["owner"] = "mom"
+        elif re.search(r"\b(?:both|we|us|parents)\b", lowered):
+            filters["owner"] = "both"
+
+    if "preparation" in lowered or "prep" in lowered or re.search(r"\bneeds?\b", lowered):
+        filters["preparation_needed"] = True
+
+    person = _extract_named_person_query(user_text)
+    if person is not None:
+        filters["person"] = person
+        filters["text_query"] = person
+
+    return filters
+
+
+def _default_list_range_for_filter(
+    reference: datetime,
+    metadata_filter: dict[str, Any],
+) -> tuple[datetime | None, datetime | None]:
+    if not metadata_filter:
+        return None, None
+
+    return reference, reference + timedelta(days=30)
 
 
 def _extract_delete_range(
@@ -357,6 +513,50 @@ def _extract_location(user_text: str) -> str | None:
     return location or None
 
 
+def _extract_pickup_parts(user_text: str) -> dict[str, str] | None:
+    match = re.search(
+        r"\b(?P<adult>[A-Z][a-z]+)\s+picks?\s+up\s+(?P<child>[A-Z][a-z]+)\b(?P<rest>.*)",
+        user_text,
+    )
+    if match is None:
+        return None
+
+    rest = match.group("rest")
+    source_match = re.search(
+        r"\bfrom\s+(?P<source>.+?)(?:\.|$)",
+        rest,
+        flags=re.IGNORECASE,
+    )
+    source = ""
+    if source_match is not None:
+        source = source_match.group("source")
+        source = re.sub(r"\bon\b.+$", "", source, flags=re.IGNORECASE)
+        source = re.sub(
+            r"\b(?:at|around)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?\b.*$",
+            "",
+            source,
+            flags=re.IGNORECASE,
+        )
+        source = _clean_spaces(source.strip(" ,"))
+
+    child = match.group("child")
+    adult = match.group("adult")
+    if source:
+        title = f"{child} {source} pickup"
+        notes = f"{adult} picks up {child} from {source}"
+    else:
+        title = f"{child} pickup"
+        notes = f"{adult} picks up {child}"
+
+    return {
+        "adult": adult,
+        "child": child,
+        "source": source,
+        "title": title,
+        "notes": notes,
+    }
+
+
 def _extract_purpose(user_text: str) -> str | None:
     match = re.search(
         r"\bto\s+((?:get|buy|shop|pick up).+?)(?:\.|$)",
@@ -413,7 +613,82 @@ def _extract_flight_description(user_text: str, location: str | None) -> str | N
     return f"Flight from {location} at {display}"
 
 
+def _extract_person(user_text: str) -> str:
+    pickup = _extract_pickup_parts(user_text)
+    if pickup is not None:
+        return pickup["child"]
+
+    match = re.search(r"\b(Nysha|Navya)\b", user_text, flags=re.IGNORECASE)
+    if match is not None:
+        return match.group(1)[:1].upper() + match.group(1)[1:].lower()
+
+    if "family" in user_text.lower():
+        return "family"
+
+    return "family"
+
+
+def _extract_owner(user_text: str) -> str:
+    pickup = _extract_pickup_parts(user_text)
+    if pickup is not None:
+        adult = pickup["adult"].lower()
+        if adult in OWNER_NAME_ALIASES:
+            return OWNER_NAME_ALIASES[adult]
+
+    lowered = user_text.lower()
+    if re.search(r"\bmom\b.+\b(?:take|handle|bring|drive|do|go)\b", lowered):
+        return "mom"
+    if re.search(r"\b(?:i|dad)\b.+\b(?:will\s+)?(?:take|handle|bring|drive|do|go)\b", lowered):
+        return "dad"
+    if re.search(r"\b(?:we|both|parents)\b.+\b(?:will\s+)?(?:take|handle|bring|drive|do|go)\b", lowered):
+        return "both"
+
+    return "unknown"
+
+
+def _infer_category(user_text: str) -> str:
+    lowered = user_text.lower()
+    for category, hints in CATEGORY_HINTS.items():
+        if any(re.search(rf"\b{re.escape(hint)}s?\b", lowered) for hint in hints):
+            return category
+
+    return ""
+
+
+def _extract_preparation_notes(user_text: str) -> str:
+    match = re.search(
+        r"\b(?:need|needs|bring|prepare)\s+(.+?)(?:\.|$)",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return ""
+
+    notes = _clean_spaces(match.group(0).strip(" ."))
+    if re.search(r"\bneed to leave\b", notes, flags=re.IGNORECASE):
+        return ""
+
+    return notes
+
+
+def _extract_metadata(user_text: str) -> dict[str, Any]:
+    preparation_notes = _extract_preparation_notes(user_text)
+    return _normalize_metadata(
+        {
+            "owner": _extract_owner(user_text),
+            "person": _extract_person(user_text),
+            "category": _infer_category(user_text),
+            "preparation_needed": bool(preparation_notes),
+            "preparation_notes": preparation_notes,
+        }
+    )
+
+
 def _title_from_text(user_text: str, location: str | None, purpose: str | None) -> str | None:
+    pickup = _extract_pickup_parts(user_text)
+    if pickup is not None:
+        return pickup["title"]
+
     lowered = user_text.lower()
     if location and "flight" in lowered and any(
         phrase in lowered
@@ -446,6 +721,20 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
     title = re.sub(r"\b(?:at|around)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bfor\s+\d+\s*(?:minute|minutes|min|hour|hours|hr|hrs)\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bnext\s+(?=monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bnext\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(
+        r"[, ]+\b(?:i|dad|mom|we|both|parents)\b.+?\b(?:will\s+)?(?:take|handle|bring|drive|do|go)\b.*$",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"[, ]+\b(?:need|needs|bring|prepare)\b.+$",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
 
     with_match = re.search(r"\bwith\s+(.+)$", title, flags=re.IGNORECASE)
     if with_match is not None:
@@ -466,6 +755,29 @@ def _is_list_request(user_text: str) -> bool:
     )
 
 
+def _is_briefing_request(user_text: str) -> bool:
+    lowered = user_text.lower().strip()
+    if "briefing" in lowered:
+        return True
+
+    has_week = "this week" in lowered or "next week" in lowered
+    if not has_week:
+        return False
+
+    briefing_words = (
+        "plan",
+        "coming up",
+        "upcoming",
+        "summary",
+        "overview",
+        "brief",
+        "schedule",
+        "calendar",
+        "look ahead",
+    )
+    return any(word in lowered for word in briefing_words)
+
+
 def _is_delete_request(user_text: str) -> bool:
     lowered = user_text.lower().strip()
     return lowered.startswith(("cancel ", "delete ", "remove "))
@@ -478,6 +790,9 @@ def _is_update_request(user_text: str) -> bool:
 
 def _list_intent(user_text: str, reference: datetime) -> dict[str, Any]:
     start, end = _extract_list_range(user_text, reference)
+    metadata_filter = _extract_list_metadata_filter(user_text)
+    if start is None or end is None:
+        start, end = _default_list_range_for_filter(reference, metadata_filter)
     missing_fields = []
     if start is None or end is None:
         missing_fields.append("date")
@@ -486,7 +801,19 @@ def _list_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         "intent": "list_events",
         "start": start.isoformat() if start is not None else None,
         "end": end.isoformat() if end is not None else None,
+        "metadata_filter": metadata_filter,
         "missing_fields": missing_fields,
+    }
+
+
+def _briefing_intent(user_text: str, reference: datetime) -> dict[str, Any]:
+    start, end, label = _extract_week_briefing_range(user_text, reference)
+    return {
+        "intent": "family_briefing",
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "label": label,
+        "missing_fields": [],
     }
 
 
@@ -609,7 +936,20 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
     purpose = _extract_purpose(user_text)
     with_description = _extract_with_description(user_text)
     flight_description = _extract_flight_description(user_text, location)
-    description = flight_description or purpose or with_description
+    pickup = _extract_pickup_parts(user_text)
+    if pickup is not None and pickup["source"]:
+        location = location or pickup["source"]
+    metadata = _extract_metadata(user_text)
+    preparation_notes = metadata["preparation_notes"]
+    pickup_notes = pickup["notes"] if pickup is not None else None
+    description = (
+        flight_description
+        or purpose
+        or with_description
+        or pickup_notes
+        or preparation_notes
+        or None
+    )
     title = _title_from_text(user_text, location, purpose)
 
     missing_fields = []
@@ -629,6 +969,7 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         "timezone": DEFAULT_TIMEZONE,
         "location": location,
         "description": description,
+        "metadata": metadata,
         "recurrence": [recurrence["rrule"]] if recurrence is not None else None,
         "recurrence_label": recurrence["label"] if recurrence is not None else None,
         "missing_fields": missing_fields,
@@ -641,6 +982,8 @@ def extract_intent(user_text: str, now: datetime | None = None) -> dict[str, Any
         return _update_intent(user_text, reference)
     if _is_delete_request(user_text):
         return _delete_intent(user_text, reference)
+    if _is_briefing_request(user_text):
+        return _briefing_intent(user_text, reference)
     if _is_list_request(user_text):
         return _list_intent(user_text, reference)
 
