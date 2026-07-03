@@ -17,6 +17,7 @@ class FakeProvider:
         timezone=DEFAULT_TIMEZONE,
         description=None,
         location=None,
+        recurrence=None,
     ):
         event = {
             "id": "created-1",
@@ -25,6 +26,7 @@ class FakeProvider:
             "end": {"dateTime": end_time, "timeZone": timezone},
             "description": description,
             "location": location,
+            "recurrence": recurrence,
         }
         self.created.append(event)
         return event

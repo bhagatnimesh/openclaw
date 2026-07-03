@@ -43,6 +43,7 @@ class GoogleCalendarProvider:
         timezone="America/Los_Angeles",
         description=None,
         location=None,
+        recurrence=None,
     ):
         event = {
             "summary": title,
@@ -61,6 +62,9 @@ class GoogleCalendarProvider:
 
         if location:
             event["location"] = location
+
+        if recurrence:
+            event["recurrence"] = recurrence
 
         return (
             self.service.events()
@@ -88,3 +92,37 @@ class GoogleCalendarProvider:
             calendarId=self.calendar_id,
             eventId=event_id,
         ).execute()
+
+    def update_event(
+        self,
+        event_id,
+        title,
+        start_time,
+        end_time,
+        timezone="America/Los_Angeles",
+        description=None,
+        location=None,
+    ):
+        event = {
+            "summary": title,
+            "start": {
+                "dateTime": start_time,
+                "timeZone": timezone,
+            },
+            "end": {
+                "dateTime": end_time,
+                "timeZone": timezone,
+            },
+        }
+
+        if description:
+            event["description"] = description
+
+        if location:
+            event["location"] = location
+
+        return (
+            self.service.events()
+            .update(calendarId=self.calendar_id, eventId=event_id, body=event)
+            .execute()
+        )

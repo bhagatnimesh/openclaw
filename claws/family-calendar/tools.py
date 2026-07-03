@@ -22,6 +22,7 @@ class CalendarProvider(Protocol):
         timezone: str = DEFAULT_TIMEZONE,
         description: str | None = None,
         location: str | None = None,
+        recurrence: list[str] | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -34,6 +35,18 @@ class CalendarProvider(Protocol):
         ...
 
     def delete_event(self, event_id: str) -> None:
+        ...
+
+    def update_event(
+        self,
+        event_id: str,
+        title: str,
+        start_time: str,
+        end_time: str,
+        timezone: str = DEFAULT_TIMEZONE,
+        description: str | None = None,
+        location: str | None = None,
+    ) -> dict[str, Any]:
         ...
 
 
@@ -86,6 +99,7 @@ class CalendarTools:
         timezone: str | None = DEFAULT_TIMEZONE,
         description: str | None = None,
         location: str | None = None,
+        recurrence: list[str] | None = None,
     ) -> ToolResponse:
         missing_fields: list[str] = []
         cleaned_title = _clean_optional(title)
@@ -109,6 +123,7 @@ class CalendarTools:
             timezone=_clean_optional(timezone) or DEFAULT_TIMEZONE,
             description=_clean_optional(description),
             location=_clean_optional(location),
+            recurrence=recurrence,
         )
         return {
             "status": "ok",
@@ -155,6 +170,49 @@ class CalendarTools:
             "status": "ok",
             "message": "Calendar event deleted.",
             "data": {"event_id": cleaned_event_id},
+        }
+
+    def update_calendar_event(
+        self,
+        event_id: str | None = None,
+        title: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        timezone: str | None = DEFAULT_TIMEZONE,
+        description: str | None = None,
+        location: str | None = None,
+    ) -> ToolResponse:
+        missing_fields: list[str] = []
+        cleaned_event_id = _clean_optional(event_id)
+        cleaned_title = _clean_optional(title)
+        cleaned_start = _clean_optional(start_time)
+        cleaned_end = _clean_optional(end_time)
+
+        if cleaned_event_id is None:
+            missing_fields.append("event_id")
+        if cleaned_title is None:
+            missing_fields.append("title")
+        if cleaned_start is None:
+            missing_fields.append("start_time")
+        if cleaned_end is None:
+            missing_fields.append("end_time")
+
+        if missing_fields:
+            return _missing_response(missing_fields)
+
+        event = self.provider.update_event(
+            event_id=cleaned_event_id,
+            title=cleaned_title,
+            start_time=cleaned_start,
+            end_time=cleaned_end,
+            timezone=_clean_optional(timezone) or DEFAULT_TIMEZONE,
+            description=_clean_optional(description),
+            location=_clean_optional(location),
+        )
+        return {
+            "status": "ok",
+            "message": "Calendar event updated.",
+            "data": {"event": event},
         }
 
 
