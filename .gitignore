@@ -275,3 +275,5 @@ secrets/
 .venv/
 __pycache__/
 *.pyc
+
+.env
