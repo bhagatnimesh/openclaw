@@ -133,10 +133,41 @@ class IntentExtractionTest(unittest.TestCase):
 
         intent = extract_intent("What needs preparation next week?", now=now)
 
-        self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(intent["intent"], "preparation_checklist")
         self.assertEqual(intent["start"], "2026-07-06T00:00:00-07:00")
         self.assertEqual(intent["end"], "2026-07-13T00:00:00-07:00")
-        self.assertEqual(intent["metadata_filter"], {"preparation_needed": True})
+        self.assertEqual(intent["label"], "next week")
+        self.assertIsNone(intent["query"])
+
+    def test_prepare_for_specific_event_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Prepare me for passport renewal", now=now)
+
+        self.assertEqual(intent["intent"], "preparation_checklist")
+        self.assertEqual(intent["start"], "2026-07-02T12:00:00-07:00")
+        self.assertEqual(intent["end"], "2026-08-01T12:00:00-07:00")
+        self.assertEqual(intent["label"], "upcoming")
+        self.assertEqual(intent["query"], "passport renewal")
+
+    def test_action_this_week_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("What needs action this week?", now=now)
+
+        self.assertEqual(intent["intent"], "preparation_checklist")
+        self.assertEqual(intent["start"], "2026-06-29T00:00:00-07:00")
+        self.assertEqual(intent["end"], "2026-07-06T00:00:00-07:00")
+        self.assertEqual(intent["label"], "this week")
+        self.assertIsNone(intent["query"])
+
+    def test_before_trip_preparation_query_intent(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("What do we need to do before the India trip?", now=now)
+
+        self.assertEqual(intent["intent"], "preparation_checklist")
+        self.assertEqual(intent["query"], "India trip")
 
     def test_this_week_briefing_intent(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))

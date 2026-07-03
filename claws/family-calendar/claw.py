@@ -40,6 +40,16 @@ RRULE_WEEKDAY_LABELS = {
 BUSY_DAY_EVENT_COUNT = 3
 MAX_BRIEFING_CLARIFICATIONS = 5
 PREP_RELEVANT_CATEGORIES = {"travel", "medical", "school", "shopping"}
+CHECKLIST_PREP_CATEGORIES = {
+    "activity",
+    "birthday",
+    "social",
+    "travel",
+    "medical",
+    "school",
+    "paperwork",
+    "appointment",
+}
 CHILD_NAMES = {"nysha", "navya", "kids", "children"}
 
 
@@ -95,6 +105,26 @@ def _event_match_text(event: dict[str, Any]) -> str:
                 event.get("summary"),
                 event.get("description"),
                 event.get("location"),
+            )
+            if part
+        )
+    )
+
+
+def _preparation_match_text(event: dict[str, Any]) -> str:
+    notes, metadata = read_metadata_from_description(event.get("description"))
+    metadata_text = " ".join(
+        str(value)
+        for key, value in metadata.items()
+        if key in ("category", "preparation_notes", "person") and value
+    )
+    return _normalize_match_text(
+        " ".join(
+            str(part)
+            for part in (
+                event.get("summary"),
+                notes,
+                metadata_text,
             )
             if part
         )
@@ -271,6 +301,41 @@ def _briefing_category(event: dict[str, Any], metadata: dict[str, Any]) -> str:
             return inferred
 
     return ""
+
+
+def _preparation_categories(
+    event: dict[str, Any],
+    metadata: dict[str, Any],
+) -> set[str]:
+    categories = set()
+    category = str(metadata.get("category") or "")
+    if category and category != "social":
+        categories.add(category)
+
+    text = _preparation_match_text(event)
+    hints = {
+        "travel": ("flight", "airport", "passport", "visa", "trip", "travel"),
+        "medical": ("doctor", "dentist", "dental", "medical", "therapy", "clinic"),
+        "school": ("school", "class", "teacher", "homework", "pickup", "field trip"),
+        "paperwork": ("paperwork", "document", "documents", "form", "forms", "renewal"),
+        "activity": ("gymnastics", "soccer", "piano", "practice", "game", "gear"),
+        "birthday": ("birthday", "party", "cake", "gift"),
+        "social": ("party", "playdate", "rsvp"),
+        "appointment": ("appointment", "appt", "reservation"),
+    }
+    for inferred, words in hints.items():
+        if any(re.search(rf"\b{re.escape(word)}s?\b", text) for word in words):
+            categories.add(inferred)
+
+    return categories
+
+
+def _is_shopping_preparation_event(event: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    category = str(metadata.get("category") or "")
+    text = _preparation_match_text(event)
+    return category == "shopping" or bool(
+        re.search(r"\b(?:shopping|shop|buy|store|mall|tshirts?|shirts?)\b", text)
+    )
 
 
 def _is_child_related(event: dict[str, Any], metadata: dict[str, Any]) -> bool:
@@ -620,6 +685,248 @@ def _append_context_note(existing_notes: str, context_note: str) -> str:
     return f"{existing_notes}\n{line}"
 
 
+def _format_preparation_header(event: dict[str, Any]) -> str:
+    title = event.get("summary") or "Untitled event"
+    start = _event_start(event)
+    if start == datetime.max:
+        return f"{title} — unscheduled"
+
+    start_part = event.get("start", {})
+    if start_part.get("dateTime"):
+        return f"{title} — {start.strftime('%A %-I:%M %p')}"
+
+    return f"{title} — {start.strftime('%A')} all day"
+
+
+def _format_preparation_note(preparation_notes: str) -> str | None:
+    cleaned = preparation_notes.strip()
+    if not cleaned:
+        return None
+
+    action = _note_action(cleaned)
+    if action is not None:
+        return action
+
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def _note_action(preparation_notes: str) -> str | None:
+    notes = _normalize_match_text(preparation_notes)
+    if not notes:
+        return None
+    if "document" in notes:
+        return "Gather required documents"
+    if "form" in notes:
+        return "Complete required forms"
+    if "snack" in notes:
+        return "Pack snacks"
+    if "gift" in notes:
+        return "Buy or wrap gift"
+    if "passport" in notes or "visa" in notes:
+        return "Check passport and visa documents"
+    if notes.startswith("need "):
+        return f"Handle {preparation_notes[5:].strip()}"
+    if notes.startswith("bring "):
+        return f"Bring {preparation_notes[6:].strip()}"
+    if notes.startswith("pack "):
+        return f"Pack {preparation_notes[5:].strip()}"
+
+    return preparation_notes[:1].upper() + preparation_notes[1:]
+
+
+def _category_actions(categories: set[str], note_action: str | None) -> list[str]:
+    actions = []
+    has_explicit_documents = note_action == "Gather required documents"
+    if "appointment" in categories:
+        actions.append("Confirm appointment")
+    if "travel" in categories and "appointment" not in categories:
+        actions.extend(
+            [
+                "Pack essentials",
+                "Check travel documents",
+                "Confirm transport",
+                "Check weather",
+                "Pack medicines",
+            ]
+        )
+    if "medical" in categories:
+        actions.extend(
+            [
+                "Bring insurance card",
+                "Complete forms",
+                "Bring prior notes",
+                "Confirm transport",
+            ]
+        )
+    if "school" in categories:
+        actions.extend(
+            [
+                "Complete school forms",
+                "Pack costume or materials",
+                "Confirm drop-off/pickup plan",
+            ]
+        )
+    if "paperwork" in categories:
+        if not has_explicit_documents:
+            actions.append("Gather required documents")
+        actions.extend(["Complete forms", "Prepare photos", "Confirm appointment"])
+    if "activity" in categories:
+        actions.extend(["Pack gear", "Set out clothes", "Confirm pickup/drop-off"])
+    if "birthday" in categories:
+        actions.extend(["Buy gift", "RSVP", "Plan food", "Confirm timing"])
+    elif "social" in categories:
+        actions.extend(["Confirm RSVP", "Plan food", "Confirm timing"])
+    return actions
+
+
+def _event_category_actions(
+    event: dict[str, Any],
+    metadata: dict[str, Any],
+    categories: set[str],
+    note_action: str | None,
+) -> list[str]:
+    if "travel" in categories and _is_shopping_preparation_event(event, metadata):
+        actions = []
+        if "shopping" not in _normalize_match_text(str(note_action)):
+            actions.append("Make shopping list")
+        actions.extend(["Confirm sizes and quantities", "Bring bags"])
+        return actions
+
+    return _category_actions(categories, note_action)
+
+
+def _dedupe_actions(actions: list[str]) -> list[str]:
+    deduped = []
+    seen = set()
+    for action in actions:
+        key = _normalize_match_text(action)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(action)
+    return deduped
+
+
+def _preparation_checklist_for_event(event: dict[str, Any]) -> list[str]:
+    notes, metadata = read_metadata_from_description(event.get("description"))
+    categories = _preparation_categories(event, metadata)
+    actions = []
+    preparation_notes = str(metadata.get("preparation_notes") or notes)
+    note_item = _format_preparation_note(preparation_notes)
+    if note_item is not None:
+        actions.append(note_item)
+    actions.extend(_event_category_actions(event, metadata, categories, _note_action(preparation_notes)))
+    if metadata.get("owner") == "unknown":
+        actions.append("Assign owner")
+    return _dedupe_actions(actions)
+
+
+def _preparation_reason(event: dict[str, Any]) -> str:
+    notes, metadata = read_metadata_from_description(event.get("description"))
+    reasons = []
+    if metadata.get("preparation_notes") or notes:
+        reasons.append("prep notes")
+    if metadata.get("preparation_needed"):
+        reasons.append("marked prep-needed")
+
+    categories = sorted(_preparation_categories(event, metadata) & CHECKLIST_PREP_CATEGORIES)
+    if "travel" in categories and _is_shopping_preparation_event(event, metadata):
+        categories.remove("travel")
+        categories.append("shopping for travel")
+    if categories:
+        reasons.append(", ".join(categories))
+
+    return "; ".join(reasons) if reasons else "likely prep-needed category"
+
+
+def _format_suggested_deadline(event: dict[str, Any], now: datetime) -> str:
+    start = _event_start(event)
+    if start == datetime.max:
+        return "Before the event"
+
+    if start <= now + timedelta(hours=48):
+        return "ASAP"
+
+    deadline = start - timedelta(days=1)
+    if event.get("start", {}).get("dateTime"):
+        return f"By {deadline.strftime('%A %-I:%M %p')}"
+
+    return f"By {deadline.strftime('%A')}"
+
+
+def _is_urgent_preparation(event: dict[str, Any], now: datetime) -> bool:
+    start = _event_start(event)
+    return start != datetime.max and start <= now + timedelta(hours=48)
+
+
+def _event_needs_preparation(event: dict[str, Any]) -> bool:
+    _, metadata = read_metadata_from_description(event.get("description"))
+    if metadata.get("preparation_needed"):
+        return True
+
+    return bool(_preparation_categories(event, metadata) & CHECKLIST_PREP_CATEGORIES)
+
+
+def _preparation_query_score(query: str | None, event: dict[str, Any]) -> int:
+    if not query:
+        return 0
+
+    normalized_query = _normalize_match_text(query)
+    query_tokens = set(normalized_query.split())
+    text = _preparation_match_text(event)
+    text_tokens = set(text.split())
+    score = 0
+    if normalized_query in text:
+        score += 5
+    score += 2 * len(query_tokens & text_tokens)
+    return score
+
+
+def _format_preparation_checklist(
+    events: list[dict[str, Any]],
+    query: str | None,
+    label: str,
+    now: datetime,
+) -> str:
+    ranked_events = []
+    for event in events:
+        query_score = _preparation_query_score(query, event)
+        if query is not None and query_score == 0:
+            continue
+        if query is None and not _event_needs_preparation(event):
+            continue
+        if query is not None and not _event_needs_preparation(event):
+            continue
+        ranked_events.append((query_score, event))
+
+    selected = [
+        event
+        for _, event in sorted(
+            ranked_events,
+            key=lambda item: (-item[0], _event_start(item[1])),
+        )
+    ]
+    if not selected:
+        target = f" for {query}" if query else f" {label}"
+        return f"No preparation actions found{target}."
+
+    lines = ["Preparation checklist:"]
+    for event in selected:
+        _, metadata = read_metadata_from_description(event.get("description"))
+        urgency = " (urgent)" if _is_urgent_preparation(event, now) else ""
+        lines.append(f"{_format_preparation_header(event)}{urgency}")
+        owner = str(metadata.get("owner") or "unknown")
+        if owner != "unknown":
+            lines.append(f"Owner: {_owner_label(owner)}")
+        lines.append(f"Why: {_preparation_reason(event)}")
+        lines.append(f"Suggested deadline: {_format_suggested_deadline(event, now)}")
+        lines.append("Checklist:")
+        actions = _preparation_checklist_for_event(event)
+        lines.extend(f"- {action}" for action in actions)
+
+    return "\n".join(lines)
+
+
 @dataclass
 class PendingAction:
     action: str
@@ -899,6 +1206,34 @@ class FamilyCalendarClaw:
         message = _format_briefing(
             response.get("data", {}).get("events", []),
             intent.get("label", "this week"),
+        )
+        print(message)
+        return message
+
+    def preparation_from_request(
+        self,
+        request: str,
+        reference_time: datetime | None = None,
+    ) -> str:
+        intent = extract_intent(request, now=reference_time)
+        now = reference_time or datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        response = self.tools.list_calendar_events(
+            time_min=intent["start"],
+            time_max=intent["end"],
+            max_results=100,
+        )
+        if response["status"] != "ok":
+            message = response["message"]
+            print(message)
+            return message
+
+        message = _format_preparation_checklist(
+            response.get("data", {}).get("events", []),
+            intent.get("query"),
+            intent.get("label", "upcoming"),
+            now,
         )
         print(message)
         return message
@@ -1205,7 +1540,9 @@ def run_cli(claw: FamilyCalendarClaw | None = None) -> None:
             continue
 
         intent = extract_intent(command)
-        if intent["intent"] == "family_briefing":
+        if intent["intent"] == "preparation_checklist":
+            active_claw.preparation_from_request(command)
+        elif intent["intent"] == "family_briefing":
             active_claw.briefing_from_request(command)
         elif intent["intent"] == "list_events":
             active_claw.list_events_from_request(command)

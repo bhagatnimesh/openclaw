@@ -778,6 +778,14 @@ def _is_briefing_request(user_text: str) -> bool:
     return any(word in lowered for word in briefing_words)
 
 
+def _is_preparation_request(user_text: str) -> bool:
+    lowered = user_text.lower().strip()
+    if re.search(r"\b(?:prepare|preparation|prep)\b", lowered):
+        return True
+
+    return bool(re.search(r"\b(?:needs?\s+action|need\s+to\s+do)\b", lowered))
+
+
 def _is_delete_request(user_text: str) -> bool:
     lowered = user_text.lower().strip()
     return lowered.startswith(("cancel ", "delete ", "remove "))
@@ -813,6 +821,77 @@ def _briefing_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         "start": start.isoformat(),
         "end": end.isoformat(),
         "label": label,
+        "missing_fields": [],
+    }
+
+
+def _extract_preparation_query(user_text: str) -> str | None:
+    query = user_text
+    query = re.sub(
+        r"^\s*what\s+(?:should\s+we\s+)?(?:do\s+we\s+need\s+to\s+do\s+)?",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"^\s*(?:can\s+you\s+)?prepare\s+(?:me|us)\s+for\s+",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"^\s*(?:should\s+we\s+)?prepare\s+for\s+",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(
+        r"^\s*(?:needs?\s+action|needs?\s+preparation|needs?\s+prep|should\s+we\s+prepare)\b",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"^\s*(?:for|before)\s+", "", query, flags=re.IGNORECASE)
+    query = re.sub(
+        r"\b(?:this\s+week|next\s+week|today|tomorrow|next\s+7\s+days|next\s+seven\s+days)\b",
+        " ",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"^\s*(?:the|our|my)\s+", "", query, flags=re.IGNORECASE)
+    query = re.sub(r"\?$", "", query.strip())
+    query = _clean_spaces(query.strip(" ."))
+    if query.lower() in (
+        "for",
+        "before",
+        "action",
+        "preparation",
+        "prep",
+        "prepare for",
+    ):
+        return None
+
+    return query or None
+
+
+def _preparation_intent(user_text: str, reference: datetime) -> dict[str, Any]:
+    start, end = _extract_list_range(user_text, reference)
+    label = "upcoming"
+    lowered = user_text.lower()
+    if "this week" in lowered:
+        start, end, label = _extract_week_briefing_range(user_text, reference)
+    elif "next week" in lowered:
+        start, end, label = _extract_week_briefing_range(user_text, reference)
+    elif start is None or end is None:
+        start = reference
+        end = reference + timedelta(days=30)
+
+    return {
+        "intent": "preparation_checklist",
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "label": label,
+        "query": _extract_preparation_query(user_text),
         "missing_fields": [],
     }
 
@@ -982,6 +1061,8 @@ def extract_intent(user_text: str, now: datetime | None = None) -> dict[str, Any
         return _update_intent(user_text, reference)
     if _is_delete_request(user_text):
         return _delete_intent(user_text, reference)
+    if _is_preparation_request(user_text):
+        return _preparation_intent(user_text, reference)
     if _is_briefing_request(user_text):
         return _briefing_intent(user_text, reference)
     if _is_list_request(user_text):
