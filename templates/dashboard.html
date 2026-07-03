@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>N4OS Portal Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard/dashboard.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <section class="identity">
+          <p class="eyebrow">N4OS Family Chief of Staff</p>
+          <h1 id="greeting">Loading dashboard</h1>
+          <p id="date-label" class="date-line">Syncing calendar and tasks...</p>
+        </section>
+        <nav class="portal-nav" aria-label="Dashboard sections">
+          <a href="#today">Today</a>
+          <a href="#planning">Planning</a>
+          <a href="#tasks">Tasks</a>
+          <a href="#family">Family</a>
+        </nav>
+        <section class="status-panel" aria-live="polite">
+          <p class="eyebrow">Read-only V1</p>
+          <p id="source-status">Local dashboard</p>
+          <p id="updated-at" class="muted">Waiting for first refresh</p>
+        </section>
+      </header>
+
+      <section id="today" class="section">
+        <div class="section-title">
+          <h2>Today</h2>
+          <span></span>
+        </div>
+        <div class="today-grid">
+          <div class="today-primary-stack">
+            <article class="best-action-card">
+              <p class="eyebrow">Decision Engine Recommendation</p>
+              <h2 id="best-action-title">Loading next action...</h2>
+              <p id="best-action-why" class="lede">Looking for the highest-leverage read-only signal.</p>
+              <div id="best-action-reasons" class="reason-list"></div>
+            </article>
+            <article class="panel home-board-panel">
+              <div class="panel-header">
+                <h3>Today at Home</h3>
+                <span id="home-board-count">0 pending</span>
+              </div>
+              <div id="home-board-items" class="home-board-list"></div>
+            </article>
+          </div>
+          <article class="panel timeline-panel">
+            <div class="panel-header">
+              <h3>Today's Timeline</h3>
+              <span id="busy-day-label">No schedule yet</span>
+            </div>
+            <div id="today-timeline" class="timeline"></div>
+          </article>
+        </div>
+        <div class="signal-grid">
+          <article class="signal-card must">
+            <p class="eyebrow">Open Loops</p>
+            <div id="open-loops"></div>
+          </article>
+          <article class="signal-card should">
+            <p class="eyebrow">Prep Needed</p>
+            <div id="prep-needed"></div>
+          </article>
+          <article class="signal-card can">
+            <p class="eyebrow">Warnings</p>
+            <div id="warnings"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="planning" class="section">
+        <div class="section-title">
+          <h2>Planning</h2>
+          <span></span>
+        </div>
+        <div id="planning-items" class="planning-grid"></div>
+      </section>
+
+      <section id="tasks" class="section">
+        <div class="section-title">
+          <h2>Tasks Planning Engine</h2>
+          <span></span>
+        </div>
+        <div id="task-groups" class="task-grid"></div>
+      </section>
+
+      <section id="family" class="section">
+        <div class="section-title">
+          <h2>Family Awareness</h2>
+          <span></span>
+        </div>
+        <div class="family-grid">
+          <article class="panel">
+            <div class="panel-header">
+              <h3>Family Members</h3>
+              <span id="family-count">0 known</span>
+            </div>
+            <div id="family-members" class="member-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-header">
+              <h3>Responsibilities</h3>
+              <span>Today</span>
+            </div>
+            <div id="responsibilities" class="compact-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-header">
+              <h3>Child Events</h3>
+              <span>Today</span>
+            </div>
+            <div id="child-events" class="compact-list"></div>
+          </article>
+          <article class="panel warm-panel">
+            <div class="panel-header">
+              <h3>Unassigned</h3>
+              <span id="unassigned-count">0</span>
+            </div>
+            <div id="unassigned" class="compact-list"></div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/dashboard/dashboard.js"></script>
+  </body>
+</html>
