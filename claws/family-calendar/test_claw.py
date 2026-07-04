@@ -140,6 +140,39 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-03T20:00:00-07:00")
         self.assertEqual(provider.created[0]["start"]["timeZone"], DEFAULT_TIMEZONE)
 
+    def test_create_event_from_request_stores_ai_assistant_help(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "\n".join(
+                    [
+                        "Add Nysha school meeting tomorrow at 4pm",
+                        "I want AI assistant",
+                        "Help: find the teacher email and draft quick talking points",
+                        "Context: ask about waitlist status",
+                    ]
+                ),
+                reference_time=reference,
+            )
+
+        self.assertEqual(provider.created[0]["summary"], "Nysha school meeting")
+        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        self.assertIn("Assistant help: Find the teacher email", notes)
+        self.assertIn("Assistant context: ask about waitlist status", notes)
+        self.assertTrue(metadata["assistant_help_needed"])
+        self.assertEqual(metadata["assistant_name"], "Noah")
+        self.assertEqual(
+            metadata["assistant_help_request"],
+            "Find the teacher email and draft quick talking points",
+        )
+        self.assertEqual(
+            metadata["assistant_context"],
+            "ask about waitlist status",
+        )
+
     def test_create_event_from_great_mall_request(self):
         provider = FakeProvider()
         claw = FamilyCalendarClaw.from_provider(provider)

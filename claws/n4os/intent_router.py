@@ -28,6 +28,7 @@ TASK_INTENTS = {
     "recommend_tasks",
     "complete_task",
     "delete_task",
+    "run_assistant_help",
 }
 HOME_BOARD_INTENTS = {
     "add_item",
@@ -36,13 +37,34 @@ HOME_BOARD_INTENTS = {
     "mark_done",
 }
 
-LOCAL_MODULES = ("constants", "intent", "matcher", "prompts", "provider", "tools")
+LOCAL_MODULES = (
+    "constants",
+    "intent",
+    "matcher",
+    "noah_assistant",
+    "prompts",
+    "provider",
+    "tools",
+)
 MISSING = object()
 
 CLAW_ROOT = Path(__file__).resolve().parents[1]
 CALENDAR_ROOT = CLAW_ROOT / "family-calendar"
 TASKS_ROOT = CLAW_ROOT / "family-tasks"
 HOME_BOARD_ROOT = CLAW_ROOT / "home-board"
+TASK_CUE_RE = re.compile(r"\b(tasks?|todos?|to-dos?|open loops?)\b")
+EXPLICIT_CLOCK_TIME_RE = re.compile(
+    r"\b(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|"
+    r"\bat\s+\d{1,2}(?::\d{2})?\b"
+)
+ASSISTANT_NAMES = ("Noah",)
+ASSISTANT_NAME_PATTERN = "|".join(re.escape(name) for name in ASSISTANT_NAMES)
+ASSISTANT_HELP_MARKER_LINE_RE = re.compile(
+    rf"^\s*(?:(?:i\s+)?(?:want|need|could\s+use)\s+(?:an?\s+)?ai\s+assistant"
+    rf"(?:\s+(?:help|support))?|ask\s+(?:{ASSISTANT_NAME_PATTERN})\s+"
+    rf"(?:to\s+help|for\s+help)|(?:{ASSISTANT_NAME_PATTERN})\s*,?\s+help)\.?\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -127,22 +149,74 @@ def _has_time_anchor(text: str) -> bool:
     )
 
 
+def _routing_text(request: str) -> str:
+    lines = [
+        line.strip()
+        for line in request.splitlines()
+        if line.strip() and ASSISTANT_HELP_MARKER_LINE_RE.match(line.strip()) is None
+    ]
+    return "\n".join(lines).lower().strip() or request.lower().strip()
+
+
+def _looks_like_task_capture(text: str) -> bool:
+    return bool(
+        re.search(
+            r"^\s*(?:to\s+)?(?:"
+            r"pack|bring|buy|get|return|put|take|call|text|email|message|"
+            r"clean|repair|fix|change|replace|research|book|order|renew|"
+            r"submit|fill|prepare|send|drop\s+off|pick\s+up|pickup"
+            r")\b",
+            text,
+        )
+    )
+
+
+def _has_explicit_clock_time(text: str) -> bool:
+    return EXPLICIT_CLOCK_TIME_RE.search(text) is not None
+
+
+def _has_task_cue(text: str) -> bool:
+    return TASK_CUE_RE.search(text) is not None
+
+
+def _has_assistant_help_metadata(task_intent: dict[str, Any]) -> bool:
+    metadata = task_intent.get("metadata")
+    return isinstance(metadata, dict) and bool(metadata.get("assistant_help_needed"))
+
+
 def _score_calendar(text: str, calendar_intent: dict[str, Any]) -> float:
     score = 0.0
     intent = calendar_intent.get("intent")
-    has_explicit_task_word = bool(re.search(r"\b(task|todo|to-do|open loop|open loops)\b", text))
-    if intent == "create_event" and _has_time_anchor(text) and not has_explicit_task_word:
+    has_explicit_task_word = _has_task_cue(text)
+    looks_like_task_capture = (
+        _looks_like_task_capture(text)
+        and not _has_explicit_clock_time(text)
+    )
+    if (
+        intent == "create_event"
+        and _has_time_anchor(text)
+        and not has_explicit_task_word
+        and not looks_like_task_capture
+    ):
         score += 0.45
-    elif intent in CALENDAR_INTENTS and intent != "create_event":
+    elif (
+        intent in CALENDAR_INTENTS
+        and intent != "create_event"
+        and not has_explicit_task_word
+    ):
         score += 0.45
 
     if re.search(r"\b(calendar|schedule|event|appointment|appt|meeting)\b", text):
         score += 0.35
     if re.search(r"\b(dentist|dental|doctor|flight|pickup|dinner|reservation)\b", text):
         score += 0.25
-    if _has_time_anchor(text):
+    if _has_time_anchor(text) and not looks_like_task_capture:
         score += 0.2
-    if re.search(r"^\s*(add|create|schedule|go to)\b", text) and _has_time_anchor(text):
+    if (
+        re.search(r"^\s*(add|create|schedule|go to)\b", text)
+        and _has_time_anchor(text)
+        and not looks_like_task_capture
+    ):
         score += 0.2
     if re.search(r"^\s*(what|what's|whats|show|list)\b", text) and re.search(
         r"\b(have|calendar|schedule|coming up)\b",
@@ -160,12 +234,21 @@ def _score_tasks(text: str, task_intent: dict[str, Any]) -> float:
     intent = task_intent.get("intent")
     if intent in {"create_task", "complete_task", "delete_task"}:
         score += 0.35
-    elif intent == "recommend_tasks" and re.search(r"\b(what|which|recommend|do)\b", text):
+    elif intent == "run_assistant_help":
+        score += 0.65
+    elif intent == "recommend_tasks" and re.search(
+        r"\b(what|which|recommend|do|show|list|give)\b",
+        text,
+    ):
         score += 0.2
         if task_intent.get("filters"):
             score += 0.2
 
-    if re.search(r"\b(task|todo|to-do|open loop|open loops)\b", text):
+    if _has_task_cue(text):
+        score += 0.45
+    if intent == "create_task" and _looks_like_task_capture(text):
+        score += 0.45
+    if intent == "create_task" and _has_assistant_help_metadata(task_intent):
         score += 0.45
     if re.search(r"^\s*(complete|finish|mark)\b", text):
         score += 0.35
@@ -192,7 +275,7 @@ def _score_home_board(text: str, home_board_intent: dict[str, Any]) -> float:
         score += 0.25
     if re.search(r"\b(journal|form|payment|fridge|food|passport|lunch|library book|permission slip)\b", text):
         score += 0.25
-    if re.search(r"\b(task|todo|to-do|open loop|open loops)\b", text) and not re.search(
+    if _has_task_cue(text) and not re.search(
         r"\b(home board|today at home)\b",
         text,
     ):
@@ -225,7 +308,7 @@ def _summary(route: Route, calendar_intent: dict[str, Any], task_intent: dict[st
         return (
             "Route to family-calendar and family-tasks for combined planning or briefing."
         )
-    return "Could not confidently choose Calendar, Tasks, Home Board, or both."
+    return "Could not confidently choose Calendar, Tasks, Home Board, or Calendar + Tasks."
 
 
 def route_request(
@@ -233,7 +316,7 @@ def route_request(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     calendar_intent, task_intent, home_board_intent = _extract_intents(request, now)
-    text = request.lower().strip()
+    text = _routing_text(request)
     if not text:
         return RouteDecision(
             route="unknown",

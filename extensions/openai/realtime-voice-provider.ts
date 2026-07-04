@@ -5,7 +5,11 @@ import {
   isProviderAuthProfileConfigured,
   resolveProviderAuthProfileApiKey,
 } from "openclaw/plugin-sdk/provider-auth";
-import { resolveProviderRequestHeaders } from "openclaw/plugin-sdk/provider-http";
+import {
+  createProviderHttpError,
+  readProviderJsonResponse,
+  resolveProviderRequestHeaders,
+} from "openclaw/plugin-sdk/provider-http";
 import {
   captureWsEvent,
   createDebugProxyWebSocketAgent,
@@ -18,6 +22,8 @@ import type {
   RealtimeVoiceBrowserSession,
   RealtimeVoiceBrowserSessionCreateRequest,
   RealtimeVoiceBridgeCreateRequest,
+  RealtimeVoiceAgentControlClassifierContext,
+  RealtimeVoiceAgentControlClassifierResult,
   RealtimeVoiceProviderConfig,
   RealtimeVoiceProviderPlugin,
   RealtimeVoiceTool,
@@ -31,6 +37,7 @@ import {
   normalizeResolvedSecretInputString,
   normalizeSecretInputString,
 } from "openclaw/plugin-sdk/secret-input";
+import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import WebSocket from "ws";
 import {
   asFiniteNumber,
@@ -87,6 +94,8 @@ type OpenAIRealtimeVoiceBridgeConfig = RealtimeVoiceBridgeCreateRequest & {
 
 const OPENAI_REALTIME_DEFAULT_MODEL = "gpt-realtime-2";
 const OPENAI_REALTIME_INPUT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
+const OPENAI_AGENT_CONTROL_CLASSIFIER_MODEL = "gpt-5.4-nano";
+const OPENAI_AGENT_CONTROL_CLASSIFIER_TIMEOUT_MS = 4_000;
 const OPENAI_REALTIME_ACTIVE_RESPONSE_ERROR_PREFIX =
   "Conversation already has an active response in progress:";
 const OPENAI_REALTIME_NO_ACTIVE_RESPONSE_CANCEL_ERROR =
@@ -388,6 +397,182 @@ function hasOpenAIRealtimePlatformApiKeyInput(params: {
     return true;
   }
   return hasOpenAIRealtimeApiKeyInput(undefined);
+}
+
+type OpenAIResponsesTextPart = {
+  type?: unknown;
+  text?: unknown;
+};
+
+type OpenAIResponsesOutputItem = {
+  content?: unknown;
+};
+
+type OpenAIAgentControlClassifierPayload = {
+  mode?: unknown;
+  confidence?: unknown;
+  semanticText?: unknown;
+};
+
+function readOpenAIResponsesText(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  const record = payload as Record<string, unknown>;
+  if (typeof record.output_text === "string" && record.output_text.trim()) {
+    return record.output_text;
+  }
+  if (!Array.isArray(record.output)) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  for (const item of record.output as OpenAIResponsesOutputItem[]) {
+    if (!item || typeof item !== "object" || !Array.isArray(item.content)) {
+      continue;
+    }
+    for (const part of item.content as OpenAIResponsesTextPart[]) {
+      if (
+        part &&
+        typeof part === "object" &&
+        (part.type === "output_text" || part.type === "text") &&
+        typeof part.text === "string"
+      ) {
+        parts.push(part.text);
+      }
+    }
+  }
+  const text = parts.join("").trim();
+  return text || undefined;
+}
+
+function parseOpenAIAgentControlClassifierPayload(
+  text: string | undefined,
+): RealtimeVoiceAgentControlClassifierResult | undefined {
+  if (!text) {
+    return undefined;
+  }
+  let parsed: OpenAIAgentControlClassifierPayload;
+  try {
+    parsed = JSON.parse(text) as OpenAIAgentControlClassifierPayload;
+  } catch {
+    return undefined;
+  }
+  const mode = typeof parsed.mode === "string" ? parsed.mode.trim().toLowerCase() : undefined;
+  const confidence =
+    typeof parsed.confidence === "string" ? parsed.confidence.trim().toLowerCase() : undefined;
+  if (
+    mode !== "ignore" &&
+    mode !== "status" &&
+    mode !== "steer" &&
+    mode !== "followup" &&
+    mode !== "cancel"
+  ) {
+    return undefined;
+  }
+  if (confidence !== "high" && confidence !== "medium" && confidence !== "low") {
+    return undefined;
+  }
+  const semanticText =
+    typeof parsed.semanticText === "string" && parsed.semanticText.trim()
+      ? parsed.semanticText.trim()
+      : undefined;
+  return {
+    mode,
+    confidence,
+    ...(semanticText ? { semanticText } : {}),
+  };
+}
+
+function buildOpenAIAgentControlClassifierInput(text: string): unknown[] {
+  return [
+    {
+      role: "system",
+      content: [
+        "Classify whether a final voice transcript is control input for an active OpenClaw run.",
+        "Return only JSON matching the schema.",
+        "Modes: status asks progress/current state; steer changes current work; followup adds work after the current result; cancel explicitly stops the active OpenClaw run; ignore is greeting, chatter, or a separate new task.",
+        "Classify in any language. Use semanticText only for high-confidence steer/followup rewrites; otherwise use an empty string.",
+        "Do not classify unrelated personal, calendar, or deploy cancellations as cancel unless the user clearly means the active OpenClaw run.",
+      ].join(" "),
+    },
+    {
+      role: "user",
+      content: text,
+    },
+  ];
+}
+
+async function classifyOpenAIRealtimeAgentControlIntent(
+  context: RealtimeVoiceAgentControlClassifierContext,
+): Promise<RealtimeVoiceAgentControlClassifierResult | undefined> {
+  const config = normalizeProviderConfig(context.providerConfig ?? {});
+  if (config.azureEndpoint || config.azureDeployment) {
+    return undefined;
+  }
+  const apiKey = await requireOpenAIRealtimePlatformApiKey({
+    configuredApiKey: config.apiKey,
+    cfg: context.cfg,
+  });
+  const url = "https://api.openai.com/v1/responses";
+  const { response, release } = await fetchWithSsrFGuard({
+    url,
+    init: {
+      method: "POST",
+      headers: resolveProviderRequestHeaders({
+        provider: "openai",
+        baseUrl: url,
+        capability: "llm",
+        transport: "http",
+        defaultHeaders: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+      }) ?? {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_AGENT_CONTROL_CLASSIFIER_MODEL,
+        input: buildOpenAIAgentControlClassifierInput(context.text),
+        text: {
+          format: {
+            type: "json_schema",
+            name: "openclaw_voice_agent_control_intent",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                mode: {
+                  type: "string",
+                  enum: ["ignore", "status", "steer", "followup", "cancel"],
+                },
+                confidence: { type: "string", enum: ["high", "medium", "low"] },
+                semanticText: { type: "string" },
+              },
+              required: ["mode", "confidence", "semanticText"],
+            },
+          },
+        },
+        reasoning: { effort: "none" },
+        max_output_tokens: 120,
+        store: false,
+      }),
+    },
+    auditContext: "openai-agent-control-intent-classifier",
+    timeoutMs: OPENAI_AGENT_CONTROL_CLASSIFIER_TIMEOUT_MS,
+  });
+  const payload = await (async () => {
+    try {
+      if (!response.ok) {
+        throw await createProviderHttpError(response, "OpenAI voice control classifier failed");
+      }
+      return await readProviderJsonResponse<unknown>(response, "openai.voice-control-classifier");
+    } finally {
+      await release();
+    }
+  })();
+  return parseOpenAIAgentControlClassifierPayload(readOpenAIResponsesText(payload));
 }
 
 function isOpenAIRealtimeMaxSessionDurationError(detail: string): boolean {
@@ -1391,6 +1576,7 @@ export function buildOpenAIRealtimeVoiceProvider(): RealtimeVoiceProviderPlugin 
         cfg,
       });
     },
+    classifyAgentControlIntent: classifyOpenAIRealtimeAgentControlIntent,
     createBridge: (req) => {
       const config = normalizeProviderConfig(req.providerConfig);
       return new OpenAIRealtimeVoiceBridge({

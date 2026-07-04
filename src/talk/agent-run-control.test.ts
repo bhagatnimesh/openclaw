@@ -5,6 +5,7 @@ import {
   controlRealtimeVoiceAgentRun,
   parseRealtimeVoiceAgentControlToolArgs,
   resolveRealtimeVoiceAgentControlIntent,
+  resolveRealtimeVoiceAgentControlIntentAsync,
   shouldAutoControlRealtimeVoiceAgentText,
   type RealtimeVoiceAgentRunActivity,
 } from "./agent-run-control.js";
@@ -115,6 +116,68 @@ describe("classifyRealtimeVoiceAgentControlText", () => {
       ),
     ).toStrictEqual({ text: "revísalo en español", mode: "steer" });
   });
+
+  it("uses provider intent metadata only for high-confidence low-confidence speech", async () => {
+    const classifier = vi.fn(async () => ({ mode: "status", confidence: "high" as const }));
+
+    await expect(
+      resolveRealtimeVoiceAgentControlIntentAsync({
+        text: "¿cómo va esto?",
+        classifier,
+        sessionKey: "agent:main:discord:c1",
+      }),
+    ).resolves.toMatchObject({
+      mode: "status",
+      confidence: "high",
+      reason: "ai_classifier",
+      shouldAutoControl: true,
+      rawText: "¿cómo va esto?",
+    });
+    expect(classifier).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "¿cómo va esto?",
+        deterministicIntent: expect.objectContaining({
+          mode: "status",
+          confidence: "low",
+          reason: "safe_default",
+          shouldAutoControl: false,
+        }),
+        sessionKey: "agent:main:discord:c1",
+      }),
+    );
+  });
+
+  it("keeps AI-classified cancel requests out of automatic control", async () => {
+    await expect(
+      resolveRealtimeVoiceAgentControlIntentAsync({
+        text: "cancela eso",
+        classifier: async () => ({ mode: "cancel", confidence: "high" }),
+      }),
+    ).resolves.toMatchObject({
+      mode: "cancel",
+      confidence: "high",
+      reason: "ai_classifier",
+      shouldAutoControl: false,
+      rawText: "cancela eso",
+    });
+  });
+
+  it("falls back to deterministic intent when the provider classifier fails", async () => {
+    await expect(
+      resolveRealtimeVoiceAgentControlIntentAsync({
+        text: "hello",
+        classifier: async () => {
+          throw new Error("classifier unavailable");
+        },
+      }),
+    ).resolves.toMatchObject({
+      mode: "status",
+      confidence: "low",
+      reason: "safe_default",
+      shouldAutoControl: false,
+      rawText: "hello",
+    });
+  });
 });
 
 describe("controlRealtimeVoiceAgentRun", () => {
@@ -163,6 +226,32 @@ describe("controlRealtimeVoiceAgentRun", () => {
     const queuedText = deps.queueEmbeddedAgentMessageWithOutcomeAsync.mock.calls[0]?.[1] ?? "";
     expect(queuedText).toContain("Spoken follow-up for the current voice call.");
     expect(queuedText).toContain("also check the migration");
+  });
+
+  it("uses semantic AI rewrite text only for steering/follow-up delivery", async () => {
+    const deps = createDeps({ activeSessionId: "session-active" });
+
+    await controlRealtimeVoiceAgentRun(
+      {
+        sessionKey: "agent:main:main",
+        text: "usa el arreglo pequeño",
+        intent: {
+          mode: "steer",
+          confidence: "high",
+          reason: "ai_classifier",
+          shouldAutoControl: true,
+          rawText: "usa el arreglo pequeño",
+          semanticText: "Use the smaller fix.",
+        },
+      },
+      deps,
+    );
+
+    expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).toHaveBeenCalledWith(
+      "session-active",
+      "Use the smaller fix.",
+      { steeringMode: "all", debounceMs: 0 },
+    );
   });
 
   it("cancels the active run without queueing a steering message", async () => {

@@ -29,6 +29,35 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["metadata"]["location"], "home")
         self.assertEqual(intent["metadata"]["owner"], "unknown")
 
+    def test_bare_packing_list_creates_due_task(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "to pack beach matt, sunc screen, fruits, water for the trip tomorrow",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(
+            intent["title"],
+            "Pack beach matt, sunc screen, fruits, water for the trip",
+        )
+        self.assertEqual(intent["due"], "2026-07-04")
+        self.assertEqual(intent["metadata"]["urgency"], "medium")
+
+    def test_voice_transcription_and_a_task_creates_task(self):
+        now = datetime(2026, 7, 3, 20, 5, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "and a task for tomorrow to order the lock",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Order the lock")
+        self.assertEqual(intent["due"], "2026-07-04")
+        self.assertEqual(intent["metadata"]["effort_type"], "admin")
+
     def test_call_during_commute_metadata(self):
         now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
@@ -42,6 +71,219 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["metadata"]["location"], "anywhere")
         self.assertEqual(intent["metadata"]["energy"], "low")
         self.assertEqual(intent["metadata"]["duration_minutes"], 20)
+
+    def test_bare_time_bound_call_is_not_task_creation(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Call Rahul tomorrow at 5pm", now=now)
+
+        self.assertEqual(intent["intent"], "recommend_tasks")
+
+    def test_call_task_with_ai_assistant_help_metadata(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "\n".join(
+                [
+                    "call FUSD for following up on Nysha's waitlist status for Chadbourne",
+                    "I want AI assistant",
+                    "Help: look up the FUSD phone number and draft quick talking points",
+                    "Email: waitlist@example.com",
+                ]
+            ),
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(
+            intent["title"],
+            "Call FUSD for following up on Nysha's waitlist status for Chadbourne",
+        )
+        self.assertEqual(
+            intent["notes"],
+            "Assistant help: Look up the FUSD phone number and draft quick talking points\n"
+            "Assistant context: Email: waitlist@example.com",
+        )
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertEqual(
+            intent["metadata"]["assistant_help_request"],
+            "Look up the FUSD phone number and draft quick talking points",
+        )
+        self.assertEqual(
+            intent["metadata"]["assistant_context"],
+            "Email: waitlist@example.com",
+        )
+        self.assertEqual(intent["metadata"]["effort_type"], "communication")
+
+    def test_call_task_with_noah_assistant_help_metadata(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "\n".join(
+                [
+                    "Ask Noah to help",
+                    "call FUSD for following up on Nysha's waitlist status for Chadbourne",
+                    "Help: look up the FUSD phone number and draft quick talking points",
+                ]
+            ),
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(
+            intent["title"],
+            "Call FUSD for following up on Nysha's waitlist status for Chadbourne",
+        )
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertEqual(intent["metadata"]["assistant_name"], "Noah")
+        self.assertEqual(
+            intent["metadata"]["assistant_help_request"],
+            "Look up the FUSD phone number and draft quick talking points",
+        )
+
+    def test_ask_noah_to_help_prefix_creates_task(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Ask Noah to help call FUSD about Nysha's waitlist",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Call FUSD about Nysha's waitlist")
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertEqual(intent["metadata"]["assistant_name"], "Noah")
+
+    def test_run_noah_assistant_help_intent(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Run Noah assistant help", now=now)
+
+        self.assertEqual(intent["intent"], "run_assistant_help")
+
+    def test_direct_noah_research_request_creates_assistant_task(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Ask Noah to help look up the FUSD phone number",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Look up the FUSD phone number")
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertEqual(
+            intent["metadata"]["assistant_help_request"],
+            "Look up the FUSD phone number",
+        )
+
+    def test_direct_noah_find_out_request_creates_assistant_task(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "I want Noah to find out the FUSD number to call",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Find out the FUSD number to call")
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertEqual(
+            intent["metadata"]["assistant_help_request"],
+            "Find out the FUSD number to call",
+        )
+
+    def test_polite_timed_task_request_with_inline_ai_help_creates_task(self):
+        now = datetime(2026, 7, 3, 21, 56, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "\n".join(
+                [
+                    "I want to add a task for Monday at 2 p.m. to call FUSD "
+                    "to follow up on Nyshas School waiting",
+                    "list for Chad Bond. This task is for Namesh. "
+                    "I want AI assistant to find out FUSD number to call",
+                    "and the key talking points. I really want",
+                    "Nyshad to meet Chad Bond from overflow",
+                    "on ASS School to Mission Valley Monteserie.",
+                ]
+            ),
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(
+            intent["title"],
+            "Call FUSD to follow up on Nyshas School waiting list for Chad Bond",
+        )
+        self.assertEqual(intent["due"], "2026-07-06")
+        self.assertIn("Assistant help: Find out FUSD number", intent["notes"])
+        self.assertNotIn("This task is for Namesh", intent["title"])
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertIn(
+            "Find out FUSD number to call",
+            intent["metadata"]["assistant_help_request"],
+        )
+        self.assertEqual(intent["metadata"]["effort_type"], "communication")
+
+    def test_polite_timed_task_request_with_noah_help_creates_task(self):
+        now = datetime(2026, 7, 3, 22, 6, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "\n".join(
+                [
+                    "I want to add a task for Monday at 2 p.m. to call FUSD "
+                    "to follow up on Nyshas School waiting",
+                    "list for Chad Bond. This task is for Namesh. "
+                    "I want Noah to find out FUSD number to call",
+                    "and the key talking points. I really want",
+                    "Nyshad to meet Chad Bond from overflow",
+                    "on ASS School to Mission Valley Monteserie",
+                ]
+            ),
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(
+            intent["title"],
+            "Call FUSD to follow up on Nyshas School waiting list for Chad Bond",
+        )
+        self.assertEqual(intent["due"], "2026-07-06")
+        self.assertIn("Assistant help: Find out FUSD number", intent["notes"])
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertEqual(intent["metadata"]["assistant_name"], "Noah")
+        self.assertIn(
+            "Find out FUSD number to call",
+            intent["metadata"]["assistant_help_request"],
+        )
+
+    def test_dropped_subject_timed_task_request_creates_task(self):
+        now = datetime(2026, 7, 3, 22, 20, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "\n".join(
+                [
+                    "want to add a task for Monday at 3 p.m. to call FUSD "
+                    "to follow up on Nyshas School waiting",
+                    "list for Chad Bond. This task is for Namesh. "
+                    "I want Noah to find out FUSD number to call",
+                    "and the key talking points. I really want",
+                    "Nyshad to meet Chad Bond from overflow",
+                    "on ASS School to Mission Valley Monteserie",
+                ]
+            ),
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(
+            intent["title"],
+            "Call FUSD to follow up on Nyshas School waiting list for Chad Bond",
+        )
+        self.assertEqual(intent["due"], "2026-07-06")
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertEqual(intent["metadata"]["assistant_name"], "Noah")
 
     def test_call_mom_does_not_assign_owner_to_mom(self):
         now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -287,6 +529,7 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(metadata["effort_type"], "communication")
         self.assertEqual(metadata["requires"], ["phone"])
         self.assertEqual(metadata["owner"], "dad")
+        self.assertFalse(metadata["assistant_help_needed"])
 
     def test_legacy_mode_metadata_maps_to_effort_type(self):
         notes = write_metadata_to_notes(
@@ -303,6 +546,23 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(metadata["context"], ["car"])
         self.assertEqual(metadata["can_do_while"], ["commuting"])
         self.assertEqual(metadata["effort_type"], "communication")
+
+    def test_metadata_helpers_preserve_assistant_help(self):
+        notes = write_metadata_to_notes(
+            "Assistant help: Look up the FUSD phone number",
+            {
+                "assistant_help_needed": True,
+                "assistant_help_request": "Look up the FUSD phone number",
+                "assistant_context": "Email: waitlist@example.com",
+            },
+        )
+
+        human_notes, metadata = read_metadata_from_notes(notes)
+
+        self.assertEqual(human_notes, "Assistant help: Look up the FUSD phone number")
+        self.assertTrue(metadata["assistant_help_needed"])
+        self.assertEqual(metadata["assistant_help_request"], "Look up the FUSD phone number")
+        self.assertEqual(metadata["assistant_context"], "Email: waitlist@example.com")
 
 
 if __name__ == "__main__":

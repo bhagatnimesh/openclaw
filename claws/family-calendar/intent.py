@@ -37,6 +37,10 @@ DEFAULT_METADATA = {
     "category": "",
     "preparation_needed": False,
     "preparation_notes": "",
+    "assistant_help_needed": False,
+    "assistant_name": "",
+    "assistant_help_request": "",
+    "assistant_context": "",
 }
 
 VALID_OWNERS = {"dad", "mom", "both", "unknown"}
@@ -54,10 +58,197 @@ CATEGORY_HINTS = {
     "social": ("dinner", "party", "birthday", "playdate", "meet", "rahul"),
     "household": ("trash", "repair", "clean", "house", "home", "groceries"),
 }
+ASSISTANT_NAMES = ("Noah",)
+ASSISTANT_NAME_PATTERN = "|".join(re.escape(name) for name in ASSISTANT_NAMES)
+ASSISTANT_HELP_MARKER_RE = re.compile(
+    rf"\b(?:(?:i\s+)?(?:want|need|could\s+use)\s+(?:an?\s+)?ai\s+assistant"
+    rf"(?:\s+(?:help|support))?|ask\s+(?:{ASSISTANT_NAME_PATTERN})\s+"
+    rf"(?:to\s+help|for\s+help)|(?:{ASSISTANT_NAME_PATTERN})\s*,?\s+help)\b",
+    re.IGNORECASE,
+)
+ASSISTANT_HELP_MARKER_LINE_RE = re.compile(
+    rf"^\s*(?:(?:i\s+)?(?:want|need|could\s+use)\s+(?:an?\s+)?ai\s+assistant"
+    rf"(?:\s+(?:help|support))?|ask\s+(?:{ASSISTANT_NAME_PATTERN})\s+"
+    rf"(?:to\s+help|for\s+help)|(?:{ASSISTANT_NAME_PATTERN})\s*,?\s+help)\.?\s*$",
+    re.IGNORECASE,
+)
+ASSISTANT_DETAIL_LABEL_RE = re.compile(
+    r"\b(?P<label>assistant\s+help|help|assistant\s+context|context|email|notes?)\s*:\s*",
+    re.IGNORECASE,
+)
 
 
 def _clean_spaces(value: str) -> str:
     return " ".join(value.split()).strip()
+
+
+def _clean_assistant_text(value: Any) -> str:
+    return _clean_spaces(str(value or "").strip())
+
+
+def _assistant_name_from_marker(marker: str) -> str:
+    for name in ASSISTANT_NAMES:
+        if re.search(rf"\b{re.escape(name)}\b", marker, flags=re.IGNORECASE):
+            return name
+    return ASSISTANT_NAMES[0]
+
+
+def _assistant_context_value(label: str, value: str) -> str:
+    cleaned = _clean_spaces(value.strip(" ."))
+    if not cleaned:
+        return ""
+
+    normalized_label = label.lower().replace("assistant ", "")
+    if normalized_label == "email":
+        return f"Email: {cleaned}"
+    return cleaned
+
+
+def _normalize_assistant_help_request(value: str) -> str:
+    cleaned = _clean_spaces(value.strip(" .,:;-"))
+    cleaned = re.sub(
+        r"^(?:help|support)?\s*(?:to|with|for)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"^(?:to|with|for)\s+", "", cleaned, flags=re.IGNORECASE)
+    if not cleaned:
+        return ""
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def _split_assistant_details(value: str) -> tuple[str, str]:
+    matches = list(ASSISTANT_DETAIL_LABEL_RE.finditer(value))
+    if not matches:
+        return _normalize_assistant_help_request(value), ""
+
+    help_parts = []
+    context_parts = []
+    leading = _normalize_assistant_help_request(value[: matches[0].start()])
+    if leading:
+        help_parts.append(leading)
+
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+        label = match.group("label")
+        detail = value[match.end() : next_start]
+        cleaned_detail = _clean_spaces(detail.strip(" ."))
+        if not cleaned_detail:
+            continue
+
+        normalized_label = label.lower().replace("assistant ", "")
+        if normalized_label == "help":
+            help_parts.append(_normalize_assistant_help_request(cleaned_detail))
+        else:
+            context = _assistant_context_value(label, cleaned_detail)
+            if context:
+                context_parts.append(context)
+
+    return "\n".join(part for part in help_parts if part), "\n".join(context_parts)
+
+
+def _assistant_description_text(help_request: str, assistant_context: str) -> str | None:
+    lines = ["Assistant help: " + (help_request or "requested")]
+    if assistant_context:
+        lines.append(f"Assistant context: {assistant_context}")
+    return "\n".join(lines)
+
+
+def _assistant_metadata(
+    help_request: str,
+    assistant_context: str,
+    assistant_name: str,
+) -> dict[str, Any]:
+    return {
+        "assistant_help_needed": True,
+        "assistant_name": assistant_name,
+        "assistant_help_request": help_request,
+        "assistant_context": assistant_context,
+    }
+
+
+def _extract_line_assistant_help(user_text: str) -> tuple[str, dict[str, Any], str | None] | None:
+    lines = [line.strip() for line in user_text.splitlines()]
+    marker_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if line and ASSISTANT_HELP_MARKER_LINE_RE.match(line)
+    ]
+    if not marker_indexes:
+        return None
+
+    marker_index = marker_indexes[0]
+    assistant_name = _assistant_name_from_marker(lines[marker_index])
+    before = [line for line in lines[:marker_index] if line]
+    after = [line for line in lines[marker_index + 1 :] if line]
+    main_lines = list(before)
+    help_parts: list[str] = []
+    context_parts: list[str] = []
+
+    for line in after:
+        label_match = ASSISTANT_DETAIL_LABEL_RE.match(line)
+        if label_match is not None:
+            label = label_match.group("label")
+            value = line[label_match.end() :]
+            if label.lower().replace("assistant ", "") == "help":
+                help_text = _normalize_assistant_help_request(value)
+                if help_text:
+                    help_parts.append(help_text)
+            else:
+                context = _assistant_context_value(label, value)
+                if context:
+                    context_parts.append(context)
+            continue
+
+        if before:
+            help_text = _normalize_assistant_help_request(line)
+            if help_text:
+                help_parts.append(help_text)
+        else:
+            main_lines.append(line)
+
+    help_request = "\n".join(help_parts)
+    assistant_context = "\n".join(context_parts)
+    return (
+        _clean_spaces(" ".join(main_lines)),
+        _assistant_metadata(help_request, assistant_context, assistant_name),
+        _assistant_description_text(help_request, assistant_context),
+    )
+
+
+def _extract_assistant_help(user_text: str) -> tuple[str, dict[str, Any], str | None]:
+    line_result = _extract_line_assistant_help(user_text)
+    if line_result is not None:
+        return line_result
+
+    match = ASSISTANT_HELP_MARKER_RE.search(user_text)
+    if match is None:
+        return user_text, {}, None
+
+    assistant_name = _assistant_name_from_marker(match.group(0))
+    main_text = _clean_spaces(user_text[: match.start()].strip(" .,\n"))
+    help_request, assistant_context = _split_assistant_details(user_text[match.end() :])
+    if not main_text and help_request:
+        main_text = help_request
+    return (
+        main_text,
+        _assistant_metadata(help_request, assistant_context, assistant_name),
+        _assistant_description_text(help_request, assistant_context),
+    )
+
+
+def _append_assistant_description(
+    description: str | None,
+    assistant_description: str | None,
+) -> str | None:
+    if assistant_description is None:
+        return description
+    if not description:
+        return assistant_description
+    if assistant_description.lower() in description.lower():
+        return description
+    return f"{description}\n{assistant_description}"
 
 
 def _clean_human_notes(description: str | None) -> str:
@@ -85,6 +276,22 @@ def _normalize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     normalized["category"] = str(normalized.get("category") or "")
     normalized["preparation_needed"] = bool(normalized.get("preparation_needed"))
     normalized["preparation_notes"] = str(normalized.get("preparation_notes") or "")
+    normalized["assistant_name"] = _clean_assistant_text(
+        normalized.get("assistant_name"),
+    )
+    normalized["assistant_help_request"] = _clean_assistant_text(
+        normalized.get("assistant_help_request"),
+    )
+    normalized["assistant_context"] = _clean_assistant_text(
+        normalized.get("assistant_context"),
+    )
+    normalized["assistant_help_needed"] = bool(
+        normalized.get("assistant_help_needed")
+        or normalized["assistant_help_request"]
+        or normalized["assistant_context"],
+    )
+    if normalized["assistant_help_needed"] and not normalized["assistant_name"]:
+        normalized["assistant_name"] = ASSISTANT_NAMES[0]
     return normalized
 
 
@@ -1003,22 +1210,28 @@ def _delete_intent(user_text: str, reference: datetime) -> dict[str, Any]:
 
 
 def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
-    recurrence = _extract_recurrence(user_text, reference)
-    date, _ = _extract_date(user_text, reference)
-    if recurrence is not None:
-        date = recurrence["start_date"]
-    start_time = _extract_time(user_text) or _extract_standalone_time(
-        user_text,
+    event_text, assistant_metadata, assistant_description = _extract_assistant_help(
         user_text,
     )
-    location = _extract_location(user_text)
-    purpose = _extract_purpose(user_text)
-    with_description = _extract_with_description(user_text)
-    flight_description = _extract_flight_description(user_text, location)
-    pickup = _extract_pickup_parts(user_text)
+    intent_text = event_text or user_text
+    recurrence = _extract_recurrence(intent_text, reference)
+    date, _ = _extract_date(intent_text, reference)
+    if recurrence is not None:
+        date = recurrence["start_date"]
+    start_time = _extract_time(intent_text) or _extract_standalone_time(
+        intent_text,
+        intent_text,
+    )
+    location = _extract_location(intent_text)
+    purpose = _extract_purpose(intent_text)
+    with_description = _extract_with_description(intent_text)
+    flight_description = _extract_flight_description(intent_text, location)
+    pickup = _extract_pickup_parts(intent_text)
     if pickup is not None and pickup["source"]:
         location = location or pickup["source"]
-    metadata = _extract_metadata(user_text)
+    metadata = _extract_metadata(intent_text)
+    metadata.update(assistant_metadata)
+    metadata = _normalize_metadata(metadata)
     preparation_notes = metadata["preparation_notes"]
     pickup_notes = pickup["notes"] if pickup is not None else None
     description = (
@@ -1029,7 +1242,8 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         or preparation_notes
         or None
     )
-    title = _title_from_text(user_text, location, purpose)
+    description = _append_assistant_description(description, assistant_description)
+    title = _title_from_text(intent_text, location, purpose)
 
     missing_fields = []
     if title is None:
@@ -1057,15 +1271,17 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
 
 def extract_intent(user_text: str, now: datetime | None = None) -> dict[str, Any]:
     reference = _default_now(now)
-    if _is_update_request(user_text):
-        return _update_intent(user_text, reference)
-    if _is_delete_request(user_text):
-        return _delete_intent(user_text, reference)
-    if _is_preparation_request(user_text):
-        return _preparation_intent(user_text, reference)
-    if _is_briefing_request(user_text):
-        return _briefing_intent(user_text, reference)
-    if _is_list_request(user_text):
-        return _list_intent(user_text, reference)
+    intent_text, _, _ = _extract_assistant_help(user_text)
+    routing_text = intent_text or user_text
+    if _is_update_request(routing_text):
+        return _update_intent(routing_text, reference)
+    if _is_delete_request(routing_text):
+        return _delete_intent(routing_text, reference)
+    if _is_preparation_request(routing_text):
+        return _preparation_intent(routing_text, reference)
+    if _is_briefing_request(routing_text):
+        return _briefing_intent(routing_text, reference)
+    if _is_list_request(routing_text):
+        return _list_intent(routing_text, reference)
 
     return _create_intent(user_text, reference)

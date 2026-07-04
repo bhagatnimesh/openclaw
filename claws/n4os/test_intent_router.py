@@ -8,10 +8,39 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from claw import N4OSClaw
+from input_normalizer import improve_entered_text
 from intent_router import route_request
 
 
 REFERENCE_TIME = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+
+def _fusd_waitlist_request():
+    return "\n".join(
+        [
+            "I want to add a task for Monday at 2 p.m. to call FUSD "
+            "to follow up on Nyshas School waiting",
+            "list for Chad Bond. This task is for Namesh. "
+            "I want AI assistant to find out FUSD number to call",
+            "and the key talking points. I really want",
+            "Nyshad to meet Chad Bond from overflow",
+            "on ASS School to Mission Valley Monteserie.",
+        ]
+    )
+
+
+def _dropped_subject_fusd_waitlist_request():
+    return "\n".join(
+        [
+            "want to add a task for Monday at 3 p.m. to call FUSD "
+            "to follow up on Nyshas School waiting",
+            "list for Chad Bond. This task is for Namesh. "
+            "I want Noah to find out FUSD number to call",
+            "and the key talking points. I really want",
+            "Nyshad to meet Chad Bond from overflow",
+            "on ASS School to Mission Valley Monteserie",
+        ]
+    )
 
 
 def _metadata_blob(metadata):
@@ -120,6 +149,18 @@ class FakeCalendarClaw:
         self.calls.append(("update", request, reference_time))
 
 
+class PendingCalendarClaw(FakeCalendarClaw):
+    def __init__(self):
+        super().__init__()
+        self.pending_action = {"intent": "create_event"}
+        self.pending_responses = []
+
+    def handle_pending_response(self, request):
+        self.pending_responses.append(request)
+        print(f"Calendar pending consumed: {request}")
+        return True
+
+
 class FakeTasksClaw:
     def __init__(self, tasks=None, recommended=None):
         self.calls = []
@@ -139,6 +180,9 @@ class FakeTasksClaw:
 
     def delete_task_from_request(self, request):
         self.calls.append(("delete", request, None))
+
+    def run_noah_assistant_help_from_request(self, request, reference_time=None):
+        self.calls.append(("run_assistant_help", request, reference_time))
 
 
 class FakeHomeBoardClaw:
@@ -162,6 +206,24 @@ class MissingGoogleTasksClaw:
 
 
 class IntentRouterTest(unittest.TestCase):
+    def test_input_improvement_keeps_plain_to_do_phrase(self):
+        self.assertEqual(
+            improve_entered_text("what do I need to do today"),
+            "what do I need to do today",
+        )
+
+    def test_input_improvement_keeps_tax_return_phrase(self):
+        self.assertEqual(
+            improve_entered_text("add tax return reminder tomorrow"),
+            "add tax return reminder tomorrow",
+        )
+
+    def test_input_improvement_preserves_noah_help_marker(self):
+        self.assertEqual(
+            improve_entered_text("Noah, help look up the FUSD phone number"),
+            "Noah, help look up the FUSD phone number",
+        )
+
     def test_routes_calendar_creation(self):
         decision = route_request("Add dentist tomorrow at 3pm", now=REFERENCE_TIME)
 
@@ -175,6 +237,13 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(decision["route"], "calendar")
         self.assertGreaterEqual(decision["confidence"], 0.6)
 
+    def test_routes_time_bound_call_to_calendar(self):
+        decision = route_request("Call Rahul tomorrow at 5pm", now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "calendar")
+        self.assertIn("create_event", decision["intent_summary"])
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
     def test_routes_task_creation(self):
         decision = route_request(
             "Add task change water filter this weekend",
@@ -184,6 +253,70 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(decision["route"], "tasks")
         self.assertGreaterEqual(decision["confidence"], 0.6)
         self.assertIn("family-tasks", decision["intent_summary"])
+
+    def test_routes_ai_assistant_marked_task_creation(self):
+        request = "\n".join(
+            [
+                "I want AI assistant",
+                "call FUSD for following up on Nysha's waitlist status for Chadbourne",
+                "Help: look up the FUSD phone number and draft quick talking points",
+            ]
+        )
+
+        decision = route_request(request, now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_noah_marked_task_creation(self):
+        request = "\n".join(
+            [
+                "Ask Noah to help",
+                "call FUSD for following up on Nysha's waitlist status for Chadbourne",
+                "Help: look up the FUSD phone number and draft quick talking points",
+            ]
+        )
+
+        decision = route_request(request, now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_inline_noah_assistant_task_creation(self):
+        decision = route_request(
+            "I want Noah to call FUSD for following up on Nysha waitlist and find the phone number",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIn("create_task", decision["intent_summary"])
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_direct_noah_research_request_to_tasks(self):
+        decision = route_request(
+            "Ask Noah to help look up the FUSD phone number",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIn("create_task", decision["intent_summary"])
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_noah_assistant_run_to_tasks(self):
+        decision = route_request("Run Noah assistant help", now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIn("run_assistant_help", decision["intent_summary"])
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_natural_packing_list_to_tasks(self):
+        decision = route_request(
+            "to pack beach matt, sunc screen, fruits, water for the trip tomorrow",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
 
     def test_routes_home_board_notice(self):
         decision = route_request(
@@ -205,6 +338,210 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(decision["route"], "tasks")
         self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_task_list_for_tomorrow_to_tasks(self):
+        decision = route_request("Give me list of tasks tomorrow", now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_voice_transcription_and_a_task_to_tasks(self):
+        decision = route_request(
+            "and a task for tomorrow to order the lock",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIn("create_task", decision["intent_summary"])
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_dispatches_task_list_for_tomorrow_only_to_tasks(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw(
+            recommended=[
+                _task(
+                    "Return water filter",
+                    {},
+                    due="2026-07-04T00:00:00.000Z",
+                )
+            ],
+        )
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "Give me list of tasks tomorrow",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(
+            tasks.calls,
+            [("recommend", "Give me list of tasks tomorrow", REFERENCE_TIME)],
+        )
+
+    def test_dispatches_ai_assistant_marked_task_to_tasks(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = "\n".join(
+            [
+                "I want AI assistant",
+                "call FUSD for following up on Nysha's waitlist status for Chadbourne",
+                "Help: look up the FUSD phone number and draft quick talking points",
+            ]
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+
+    def test_dispatches_inline_noah_assistant_task_to_tasks(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = (
+            "I want Noah to call FUSD for following up on Nysha waitlist "
+            "and find the phone number"
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+
+    def test_dispatches_direct_noah_research_request_to_tasks(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = "Ask Noah to help look up the FUSD phone number"
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+
+    def test_dispatches_noah_help_wake_phrase_to_tasks(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = "Noah, help look up the FUSD phone number"
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+
+    def test_dispatches_noah_assistant_run_to_tasks(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = "Run Noah assistant help"
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [("run_assistant_help", request, REFERENCE_TIME)])
+
+    def test_dispatches_polite_timed_task_request_to_task_creation(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = _fusd_waitlist_request()
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIn("create_task", decision["intent_summary"])
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+
+    def test_dispatches_dropped_subject_task_request_to_task_creation(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = _dropped_subject_fusd_waitlist_request()
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIn("create_task", decision["intent_summary"])
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+
+    def test_dispatches_voice_transcription_and_a_task_to_task_creation(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = "and a task for tomorrow to order the lock"
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIn("create_task", decision["intent_summary"])
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+
+    def test_dispatch_improves_voice_typed_task_text(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "Can you add tax buy milk",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [("create", "add task buy milk", REFERENCE_TIME)])
+
+    def test_dispatch_improves_home_board_mishearing(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        home_board = FakeHomeBoardClaw()
+        claw = N4OSClaw(
+            calendar_claw=calendar,
+            tasks_claw=tasks,
+            home_board_claw=home_board,
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request("show home bored", reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "home_board")
+        self.assertEqual(home_board.calls, [("list", "show home board", REFERENCE_TIME)])
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [])
+
+    def test_dispatches_time_bound_call_to_calendar(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = "Call Rahul tomorrow at 5pm"
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "calendar")
+        self.assertEqual(calendar.calls, [("create", request, REFERENCE_TIME)])
+        self.assertEqual(tasks.calls, [])
 
     def test_routes_day_briefing_to_both(self):
         decision = route_request("Give me my day briefing", now=REFERENCE_TIME)
@@ -229,7 +566,10 @@ class IntentRouterTest(unittest.TestCase):
             decision = claw.handle_request("hmm maybe later", reference_time=REFERENCE_TIME)
 
         self.assertEqual(decision["route"], "unknown")
-        self.assertIn("Should I use Calendar, Tasks, Home Board, or both?", output.getvalue())
+        self.assertIn(
+            "Should I use Calendar, Tasks, Home Board, or Calendar + Tasks?",
+            output.getvalue(),
+        )
         self.assertEqual(calendar.calls, [])
         self.assertEqual(tasks.calls, [])
 
@@ -248,6 +588,38 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(first_decision["route"], "unknown")
         self.assertEqual(clarified_decision["route"], "calendar")
         self.assertEqual(calendar.calls, [("create", "hmm maybe later", REFERENCE_TIME)])
+        self.assertEqual(tasks.calls, [])
+
+    def test_new_task_bypasses_pending_calendar_followup(self):
+        calendar = PendingCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = "to pack beach matt, sunc screen, fruits, water for the trip tomorrow"
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(calendar.pending_responses, [])
+        self.assertIsNone(calendar.pending_action)
+        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+
+    def test_bare_home_board_command_lists_without_clarification_loop(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        home_board = FakeHomeBoardClaw()
+        claw = N4OSClaw(
+            calendar_claw=calendar,
+            tasks_claw=tasks,
+            home_board_claw=home_board,
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request("Home board", reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "home_board")
+        self.assertEqual(home_board.calls, [("list", "Home board", REFERENCE_TIME)])
+        self.assertEqual(calendar.calls, [])
         self.assertEqual(tasks.calls, [])
 
     def test_home_board_notice_dispatches_to_home_board_claw(self):

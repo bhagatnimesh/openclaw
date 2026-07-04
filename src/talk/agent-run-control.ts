@@ -17,6 +17,7 @@ import {
   formatRealtimeVoiceAgentQueueRejection,
   formatRealtimeVoiceAgentStatus,
   resolveRealtimeVoiceAgentControlIntent,
+  type RealtimeVoiceAgentControlIntent,
   type RealtimeVoiceAgentControlResult,
   type RealtimeVoiceAgentRunActivity,
 } from "./agent-run-control-shared.js";
@@ -31,8 +32,13 @@ export {
   REALTIME_VOICE_AGENT_CONTROL_MODES,
   REALTIME_VOICE_AGENT_CONTROL_TOOL,
   REALTIME_VOICE_AGENT_CONTROL_TOOL_NAME,
+  resolveRealtimeVoiceAgentControlIntentAsync,
   resolveRealtimeVoiceAgentControlIntent,
   shouldAutoControlRealtimeVoiceAgentText,
+  type RealtimeVoiceAgentControlClassifier,
+  type RealtimeVoiceAgentControlClassifierContext,
+  type RealtimeVoiceAgentControlClassifierMode,
+  type RealtimeVoiceAgentControlClassifierResult,
   type RealtimeVoiceAgentControlMode,
   type RealtimeVoiceAgentControlIntent,
   type RealtimeVoiceAgentControlProviderResult,
@@ -67,13 +73,16 @@ export async function controlRealtimeVoiceAgentRun(
     sessionKey: string;
     text: string;
     mode?: unknown;
+    intent?: RealtimeVoiceAgentControlIntent;
+    semanticText?: string;
     recentEvents?: readonly TalkEvent[];
   },
   deps: RealtimeVoiceAgentControlDeps = defaultDeps,
 ): Promise<RealtimeVoiceAgentControlResult> {
   const sessionKey = params.sessionKey.trim();
   const text = params.text.trim();
-  const intent = resolveRealtimeVoiceAgentControlIntent({ text, mode: params.mode });
+  const intent =
+    params.intent ?? resolveRealtimeVoiceAgentControlIntent({ text, mode: params.mode });
   const mode = intent.mode;
   const sessionId = deps.resolveActiveEmbeddedRunSessionId(sessionKey);
   const activity = deps.getDiagnosticSessionActivitySnapshot({ sessionId, sessionKey });
@@ -153,7 +162,9 @@ export async function controlRealtimeVoiceAgentRun(
 
   // Steering and follow-up both enqueue to the active run; follow-up is wrapped
   // so the runner treats it as deferred context instead of an immediate pivot.
-  const steerText = mode === "followup" ? buildRealtimeVoiceAgentFollowupSteeringText(text) : text;
+  const semanticText = params.semanticText?.trim() || intent.semanticText?.trim() || text;
+  const steerText =
+    mode === "followup" ? buildRealtimeVoiceAgentFollowupSteeringText(semanticText) : semanticText;
   const outcome = await deps.queueEmbeddedAgentMessageWithOutcomeAsync(sessionId, steerText, {
     steeringMode: "all",
     debounceMs: 0,

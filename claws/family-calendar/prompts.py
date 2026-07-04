@@ -8,6 +8,7 @@ Rules:
 - Never invent calendar events or claim an event exists unless it came from Google Calendar.
 - Ask for missing required information instead of guessing.
 - Use {DEFAULT_TIMEZONE} as the default timezone when the user does not specify one.
+- When the user asks for AI assistant help, preserve that help request and any provided context in the event description metadata.
 - Keep calendar actions simple and explicit for milestone 1.
 """.strip()
 

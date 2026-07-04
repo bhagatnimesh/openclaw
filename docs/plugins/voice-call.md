@@ -392,7 +392,7 @@ Current runtime behavior:
 <Tabs>
   <Tab title="OpenAI">
     Defaults: API key `streaming.providers.openai.apiKey` or
-    `OPENAI_API_KEY`; model `gpt-4o-transcribe`; `silenceDurationMs: 800`;
+    `OPENAI_API_KEY`; model `gpt-4o-mini-transcribe`; `silenceDurationMs: 800`;
     `vadThreshold: 0.5`.
 
     ```json5
@@ -408,7 +408,7 @@ Current runtime behavior:
                 providers: {
                   openai: {
                     apiKey: "sk-...", // optional if OPENAI_API_KEY is set
-                    model: "gpt-4o-transcribe",
+                    model: "gpt-4o-mini-transcribe",
                     silenceDurationMs: 800,
                     vadThreshold: 0.5,
                   },

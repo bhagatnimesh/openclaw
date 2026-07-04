@@ -648,6 +648,94 @@ describe("buildOpenAIRealtimeVoiceProvider", () => {
     });
   });
 
+  it("classifies low-confidence active-run control through the direct OpenAI Responses API", async () => {
+    fetchWithSsrFGuardMock.mockResolvedValueOnce({
+      response: createJsonResponse({
+        output_text: JSON.stringify({
+          mode: "steer",
+          confidence: "high",
+          semanticText: "Use the smaller fix.",
+        }),
+      }),
+      release: vi.fn(async () => undefined),
+    });
+    const provider = buildOpenAIRealtimeVoiceProvider();
+    if (!provider.classifyAgentControlIntent) {
+      throw new Error("expected OpenAI realtime provider to support intent classification");
+    }
+
+    await expect(
+      provider.classifyAgentControlIntent({
+        text: "usa el arreglo pequeño",
+        deterministicIntent: {
+          mode: "status",
+          confidence: "low",
+          reason: "safe_default",
+          shouldAutoControl: false,
+          rawText: "usa el arreglo pequeño",
+        },
+        providerConfig: { apiKey: "sk-test" }, // pragma: allowlist secret
+        sessionKey: "discord:g1:c1",
+      }),
+    ).resolves.toEqual({
+      mode: "steer",
+      confidence: "high",
+      semanticText: "Use the smaller fix.",
+    });
+
+    expectRecordFields(requireFetchRequest(), "fetch request", {
+      url: "https://api.openai.com/v1/responses",
+      auditContext: "openai-agent-control-intent-classifier",
+      timeoutMs: 4000,
+    });
+    expectRecordFields(requireFetchInit(), "fetch init", { method: "POST" });
+    expectRecordFields(requireFetchHeaders(), "fetch headers", {
+      Authorization: "Bearer sk-test", // pragma: allowlist secret
+      "Content-Type": "application/json",
+    });
+    const body = requireFetchJsonBody();
+    expectRecordFields(body, "classifier request body", {
+      model: "gpt-5.4-nano",
+      max_output_tokens: 120,
+      store: false,
+    });
+    expect(body.reasoning).toEqual({ effort: "none" });
+    expect(requireNestedRecord(body, ["text", "format"])).toMatchObject({
+      type: "json_schema",
+      name: "openclaw_voice_agent_control_intent",
+      strict: true,
+    });
+    expect(body.input).toEqual([
+      expect.objectContaining({ role: "system" }),
+      { role: "user", content: "usa el arreglo pequeño" },
+    ]);
+  });
+
+  it("skips the direct Responses classifier for Azure realtime configs", async () => {
+    const provider = buildOpenAIRealtimeVoiceProvider();
+    if (!provider.classifyAgentControlIntent) {
+      throw new Error("expected OpenAI realtime provider to support intent classification");
+    }
+
+    await expect(
+      provider.classifyAgentControlIntent({
+        text: "¿cómo va esto?",
+        deterministicIntent: {
+          mode: "status",
+          confidence: "low",
+          reason: "safe_default",
+          shouldAutoControl: false,
+        },
+        providerConfig: {
+          apiKey: "sk-test", // pragma: allowlist secret
+          azureEndpoint: "https://example.openai.azure.com",
+          azureDeployment: "realtime-prod",
+        },
+      }),
+    ).resolves.toBeUndefined();
+    expect(fetchWithSsrFGuardMock).not.toHaveBeenCalled();
+  });
+
   it("fails closed when keychain refs cannot be resolved", async () => {
     vi.stubEnv("OPENAI_API_KEY", "keychain:openclaw:OPENAI_REALTIME_MISSING_TEST");
     execFileSyncMock.mockImplementationOnce(() => {

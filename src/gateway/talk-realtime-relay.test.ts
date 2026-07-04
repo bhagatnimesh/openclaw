@@ -1360,6 +1360,102 @@ describe("talk realtime gateway relay", () => {
     expect(bridge.submitToolResult).toHaveBeenCalledTimes(1);
   });
 
+  it("uses provider intent metadata for low-confidence active-run relay transcripts", async () => {
+    let bridgeRequest: RealtimeVoiceBridgeCreateRequest | undefined;
+    const queueMessage = vi.fn(async () => undefined);
+    setActiveEmbeddedRun(
+      "embedded-session-1",
+      {
+        queueMessage,
+        isStreaming: () => true,
+        isCompacting: () => false,
+        abort: vi.fn(),
+      },
+      "main",
+    );
+    const bridge = {
+      connect: vi.fn(async () => undefined),
+      sendAudio: vi.fn(),
+      setMediaTimestamp: vi.fn(),
+      sendUserMessage: vi.fn(),
+      handleBargeIn: vi.fn(),
+      submitToolResult: vi.fn(),
+      acknowledgeMark: vi.fn(),
+      close: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+    const classifier = vi.fn(async () => ({
+      mode: "steer" as const,
+      confidence: "high" as const,
+      semanticText: "Use the smaller fix.",
+    }));
+    const provider: RealtimeVoiceProviderPlugin = {
+      id: "relay-test",
+      label: "Relay Test",
+      isConfigured: () => true,
+      classifyAgentControlIntent: classifier,
+      createBridge: (req) => {
+        bridgeRequest = req;
+        return bridge;
+      },
+    };
+    const providerConfig = { apiKey: "sk-test" };
+    const context = {
+      broadcastToConnIds: vi.fn(),
+      chatAbortControllers: new Map([
+        [
+          "run-1",
+          {
+            controller: new AbortController(),
+            sessionId: "run-1",
+            sessionKey: "main",
+            startedAtMs: 1,
+            expiresAtMs: Date.now() + 60_000,
+          },
+        ],
+      ]),
+    } as never;
+    const session = createTalkRealtimeRelaySession({
+      context,
+      connId: "conn-1",
+      provider,
+      providerConfig,
+      instructions: "brief",
+      tools: [],
+      sessionKey: "main",
+    });
+    registerTalkRealtimeRelayAgentRun({
+      relaySessionId: session.relaySessionId,
+      connId: "conn-1",
+      sessionKey: "main",
+      runId: "run-1",
+      callId: "call-1",
+    });
+
+    bridgeRequest?.onTranscript?.("user", "usa el arreglo pequeño", true);
+
+    await vi.waitFor(() => expect(queueMessage).toHaveBeenCalled());
+    expect(classifier).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "usa el arreglo pequeño",
+        providerConfig,
+        sessionKey: "main",
+        deterministicIntent: expect.objectContaining({
+          mode: "status",
+          confidence: "low",
+          shouldAutoControl: false,
+        }),
+      }),
+    );
+    expect(queueMessage).toHaveBeenCalledWith("Use the smaller fix.", {
+      steeringMode: "all",
+      debounceMs: 0,
+    });
+    expect(bridge.sendUserMessage).toHaveBeenCalledWith(
+      expect.stringContaining('Status: "Got it. I steered the active run."'),
+    );
+  });
+
   it("does not submit cancel results for synthetic forced-consult calls", async () => {
     vi.useFakeTimers();
 

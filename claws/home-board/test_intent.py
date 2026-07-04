@@ -51,6 +51,12 @@ class HomeBoardIntentTest(unittest.TestCase):
         self.assertEqual(intent["intent"], "list_items")
         self.assertEqual(intent["date"], "2026-07-03")
 
+    def test_bare_home_board_command_lists_items(self):
+        intent = extract_intent("Home board", now=REFERENCE_TIME)
+
+        self.assertEqual(intent["intent"], "list_items")
+        self.assertEqual(intent["date"], "2026-07-03")
+
     def test_unknown_text_does_not_become_notice(self):
         intent = extract_intent("What should I focus on today?", now=REFERENCE_TIME)
 

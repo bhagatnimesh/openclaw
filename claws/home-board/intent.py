@@ -311,6 +311,13 @@ def extract_intent(request: str, now: datetime | None = None) -> dict[str, Any]:
     if not cleaned_request:
         return {"intent": "unknown", "missing_fields": ["message"]}
 
+    if re.fullmatch(
+        r"(?:use\s+)?(?:home board|today at home|house board)",
+        lowered,
+    ):
+        item_date, _ = _extract_date(cleaned_request, reference)
+        return {"intent": "list_items", "date": item_date, "status": "pending"}
+
     if re.search(r"\b(show|list|what'?s|whats|what is)\b", lowered) and re.search(
         r"\b(home board|today at home|at home|house board)\b",
         lowered,

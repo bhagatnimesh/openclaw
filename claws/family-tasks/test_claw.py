@@ -13,6 +13,7 @@ from claw import (
     run_interactive,
 )
 from intent import DEFAULT_TIMEZONE, read_metadata_from_notes, write_metadata_to_notes
+from noah_assistant import NoahResearchResult, NoahSource
 
 
 class FakeProvider:
@@ -20,6 +21,7 @@ class FakeProvider:
         self.created = []
         self.completed = []
         self.deleted = []
+        self.updated = []
         self.tasks = []
 
     def list_task_lists(self):
@@ -48,7 +50,32 @@ class FakeProvider:
         status=None,
         task_list_id="@default",
     ):
-        return {"id": task_id, "status": status or "needsAction"}
+        updated = None
+        for task in self.tasks:
+            if task.get("id") != task_id:
+                continue
+            if title is not None:
+                task["title"] = title
+            if notes is not None:
+                task["notes"] = notes
+            if due is not None:
+                task["due"] = due
+            if status is not None:
+                task["status"] = status
+            updated = task
+            break
+
+        if updated is None:
+            updated = {
+                "id": task_id,
+                "title": title,
+                "notes": notes,
+                "due": due,
+                "status": status or "needsAction",
+            }
+
+        self.updated.append(updated)
+        return updated
 
     def complete_task(self, task_id, task_list_id="@default"):
         self.completed.append(task_id)
@@ -163,6 +190,33 @@ def _situational_tasks():
     ]
 
 
+class FakeResearchClient:
+    def __init__(self, result=None, error=None):
+        self.result = result or NoahResearchResult(
+            text="FUSD main line is 510-657-2350. Ask about the waitlist status.",
+            sources=[
+                NoahSource(
+                    title="Fremont Unified School District",
+                    url="https://www.fremont.k12.ca.us/",
+                )
+            ],
+        )
+        self.error = error
+        self.calls = []
+
+    def research(self, *, task_title, help_request, assistant_context):
+        self.calls.append(
+            {
+                "task_title": task_title,
+                "help_request": help_request,
+                "assistant_context": assistant_context,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
 class FamilyTasksClawTest(unittest.TestCase):
     def test_created_task_message_prefers_web_view_link(self):
         message = _format_created_task_message(
@@ -237,6 +291,244 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertEqual(metadata["effort_type"], "communication")
         self.assertEqual(metadata["requires"], ["phone"])
 
+    def test_add_task_from_request_stores_ai_assistant_help(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "\n".join(
+                    [
+                        "call FUSD for following up on Nysha's waitlist status for Chadbourne",
+                        "I want AI assistant",
+                        "Help: look up the FUSD phone number and draft quick talking points",
+                        "Email: waitlist@example.com",
+                    ]
+                ),
+                reference_time=now,
+            )
+
+        self.assertIn(
+            "Created task: Call FUSD for following up on Nysha's waitlist status for Chadbourne (task id: task-123).",
+            message,
+        )
+        self.assertIn(
+            "Noah acknowledged: On your behalf, Noah will look up the FUSD phone number and draft quick talking points and update you here when done.",
+            message,
+        )
+        created = provider.created[0]
+        notes, metadata = read_metadata_from_notes(created["notes"])
+        self.assertIn("Assistant help: Look up the FUSD phone number", notes)
+        self.assertIn("Assistant context: Email: waitlist@example.com", notes)
+        self.assertTrue(metadata["assistant_help_needed"])
+        self.assertEqual(metadata["assistant_name"], "Noah")
+        self.assertEqual(
+            metadata["assistant_help_request"],
+            "Look up the FUSD phone number and draft quick talking points",
+        )
+        self.assertEqual(
+            metadata["assistant_context"],
+            "Email: waitlist@example.com",
+        )
+
+    def test_add_task_from_polite_timed_request_creates_task(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 3, 21, 56, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "\n".join(
+                    [
+                        "I want to add a task for Monday at 2 p.m. to call FUSD "
+                        "to follow up on Nyshas School waiting",
+                        "list for Chad Bond. This task is for Namesh. "
+                        "I want AI assistant to find out FUSD number to call",
+                        "and the key talking points. I really want",
+                        "Nyshad to meet Chad Bond from overflow",
+                        "on ASS School to Mission Valley Monteserie.",
+                    ]
+                ),
+                reference_time=now,
+            )
+
+        self.assertIn(
+            "Created task: Call FUSD to follow up on Nyshas School waiting list for Chad Bond (task id: task-123).",
+            message,
+        )
+        self.assertIn(
+            "Noah acknowledged: On your behalf, Noah will find out FUSD number to call and the key talking points",
+            message,
+        )
+        created = provider.created[0]
+        notes, metadata = read_metadata_from_notes(created["notes"])
+        self.assertEqual(
+            created["title"],
+            "Call FUSD to follow up on Nyshas School waiting list for Chad Bond",
+        )
+        self.assertEqual(created["due"], "2026-07-06")
+        self.assertIn("Assistant help: Find out FUSD number", notes)
+        self.assertTrue(metadata["assistant_help_needed"])
+        self.assertIn(
+            "Find out FUSD number to call",
+            metadata["assistant_help_request"],
+        )
+
+    def test_add_task_from_noah_request_stores_assistant_metadata(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 3, 22, 6, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "\n".join(
+                    [
+                        "I want to add a task for Monday at 2 p.m. to call FUSD "
+                        "to follow up on Nyshas School waiting",
+                        "list for Chad Bond. This task is for Namesh. "
+                        "I want Noah to find out FUSD number to call",
+                        "and the key talking points. I really want",
+                        "Nyshad to meet Chad Bond from overflow",
+                        "on ASS School to Mission Valley Monteserie",
+                    ]
+                ),
+                reference_time=now,
+            )
+
+        self.assertIn(
+            "Created task: Call FUSD to follow up on Nyshas School waiting list for Chad Bond (task id: task-123).",
+            message,
+        )
+        self.assertIn(
+            "Noah acknowledged: On your behalf, Noah will find out FUSD number to call and the key talking points",
+            message,
+        )
+        created = provider.created[0]
+        notes, metadata = read_metadata_from_notes(created["notes"])
+        self.assertEqual(
+            created["title"],
+            "Call FUSD to follow up on Nyshas School waiting list for Chad Bond",
+        )
+        self.assertEqual(created["due"], "2026-07-06")
+        self.assertIn("Assistant help: Find out FUSD number", notes)
+        self.assertTrue(metadata["assistant_help_needed"])
+        self.assertEqual(metadata["assistant_name"], "Noah")
+        self.assertIn(
+            "Find out FUSD number to call",
+            metadata["assistant_help_request"],
+        )
+
+    def test_run_noah_assistant_help_writes_result_to_task(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            _task(
+                "Call FUSD about Chadbourne waitlist",
+                {
+                    "assistant_help_needed": True,
+                    "assistant_name": "Noah",
+                    "assistant_help_request": (
+                        "Find out FUSD number to call and the key talking points"
+                    ),
+                    "assistant_context": "Nysha is on the Chadbourne waitlist.",
+                    "effort_type": "communication",
+                },
+            )
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        client = FakeResearchClient()
+
+        with redirect_stdout(StringIO()):
+            message = claw.run_noah_assistant_help(
+                research_client=client,
+                reference_time=now,
+            )
+
+        self.assertIn("Noah completed 1 assistant help task", message)
+        self.assertEqual(
+            client.calls,
+            [
+                {
+                    "task_title": "Call FUSD about Chadbourne waitlist",
+                    "help_request": "Find out FUSD number to call and the key talking points",
+                    "assistant_context": "Nysha is on the Chadbourne waitlist.",
+                }
+            ],
+        )
+        notes, metadata = read_metadata_from_notes(provider.tasks[0]["notes"])
+        self.assertIn("Noah result (2026-07-03 09:00 PDT):", notes)
+        self.assertIn("FUSD main line is 510-657-2350", notes)
+        self.assertIn("Sources:", notes)
+        self.assertIn("https://www.fremont.k12.ca.us/", notes)
+        self.assertFalse(metadata["assistant_help_needed"])
+        self.assertEqual(metadata["assistant_help_status"], "completed")
+        self.assertEqual(
+            metadata["assistant_help_completed_at"],
+            "2026-07-03T09:00:00-07:00",
+        )
+        self.assertIn("510-657-2350", metadata["assistant_help_result_summary"])
+        self.assertEqual(
+            metadata["assistant_help_result_sources"],
+            [
+                {
+                    "title": "Fremont Unified School District",
+                    "url": "https://www.fremont.k12.ca.us/",
+                }
+            ],
+        )
+
+    def test_run_noah_assistant_help_records_retryable_error(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            _task(
+                "Research school transfer window",
+                {
+                    "assistant_help_needed": True,
+                    "assistant_name": "Noah",
+                    "assistant_help_request": "Find the transfer window.",
+                },
+            )
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        client = FakeResearchClient(error=RuntimeError("temporary OpenAI error"))
+
+        with redirect_stdout(StringIO()):
+            message = claw.run_noah_assistant_help(
+                research_client=client,
+                reference_time=now,
+            )
+
+        self.assertIn("Noah could not complete 1 assistant help task", message)
+        _, metadata = read_metadata_from_notes(provider.tasks[0]["notes"])
+        self.assertTrue(metadata["assistant_help_needed"])
+        self.assertEqual(metadata["assistant_help_status"], "error")
+        self.assertEqual(
+            metadata["assistant_help_last_attempt_at"],
+            "2026-07-03T09:00:00-07:00",
+        )
+        self.assertIn("temporary OpenAI error", metadata["assistant_help_error"])
+
+    def test_run_noah_assistant_help_skips_when_no_pending_tasks(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            _task(
+                "Call FUSD about Chadbourne waitlist",
+                {
+                    "assistant_help_needed": False,
+                    "assistant_help_status": "completed",
+                },
+            )
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            message = claw.run_noah_assistant_help(research_client=FakeResearchClient())
+
+        self.assertEqual(message, "No pending Noah assistant help tasks found.")
+        self.assertEqual(provider.updated, [])
+
     def test_add_task_from_request_reports_invalid_scope(self):
         claw = FamilyTasksClaw.from_provider(FailingProvider())
 
@@ -296,6 +588,25 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertIn("Call Rahul", message)
         self.assertNotIn("Research summer camps", message)
         self.assertIn("can do while driving", message)
+
+    def test_task_list_request_uses_matching_heading(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            _task("Return water filter", {}, due="2026-07-04T00:00:00.000Z"),
+            _task("Change furnace filter", {}, due="2026-07-05T00:00:00.000Z"),
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.recommend_tasks_from_request(
+                "Give me list of tasks tomorrow",
+                reference_time=now,
+            )
+
+        self.assertTrue(message.startswith("Matching tasks:"))
+        self.assertIn("Return water filter", message)
+        self.assertNotIn("Change furnace filter", message)
 
     def test_situational_recommendation_examples_use_fake_tasks(self):
         cases = [

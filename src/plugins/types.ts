@@ -49,6 +49,7 @@ import type {
 import type { RuntimeEnv } from "../runtime.js";
 import type { SecurityAuditFinding } from "../security/audit.types.js";
 import type { JsonSchemaObject } from "../shared/json-schema.types.js";
+import type { RealtimeVoiceAgentControlClassifier } from "../talk/agent-run-control-shared.js";
 import type {
   RealtimeVoiceBridge,
   RealtimeVoiceBrowserSession,
@@ -1919,6 +1920,7 @@ export type RealtimeVoiceProviderPlugin = {
   capabilities?: RealtimeVoiceProviderCapabilities;
   resolveConfig?: (ctx: RealtimeVoiceProviderResolveConfigContext) => RealtimeVoiceProviderConfig;
   isConfigured: (ctx: RealtimeVoiceProviderConfiguredContext) => boolean;
+  classifyAgentControlIntent?: RealtimeVoiceAgentControlClassifier;
   createBridge: (req: RealtimeVoiceBridgeCreateRequest) => RealtimeVoiceBridge;
   createBrowserSession?: (
     req: RealtimeVoiceBrowserSessionCreateRequest,

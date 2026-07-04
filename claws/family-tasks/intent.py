@@ -78,6 +78,10 @@ DEFAULT_METADATA = {
     "can_do_while": [],
     "location": "unknown",
     "owner": "unknown",
+    "assistant_help_needed": False,
+    "assistant_name": "",
+    "assistant_help_request": "",
+    "assistant_context": "",
 }
 
 HOUSEHOLD_PHYSICAL_WORDS = (
@@ -119,6 +123,98 @@ ERRAND_WORDS = (
     "drop off",
     "dropoff",
 )
+TASK_ACTION_WORDS = (
+    "pack",
+    "bring",
+    "buy",
+    "get",
+    "return",
+    "put",
+    "take",
+    "call",
+    "text",
+    "email",
+    "message",
+    "clean",
+    "repair",
+    "fix",
+    "change",
+    "replace",
+    "research",
+    "book",
+    "order",
+    "renew",
+    "submit",
+    "fill",
+    "prepare",
+    "send",
+    "drop off",
+    "pick up",
+    "pickup",
+)
+TASK_ACTION_PATTERN = "|".join(
+    re.escape(word).replace(r"\ ", r"\s+")
+    for word in TASK_ACTION_WORDS
+)
+CREATE_TASK_START_RE = re.compile(
+    rf"^\s*(?:to\s+)?(?:{TASK_ACTION_PATTERN})\b",
+    re.IGNORECASE,
+)
+CREATE_TASK_REQUEST_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
+    r"(?:add|create|capture|remember)\s+(?:an?\s+)?"
+    r"(?:task|todo|to-do|open loop)\b",
+    re.IGNORECASE,
+)
+CREATE_TASK_TRANSCRIPTION_RE = re.compile(
+    r"^\s*and\s+(?=(?:an?\s+)?(?:task|todo|to-do|open loop)\b)",
+    re.IGNORECASE,
+)
+LEADING_DUE_ACTION_RE = re.compile(
+    rf"^\s*(?:for|on)\s+"
+    r"(?:today|tomorrow|tonight|this\s+weekend|weekend|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"(?:\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))?"
+    rf"\s+to\s+(?=(?:{TASK_ACTION_PATTERN})\b)",
+    re.IGNORECASE,
+)
+EXPLICIT_CLOCK_TIME_RE = re.compile(
+    r"\b(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b|"
+    r"\bat\s+\d{1,2}(?::\d{2})?\b",
+    re.IGNORECASE,
+)
+TASK_OWNER_NOTE_RE = re.compile(
+    r"\b(?:this\s+)?task\s+(?:is\s+)?for\s+[\w'.-]+\.?.*$",
+    re.IGNORECASE,
+)
+ASSISTANT_NAMES = ("Noah",)
+ASSISTANT_NAME_PATTERN = "|".join(re.escape(name) for name in ASSISTANT_NAMES)
+ASSISTANT_HELP_MARKER_RE = re.compile(
+    rf"\b(?:(?:i\s+)?(?:want|need|could\s+use)\s+(?:an?\s+)?ai\s+assistant"
+    rf"(?:\s+(?:help|support))?|ask\s+(?:{ASSISTANT_NAME_PATTERN})\s+"
+    rf"(?:to\s+help|for\s+help)|(?:i\s+)?(?:want|need|would\s+like)\s+"
+    rf"(?:{ASSISTANT_NAME_PATTERN})\s+to|(?:{ASSISTANT_NAME_PATTERN})\s*,?\s+help)\b",
+    re.IGNORECASE,
+)
+ASSISTANT_HELP_MARKER_LINE_RE = re.compile(
+    rf"^\s*(?:(?:i\s+)?(?:want|need|could\s+use)\s+(?:an?\s+)?ai\s+assistant"
+    rf"(?:\s+(?:help|support))?|ask\s+(?:{ASSISTANT_NAME_PATTERN})\s+"
+    rf"(?:to\s+help|for\s+help)|(?:i\s+)?(?:want|need|would\s+like)\s+"
+    rf"(?:{ASSISTANT_NAME_PATTERN})\s+to\s+help|(?:{ASSISTANT_NAME_PATTERN})\s*,?\s+help)\.?\s*$",
+    re.IGNORECASE,
+)
+ASSISTANT_DETAIL_LABEL_RE = re.compile(
+    r"\b(?P<label>assistant\s+help|help|assistant\s+context|context|email|notes?)\s*:\s*",
+    re.IGNORECASE,
+)
+RUN_ASSISTANT_HELP_RE = re.compile(
+    rf"\b(?:run|process|work|check|do|complete)\b.*"
+    rf"\b(?:{ASSISTANT_NAME_PATTERN}|assistant(?:\s+help)?)\b.*"
+    r"\b(?:tasks?|queue|research|help)\b|"
+    rf"\b(?:{ASSISTANT_NAME_PATTERN}|assistant)\b.*"
+    r"\b(?:run|process|work|check|research)\b",
+    re.IGNORECASE,
+)
 
 
 def _default_now(now: datetime | None) -> datetime:
@@ -132,6 +228,162 @@ def _default_now(now: datetime | None) -> datetime:
 
 def _clean_spaces(value: str) -> str:
     return " ".join(value.split()).strip()
+
+
+def _clean_assistant_text(value: Any) -> str:
+    return _clean_spaces(str(value or "").strip())
+
+
+def _assistant_name_from_marker(marker: str) -> str:
+    for name in ASSISTANT_NAMES:
+        if re.search(rf"\b{re.escape(name)}\b", marker, flags=re.IGNORECASE):
+            return name
+    return ASSISTANT_NAMES[0]
+
+
+def _assistant_context_value(label: str, value: str) -> str:
+    cleaned = _clean_spaces(value.strip(" ."))
+    if not cleaned:
+        return ""
+
+    normalized_label = label.lower().replace("assistant ", "")
+    if normalized_label == "email":
+        return f"Email: {cleaned}"
+    return cleaned
+
+
+def _normalize_assistant_help_request(value: str) -> str:
+    cleaned = _clean_spaces(value.strip(" .,:;-"))
+    cleaned = re.sub(
+        r"^(?:help|support)?\s*(?:to|with|for)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"^(?:to|with|for)\s+", "", cleaned, flags=re.IGNORECASE)
+    if not cleaned:
+        return ""
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def _split_assistant_details(value: str) -> tuple[str, str]:
+    matches = list(ASSISTANT_DETAIL_LABEL_RE.finditer(value))
+    if not matches:
+        return _normalize_assistant_help_request(value), ""
+
+    help_parts = []
+    context_parts = []
+    leading = _normalize_assistant_help_request(value[: matches[0].start()])
+    if leading:
+        help_parts.append(leading)
+
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+        label = match.group("label")
+        detail = value[match.end() : next_start]
+        cleaned_detail = _clean_spaces(detail.strip(" ."))
+        if not cleaned_detail:
+            continue
+
+        normalized_label = label.lower().replace("assistant ", "")
+        if normalized_label == "help":
+            help_parts.append(_normalize_assistant_help_request(cleaned_detail))
+        else:
+            context = _assistant_context_value(label, cleaned_detail)
+            if context:
+                context_parts.append(context)
+
+    return "\n".join(part for part in help_parts if part), "\n".join(context_parts)
+
+
+def _assistant_note_text(help_request: str, assistant_context: str) -> str | None:
+    lines = ["Assistant help: " + (help_request or "requested")]
+    if assistant_context:
+        lines.append(f"Assistant context: {assistant_context}")
+    return "\n".join(lines)
+
+
+def _assistant_metadata(
+    help_request: str,
+    assistant_context: str,
+    assistant_name: str,
+) -> dict[str, Any]:
+    return {
+        "assistant_help_needed": True,
+        "assistant_name": assistant_name,
+        "assistant_help_request": help_request,
+        "assistant_context": assistant_context,
+    }
+
+
+def _extract_line_assistant_help(user_text: str) -> tuple[str, dict[str, Any], str | None] | None:
+    lines = [line.strip() for line in user_text.splitlines()]
+    marker_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if line and ASSISTANT_HELP_MARKER_LINE_RE.match(line)
+    ]
+    if not marker_indexes:
+        return None
+
+    marker_index = marker_indexes[0]
+    assistant_name = _assistant_name_from_marker(lines[marker_index])
+    before = [line for line in lines[:marker_index] if line]
+    after = [line for line in lines[marker_index + 1 :] if line]
+    main_lines = list(before)
+    help_parts: list[str] = []
+    context_parts: list[str] = []
+
+    for line in after:
+        label_match = ASSISTANT_DETAIL_LABEL_RE.match(line)
+        if label_match is not None:
+            label = label_match.group("label")
+            value = line[label_match.end() :]
+            if label.lower().replace("assistant ", "") == "help":
+                help_text = _normalize_assistant_help_request(value)
+                if help_text:
+                    help_parts.append(help_text)
+            else:
+                context = _assistant_context_value(label, value)
+                if context:
+                    context_parts.append(context)
+            continue
+
+        if before:
+            help_text = _normalize_assistant_help_request(line)
+            if help_text:
+                help_parts.append(help_text)
+        else:
+            main_lines.append(line)
+
+    help_request = "\n".join(help_parts)
+    assistant_context = "\n".join(context_parts)
+    return (
+        _clean_spaces(" ".join(main_lines)),
+        _assistant_metadata(help_request, assistant_context, assistant_name),
+        _assistant_note_text(help_request, assistant_context),
+    )
+
+
+def _extract_assistant_help(user_text: str) -> tuple[str, dict[str, Any], str | None]:
+    line_result = _extract_line_assistant_help(user_text)
+    if line_result is not None:
+        return line_result
+
+    match = ASSISTANT_HELP_MARKER_RE.search(user_text)
+    if match is None:
+        return user_text, {}, None
+
+    assistant_name = _assistant_name_from_marker(match.group(0))
+    main_text = _clean_spaces(user_text[: match.start()].strip(" .,\n"))
+    help_request, assistant_context = _split_assistant_details(user_text[match.end() :])
+    if not main_text and help_request:
+        main_text = help_request
+    return (
+        main_text,
+        _assistant_metadata(help_request, assistant_context, assistant_name),
+        _assistant_note_text(help_request, assistant_context),
+    )
 
 
 def _clean_list(values: Any, allowed: set[str] | None = None) -> list[str]:
@@ -243,6 +495,30 @@ def normalize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     )
     normalized["location"] = _clean_choice(normalized.get("location"), VALID_LOCATIONS)
     normalized["owner"] = _clean_owner(normalized.get("owner"))
+    normalized["assistant_name"] = _clean_assistant_text(
+        normalized.get("assistant_name"),
+    )
+    normalized["assistant_help_request"] = _clean_assistant_text(
+        normalized.get("assistant_help_request"),
+    )
+    normalized["assistant_context"] = _clean_assistant_text(
+        normalized.get("assistant_context"),
+    )
+    assistant_help_status = _clean_assistant_text(
+        normalized.get("assistant_help_status"),
+    ).lower()
+    if assistant_help_status:
+        normalized["assistant_help_status"] = assistant_help_status
+    normalized["assistant_help_needed"] = bool(
+        assistant_help_status != "completed"
+        and (
+            normalized.get("assistant_help_needed")
+            or normalized["assistant_help_request"]
+            or normalized["assistant_context"]
+        ),
+    )
+    if normalized["assistant_help_needed"] and not normalized["assistant_name"]:
+        normalized["assistant_name"] = ASSISTANT_NAMES[0]
     return normalized
 
 
@@ -556,16 +832,22 @@ def _infer_metadata(
 
 
 def _strip_create_words(user_text: str) -> str:
-    return re.sub(
-        r"^\s*(?:please\s+)?(?:add|create|capture|remember)\s+(?:an?\s+)?(?:task\s+)?",
+    cleaned = re.sub(
+        r"^\s*(?:please\s+)?(?:"
+        r"(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
+        r"(?:add|create|capture|remember)\s+(?:an?\s+)?"
+        r"(?:(?:task|todo|to-do|open loop)\s+)?(?:to\s+)?"
+        r"|to\s+)",
         "",
         user_text,
         flags=re.IGNORECASE,
     ).strip()
+    return LEADING_DUE_ACTION_RE.sub("", cleaned, count=1).strip()
 
 
 def _strip_task_annotations(title: str) -> str:
     cleaned = title
+    cleaned = TASK_OWNER_NOTE_RE.sub("", cleaned)
     cleaned = re.sub(r"\s*,\s*(?:needs?|requires?).*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:this\s+weekend|today|tomorrow|tonight)\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(
@@ -604,18 +886,23 @@ def _extract_create_intent(
     user_text: str,
     reference: datetime,
 ) -> dict[str, Any]:
-    due, _ = _extract_due_date(user_text, reference)
-    title = _title_from_request(user_text)
+    task_text, assistant_metadata, assistant_notes = _extract_assistant_help(user_text)
+    intent_text = task_text or user_text
+    due, _ = _extract_due_date(intent_text, reference)
+    title = _title_from_request(intent_text)
     missing_fields = []
     if title is None:
         missing_fields.append("title")
 
+    metadata = _infer_metadata(intent_text, due)
+    metadata.update(assistant_metadata)
+
     return {
         "intent": "create_task",
         "title": title,
-        "notes": None,
+        "notes": assistant_notes,
         "due": due,
-        "metadata": _infer_metadata(user_text, due),
+        "metadata": normalize_metadata(metadata),
         "missing_fields": missing_fields,
     }
 
@@ -728,32 +1015,58 @@ def _extract_query_after_action(user_text: str) -> str | None:
     return cleaned or None
 
 
+def _normalize_create_request_text(user_text: str) -> str:
+    return CREATE_TASK_TRANSCRIPTION_RE.sub("add ", user_text, count=1)
+
+
+def _is_run_assistant_help_request(user_text: str) -> bool:
+    return RUN_ASSISTANT_HELP_RE.search(user_text) is not None
+
+
+def _has_explicit_clock_time(user_text: str) -> bool:
+    return EXPLICIT_CLOCK_TIME_RE.search(user_text) is not None
+
+
 def extract_intent(
     user_text: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     reference = _default_now(now)
-    lowered = user_text.lower().strip()
+    intent_text, assistant_metadata, _ = _extract_assistant_help(user_text)
+    request_text = _normalize_create_request_text(intent_text or user_text)
+    lowered = request_text.lower().strip()
+
+    if _is_run_assistant_help_request(request_text):
+        return {
+            "intent": "run_assistant_help",
+            "missing_fields": [],
+        }
 
     if re.search(r"^\s*(?:complete|finish|mark)\b", lowered):
         return {
             "intent": "complete_task",
-            "query": _extract_query_after_action(user_text),
+            "query": _extract_query_after_action(request_text),
             "missing_fields": [],
         }
 
     if re.search(r"^\s*(?:delete|remove)\b", lowered):
         return {
             "intent": "delete_task",
-            "query": _extract_query_after_action(user_text),
+            "query": _extract_query_after_action(request_text),
             "missing_fields": [],
         }
 
-    if re.search(r"^\s*(?:add|create|capture|remember)\b", lowered):
-        return _extract_create_intent(user_text, reference)
+    has_assistant_help = bool(assistant_metadata.get("assistant_help_needed"))
+    has_create_request = CREATE_TASK_REQUEST_RE.search(lowered) is not None
+    has_bare_task_start = CREATE_TASK_START_RE.search(lowered) is not None
+    if (has_assistant_help and request_text) or has_create_request or (
+        has_bare_task_start
+        and not _has_explicit_clock_time(request_text)
+    ):
+        return _extract_create_intent(_normalize_create_request_text(user_text), reference)
 
     return {
         "intent": "recommend_tasks",
-        "filters": _extract_recommendation_filters(user_text, reference),
+        "filters": _extract_recommendation_filters(request_text, reference),
         "missing_fields": [],
     }

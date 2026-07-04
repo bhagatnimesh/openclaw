@@ -1901,7 +1901,7 @@ describe("loadPluginManifestRegistry", () => {
           capabilities: ["image", "audio", "unknown"],
           defaultModels: {
             image: "gpt-5.4-mini",
-            audio: "gpt-4o-transcribe",
+            audio: "gpt-4o-mini-transcribe",
             unknown: "ignored",
           },
           autoPriority: {
@@ -1986,7 +1986,7 @@ describe("loadPluginManifestRegistry", () => {
         capabilities: ["image", "audio"],
         defaultModels: {
           image: "gpt-5.4-mini",
-          audio: "gpt-4o-transcribe",
+          audio: "gpt-4o-mini-transcribe",
         },
         autoPriority: {
           image: 10,

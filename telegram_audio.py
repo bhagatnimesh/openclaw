@@ -16,12 +16,17 @@ VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE = (
     "Voice transcription is not configured. Configure OpenClaw audio transcription or set "
     "N4OS_VOICE_TRANSCRIBE_COMMAND."
 )
-VOICE_TRANSCRIBE_TIMEOUT_SECONDS = 120
+VOICE_TRANSCRIBE_TIMEOUT_SECONDS = 75
 VOICE_PATH_PLACEHOLDERS = ("{{path}}", "{path}", "{{MediaPath}}")
 COMMON_NODE_CANDIDATES = (
     "/opt/homebrew/bin/node",
     "/usr/local/bin/node",
     "/usr/bin/node",
+)
+LOCAL_WHISPER_MODEL = "tiny"
+COMMON_WHISPER_CANDIDATES = (
+    "/opt/homebrew/bin/whisper",
+    "/usr/local/bin/whisper",
 )
 
 
@@ -31,6 +36,10 @@ class AudioTranscriber(Protocol):
 
 
 class VoiceTranscriptionUnavailable(RuntimeError):
+    pass
+
+
+class VoiceTranscriptionTimeout(RuntimeError):
     pass
 
 
@@ -133,6 +142,17 @@ def _resolve_node_command() -> str | None:
     return None
 
 
+def _resolve_whisper_command() -> str | None:
+    whisper = shutil.which("whisper")
+    if whisper:
+        return whisper
+
+    for candidate in COMMON_WHISPER_CANDIDATES:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _command_for_audio_path(command: Sequence[str], audio_path: Path) -> list[str]:
     path_value = str(audio_path)
     rendered = [_replace_audio_path_placeholders(part, path_value) for part in command]
@@ -189,11 +209,111 @@ def _parse_json_payload(body: str) -> Any | None:
     return None
 
 
+def _subprocess_env(extra_paths: Sequence[Path] = ()) -> dict[str, str]:
+    env = os.environ.copy()
+    path_parts = [str(path) for path in extra_paths]
+    existing_path = env.get("PATH", "")
+    if existing_path:
+        path_parts.append(existing_path)
+    env["PATH"] = os.pathsep.join(path_parts)
+    return env
+
+
+def create_default_audio_transcriber(
+    command: Sequence[str] | None = None,
+) -> AudioTranscriber:
+    if command is not None:
+        return CommandAudioTranscriber(command)
+
+    whisper = _resolve_whisper_command()
+    if whisper is not None:
+        return WhisperCliAudioTranscriber(whisper)
+
+    return CommandAudioTranscriber()
+
+
+class WhisperCliAudioTranscriber:
+    def __init__(
+        self,
+        command: str,
+        model: str = LOCAL_WHISPER_MODEL,
+        timeout_seconds: float = VOICE_TRANSCRIBE_TIMEOUT_SECONDS,
+    ) -> None:
+        self.command = command
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+
+    async def transcribe(self, message: Any) -> str:
+        media = _first_audio_media(message)
+        if media is None:
+            return ""
+
+        with tempfile.TemporaryDirectory(prefix="n4os-telegram-audio-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            audio_path = tmpdir_path / f"message{_audio_suffix(media)}"
+            output_dir = tmpdir_path / "whisper-output"
+            output_dir.mkdir()
+            telegram_file = await media.get_file()
+            await telegram_file.download_to_drive(audio_path)
+            return await asyncio.to_thread(
+                self._run_command,
+                audio_path,
+                output_dir,
+            )
+
+    def _run_command(self, audio_path: Path, output_dir: Path) -> str:
+        command = [
+            self.command,
+            "--model",
+            self.model,
+            "--output_format",
+            "txt",
+            "--output_dir",
+            str(output_dir),
+            "--verbose",
+            "False",
+            str(audio_path),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+                env=_subprocess_env(
+                    (Path(self.command).parent, Path(self.command).resolve().parent),
+                ),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise VoiceTranscriptionTimeout(
+                f"Voice transcription command timed out after {self.timeout_seconds:g}s."
+            ) from error
+
+        if completed.returncode != 0:
+            details = (completed.stderr or completed.stdout).strip()
+            if details:
+                raise RuntimeError(details[-500:])
+            raise RuntimeError(
+                f"Voice transcription command exited with {completed.returncode}."
+            )
+
+        output_path = output_dir / f"{audio_path.stem}.txt"
+        if output_path.exists():
+            return output_path.read_text(encoding="utf-8").strip()
+
+        fallback = _extract_transcript(completed.stdout)
+        if fallback.startswith("Skipping ") and " due to " in fallback:
+            raise RuntimeError(fallback[-500:])
+        return fallback
+
+
 class CommandAudioTranscriber:
     def __init__(
         self,
         command: Sequence[str] | None = None,
         cwd: Path | None = None,
+        timeout_seconds: float = VOICE_TRANSCRIBE_TIMEOUT_SECONDS,
     ) -> None:
         self.command = (
             tuple(command)
@@ -201,6 +321,7 @@ class CommandAudioTranscriber:
             else _default_openclaw_transcribe_command()
         )
         self.cwd = cwd or Path(__file__).resolve().parent
+        self.timeout_seconds = timeout_seconds
 
     async def transcribe(self, message: Any) -> str:
         media = _first_audio_media(message)
@@ -217,14 +338,19 @@ class CommandAudioTranscriber:
 
     def _run_command(self, audio_path: Path) -> str:
         command = _command_for_audio_path(self.command, audio_path)
-        completed = subprocess.run(
-            command,
-            cwd=self.cwd,
-            capture_output=True,
-            text=True,
-            timeout=VOICE_TRANSCRIBE_TIMEOUT_SECONDS,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.cwd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise VoiceTranscriptionTimeout(
+                f"Voice transcription command timed out after {self.timeout_seconds:g}s."
+            ) from error
         if completed.returncode != 0:
             details = (completed.stderr or completed.stdout).strip()
             if details:

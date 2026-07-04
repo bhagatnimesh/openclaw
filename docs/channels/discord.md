@@ -1321,6 +1321,11 @@ STT plus TTS pipeline:
 - `voice.model`, when set, overrides only the response LLM for this voice-channel turn.
 - `voice.tts` is merged over `messages.tts`; streaming-capable providers feed the player directly, otherwise the resulting audio file is played in the joined channel.
 
+Realtime active-run control:
+
+- Discord realtime voice first uses deterministic local matching for status, cancel, steer, and follow-up phrases. When the selected realtime provider offers an intent classifier, OpenClaw may use it only for low-confidence transcripts so multilingual or fuzzy phrasing can classify intent without changing the original transcript.
+- AI-rewritten text is used only for high-confidence steer and follow-up control actions. Cancellation still requires an explicit local control phrase before OpenClaw automatically stops an active run.
+
 Default agent-proxy voice-channel session example:
 
 ```json5

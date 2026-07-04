@@ -8,6 +8,7 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { RealtimeVoiceTool } from "./provider-types.js";
 import type { TalkEvent } from "./talk-events.js";
 
@@ -61,13 +62,39 @@ export type RealtimeVoiceAgentControlIntent = {
   confidence: "high" | "medium" | "low";
   reason:
     | "explicit_mode"
+    | "ai_classifier"
     | "cancel_safety"
     | "status_query"
     | "followup_marker"
     | "steer_command"
     | "safe_default";
   shouldAutoControl: boolean;
+  rawText?: string;
+  semanticText?: string;
 };
+
+/** Optional provider-side classifier modes; "ignore" means the utterance is not active-run control. */
+export type RealtimeVoiceAgentControlClassifierMode = RealtimeVoiceAgentControlMode | "ignore";
+
+/** Provider-side classification result for low-confidence active-run speech. */
+export type RealtimeVoiceAgentControlClassifierResult = {
+  mode: RealtimeVoiceAgentControlClassifierMode;
+  confidence: "high" | "medium" | "low";
+  semanticText?: string;
+};
+
+/** Context passed to an optional provider-side active-run control classifier. */
+export type RealtimeVoiceAgentControlClassifierContext = {
+  text: string;
+  deterministicIntent: RealtimeVoiceAgentControlIntent;
+  cfg?: OpenClawConfig;
+  providerConfig?: Record<string, unknown>;
+  sessionKey?: string;
+};
+
+export type RealtimeVoiceAgentControlClassifier = (
+  context: RealtimeVoiceAgentControlClassifierContext,
+) => Promise<RealtimeVoiceAgentControlClassifierResult | undefined>;
 
 /** Snapshot of active work used when recent Talk events cannot describe status. */
 export type RealtimeVoiceAgentRunActivity = {
@@ -221,7 +248,116 @@ export function resolveRealtimeVoiceAgentControlIntent(params: {
     confidence: "low",
     reason: "safe_default",
     shouldAutoControl: false,
+    rawText: text,
   };
+}
+
+function normalizeClassifierResult(
+  result: RealtimeVoiceAgentControlClassifierResult | undefined,
+): RealtimeVoiceAgentControlClassifierResult | undefined {
+  if (!result) {
+    return undefined;
+  }
+  const mode =
+    result.mode === "ignore" ? "ignore" : normalizeRealtimeVoiceAgentControlMode(result.mode);
+  if (!mode) {
+    return undefined;
+  }
+  const confidence =
+    result.confidence === "high" || result.confidence === "medium" || result.confidence === "low"
+      ? result.confidence
+      : undefined;
+  if (!confidence) {
+    return undefined;
+  }
+  return {
+    mode,
+    confidence,
+    ...(normalizeOptionalString(result.semanticText)
+      ? { semanticText: normalizeOptionalString(result.semanticText) }
+      : {}),
+  };
+}
+
+function mergeClassifierIntent(params: {
+  text: string;
+  deterministicIntent: RealtimeVoiceAgentControlIntent;
+  classifierResult: RealtimeVoiceAgentControlClassifierResult;
+}): RealtimeVoiceAgentControlIntent {
+  const result = params.classifierResult;
+  if (result.mode === "ignore") {
+    return {
+      ...params.deterministicIntent,
+      confidence: result.confidence,
+      reason: "ai_classifier",
+      shouldAutoControl: false,
+      rawText: params.text,
+    };
+  }
+  if (result.mode === "cancel") {
+    return {
+      mode: "cancel",
+      confidence: result.confidence,
+      reason: "ai_classifier",
+      shouldAutoControl: false,
+      rawText: params.text,
+    };
+  }
+
+  const shouldAutoControl = result.confidence === "high";
+  const semanticText =
+    shouldAutoControl && (result.mode === "steer" || result.mode === "followup")
+      ? normalizeOptionalString(result.semanticText)
+      : undefined;
+  return {
+    mode: result.mode,
+    confidence: result.confidence,
+    reason: "ai_classifier",
+    shouldAutoControl,
+    rawText: params.text,
+    ...(semanticText ? { semanticText } : {}),
+  };
+}
+
+/** Classify raw spoken control text, optionally asking a provider classifier for low-confidence text. */
+export async function resolveRealtimeVoiceAgentControlIntentAsync(params: {
+  text: string;
+  mode?: unknown;
+  cfg?: OpenClawConfig;
+  providerConfig?: Record<string, unknown>;
+  sessionKey?: string;
+  classifier?: RealtimeVoiceAgentControlClassifier;
+}): Promise<RealtimeVoiceAgentControlIntent> {
+  const deterministicIntent = resolveRealtimeVoiceAgentControlIntent({
+    text: params.text,
+    mode: params.mode,
+  });
+  if (deterministicIntent.shouldAutoControl || !params.classifier) {
+    return deterministicIntent;
+  }
+
+  let classifierResult: RealtimeVoiceAgentControlClassifierResult | undefined;
+  try {
+    classifierResult = normalizeClassifierResult(
+      await params.classifier({
+        text: params.text,
+        deterministicIntent,
+        ...(params.cfg ? { cfg: params.cfg } : {}),
+        ...(params.providerConfig ? { providerConfig: params.providerConfig } : {}),
+        ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+      }),
+    );
+  } catch {
+    return deterministicIntent;
+  }
+  if (!classifierResult) {
+    return deterministicIntent;
+  }
+  return mergeClassifierIntent({
+    text: params.text,
+    deterministicIntent,
+    classifierResult,
+  });
 }
 
 /** Return the best control mode for a spoken utterance, even if auto-routing is unsafe. */

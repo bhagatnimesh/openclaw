@@ -33,6 +33,7 @@ import {
   type RealtimeVoiceAgentControlResult,
   type RealtimeVoiceBridgeSession,
   type RealtimeVoiceProviderConfig,
+  type RealtimeVoiceProviderPlugin,
   type RealtimeVoiceToolCallEvent,
   type RealtimeVoiceForcedConsultCoordinator,
   type RealtimeVoiceForcedConsultHandle,
@@ -388,6 +389,8 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
   private outputPlaybackWatchdog: ReturnType<typeof setTimeout> | undefined;
   private outputPacedBuffer: Buffer = Buffer.alloc(0);
   private realtimeProviderId: string | undefined;
+  private realtimeProvider: RealtimeVoiceProviderPlugin | undefined;
+  private realtimeProviderConfig: RealtimeVoiceProviderConfig | undefined;
   private queuedExactSpeechMessages: string[] = [];
   private exactSpeechResponseActive = false;
   private exactSpeechAudioStarted = false;
@@ -460,6 +463,8 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
       noRegisteredProviderMessage: "No configured realtime voice provider registered",
     });
     this.realtimeProviderId = resolved.provider.id;
+    this.realtimeProvider = resolved.provider;
+    this.realtimeProviderConfig = resolved.providerConfig;
     const isAgentProxy = isDiscordAgentProxyVoiceMode(this.params.mode);
     const defaultToolPolicy: RealtimeVoiceAgentConsultToolPolicy = isAgentProxy
       ? "owner"
@@ -1292,6 +1297,11 @@ export class DiscordRealtimeVoiceSession implements VoiceRealtimeSession {
     const control = await maybeControlDiscordVoiceAgentRun({
       entry: this.params.entry,
       text: acceptedText,
+      cfg: this.params.cfg,
+      ...(this.realtimeProviderConfig ? { providerConfig: this.realtimeProviderConfig } : {}),
+      ...(this.realtimeProvider?.classifyAgentControlIntent
+        ? { classifier: this.realtimeProvider.classifyAgentControlIntent }
+        : {}),
     }).catch((error: unknown) => {
       logger.warn(
         `discord voice: realtime active-run control failed; falling back to normal transcript handling: ${formatErrorMessage(error)}`,

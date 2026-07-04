@@ -50,6 +50,25 @@ class HomeBoardClawTest(unittest.TestCase):
             ["Dad", "Helper", "Nysha"],
         )
 
+    def test_list_items_from_bare_home_board_command(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claw = HomeBoardClaw.from_provider(
+                SQLiteHomeBoardProvider(Path(tmpdir) / "n4os.db"),
+            )
+
+            with redirect_stdout(StringIO()):
+                claw.add_item_from_request(
+                    "Nysha, take your journal today",
+                    reference_time=REFERENCE_TIME,
+                )
+                message = claw.list_items_from_request(
+                    "Home board",
+                    reference_time=REFERENCE_TIME,
+                )
+
+        self.assertIn("Today at Home:", message)
+        self.assertIn("Nysha: Take your journal", message)
+
 
 if __name__ == "__main__":
     unittest.main()

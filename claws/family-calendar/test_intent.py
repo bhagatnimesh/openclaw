@@ -43,6 +43,64 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(intent["description"], "with Rahul")
         self.assertEqual(intent["missing_fields"], [])
 
+    def test_event_with_ai_assistant_help_metadata(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "\n".join(
+                [
+                    "Add Nysha school meeting tomorrow at 4pm",
+                    "I want AI assistant",
+                    "Help: find the teacher email and draft quick talking points",
+                    "Context: ask about waitlist status",
+                ]
+            ),
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Nysha school meeting")
+        self.assertEqual(intent["date"], "2026-07-03")
+        self.assertEqual(intent["start_time"], "16:00")
+        self.assertEqual(
+            intent["description"],
+            "Assistant help: Find the teacher email and draft quick talking points\n"
+            "Assistant context: ask about waitlist status",
+        )
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertEqual(
+            intent["metadata"]["assistant_help_request"],
+            "Find the teacher email and draft quick talking points",
+        )
+        self.assertEqual(
+            intent["metadata"]["assistant_context"],
+            "ask about waitlist status",
+        )
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_event_with_noah_assistant_help_metadata(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "\n".join(
+                [
+                    "Add Nysha school meeting tomorrow at 4pm",
+                    "Ask Noah to help",
+                    "Help: find the teacher email and draft quick talking points",
+                ]
+            ),
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Nysha school meeting")
+        self.assertTrue(intent["metadata"]["assistant_help_needed"])
+        self.assertEqual(intent["metadata"]["assistant_name"], "Noah")
+        self.assertEqual(
+            intent["metadata"]["assistant_help_request"],
+            "Find the teacher email and draft quick talking points",
+        )
+
     def test_leave_for_flight_uses_action_time(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
@@ -364,6 +422,24 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertIn("N4OS_METADATA:", description)
         self.assertEqual(metadata["owner"], "dad")
         self.assertEqual(metadata["category"], "shopping")
+        self.assertFalse(metadata["assistant_help_needed"])
+
+    def test_metadata_description_helpers_preserve_assistant_help(self):
+        description = write_metadata_to_description(
+            "Assistant help: Find the teacher email",
+            {
+                "assistant_help_needed": True,
+                "assistant_help_request": "Find the teacher email",
+                "assistant_context": "ask about waitlist status",
+            },
+        )
+
+        notes, metadata = read_metadata_from_description(description)
+
+        self.assertEqual(notes, "Assistant help: Find the teacher email")
+        self.assertTrue(metadata["assistant_help_needed"])
+        self.assertEqual(metadata["assistant_help_request"], "Find the teacher email")
+        self.assertEqual(metadata["assistant_context"], "ask about waitlist status")
 
     def test_recurring_natural_order_with_count(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))

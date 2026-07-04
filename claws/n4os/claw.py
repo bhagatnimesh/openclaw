@@ -16,6 +16,7 @@ try:
         module_scope,
         route_request,
     )
+    from .input_normalizer import improve_entered_text
     from .prompts import CLARIFICATION_PROMPT, SYSTEM_PROMPT
 except ImportError:
     from intent_router import (
@@ -27,6 +28,7 @@ except ImportError:
         module_scope,
         route_request,
     )
+    from input_normalizer import improve_entered_text
     from prompts import CLARIFICATION_PROMPT, SYSTEM_PROMPT
 
 
@@ -247,6 +249,33 @@ def _clarified_route(request: str) -> str | None:
     return None
 
 
+def _has_pending_action(claw: Any | None) -> bool:
+    return claw is not None and getattr(claw, "pending_action", None) is not None
+
+
+def _clear_pending_action(claw: Any | None) -> None:
+    if claw is not None and hasattr(claw, "pending_action"):
+        setattr(claw, "pending_action", None)
+
+
+def _pending_owner(calendar: Any | None, tasks: Any | None) -> str | None:
+    if _has_pending_action(calendar):
+        return "calendar"
+    if _has_pending_action(tasks):
+        return "tasks"
+    return None
+
+
+def _is_confident_new_route(decision: dict[str, Any], pending_owner: str) -> bool:
+    route = decision.get("route")
+    confidence = float(decision.get("confidence") or 0)
+    return (
+        route in ("calendar", "tasks", "home_board", "both")
+        and route != pending_owner
+        and confidence >= LOW_CONFIDENCE_THRESHOLD
+    )
+
+
 @dataclass
 class N4OSClaw:
     """Top-level N4OS router over family calendar, tasks, and Home Board claws."""
@@ -258,14 +287,26 @@ class N4OSClaw:
     pending_route_clarification: PendingRouteClarification | None = None
 
     def route(self, request: str, reference_time: datetime | None = None) -> dict[str, Any]:
-        return route_request(request, now=reference_time)
+        return route_request(improve_entered_text(request), now=reference_time)
 
     def handle_request(
         self,
         request: str,
         reference_time: datetime | None = None,
     ) -> dict[str, Any]:
+        request = improve_entered_text(request)
         calendar = self.calendar_claw
+        tasks = self.tasks_claw
+        pending_owner = _pending_owner(calendar, tasks)
+        if pending_owner is not None:
+            decision = self.route(request, reference_time=reference_time)
+            if _is_confident_new_route(decision, pending_owner):
+                _clear_pending_action(calendar)
+                _clear_pending_action(tasks)
+                self.pending_route_clarification = None
+                self._dispatch_decision(request, decision, reference_time)
+                return decision
+
         if calendar is not None and calendar.handle_pending_response(request):
             return {
                 "route": "calendar",
@@ -273,7 +314,6 @@ class N4OSClaw:
                 "confidence": 1.0,
             }
 
-        tasks = self.tasks_claw
         if tasks is not None and tasks.handle_pending_response(request):
             return {
                 "route": "tasks",
@@ -399,6 +439,11 @@ class N4OSClaw:
             claw.complete_task_from_request(request)
         elif intent["intent"] == "delete_task":
             claw.delete_task_from_request(request)
+        elif intent["intent"] == "run_assistant_help":
+            claw.run_noah_assistant_help_from_request(
+                request,
+                reference_time=reference_time,
+            )
         else:
             claw.recommend_tasks_from_request(request, reference_time=reference_time)
 

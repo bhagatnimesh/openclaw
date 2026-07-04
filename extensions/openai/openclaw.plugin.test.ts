@@ -145,7 +145,7 @@ describe("OpenAI plugin manifest", () => {
     const metadata = manifest.mediaUnderstandingProviderMetadata?.openai;
     expect(metadata?.capabilities).toEqual(["image", "audio"]);
     expect(metadata?.defaultModels?.image).toBe("gpt-5.5");
-    expect(metadata?.defaultModels?.audio).toBe("gpt-4o-transcribe");
+    expect(metadata?.defaultModels?.audio).toBe("gpt-4o-mini-transcribe");
     expect(metadata?.autoPriority?.image).toBe(20);
     expect(metadata?.autoPriority?.audio).toBe(20);
   });

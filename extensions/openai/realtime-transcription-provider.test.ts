@@ -254,7 +254,7 @@ describe("buildOpenAIRealtimeTranscriptionProvider", () => {
       audio: {
         input: {
           format: { type: "audio/pcmu" },
-          transcription: { model: "gpt-4o-transcribe" },
+          transcription: { model: "gpt-4o-mini-transcribe" },
           turn_detection: {
             type: "server_vad",
             threshold: 0.5,
@@ -278,7 +278,7 @@ describe("buildOpenAIRealtimeTranscriptionProvider", () => {
         audio: {
           input: {
             format: { type: "audio/pcmu" },
-            transcription: { model: "gpt-4o-transcribe" },
+            transcription: { model: "gpt-4o-mini-transcribe" },
             turn_detection: {
               type: "server_vad",
               threshold: 0.5,

@@ -11,7 +11,8 @@ import {
 import {
   buildRealtimeVoiceAgentControlSpeechMessage,
   controlRealtimeVoiceAgentRun,
-  shouldAutoControlRealtimeVoiceAgentText,
+  resolveRealtimeVoiceAgentControlIntentAsync,
+  type RealtimeVoiceAgentControlIntent,
   type RealtimeVoiceAgentControlResult,
 } from "../talk/agent-run-control.js";
 import { readSpeakableRealtimeVoiceToolResult } from "../talk/consult-question.js";
@@ -108,6 +109,9 @@ type RelaySession = {
   id: string;
   connId: string;
   context: GatewayRequestContext;
+  cfg: OpenClawConfig | undefined;
+  provider: RealtimeVoiceProviderPlugin;
+  providerConfig: RealtimeVoiceProviderConfig;
   bridge: RealtimeVoiceBridgeSession;
   talk: TalkSessionController;
   sessionKey?: string;
@@ -546,19 +550,34 @@ export function createTalkRealtimeRelaySession(
         if (isRelayAssistantEchoTranscript(relay, question)) {
           return;
         }
-        if (
-          relay &&
-          pruneInactiveRelayAgentRuns(relay) > 0 &&
-          shouldAutoControlRealtimeVoiceAgentText(question)
-        ) {
+        if (relay && pruneInactiveRelayAgentRuns(relay) > 0) {
           // While an agent consult is active, short user utterances like "stop"
           // steer the chat run instead of becoming a new consult.
-          void steerTalkRealtimeRelayAgentRun({
-            relaySessionId,
-            connId: params.connId,
+          void resolveRealtimeVoiceAgentControlIntentAsync({
             text: question,
+            providerConfig: relay.providerConfig,
+            ...(relay.sessionKey ? { sessionKey: relay.sessionKey } : {}),
+            ...(relay.cfg ? { cfg: relay.cfg } : {}),
+            ...(relay.provider.classifyAgentControlIntent
+              ? { classifier: relay.provider.classifyAgentControlIntent }
+              : {}),
           })
+            .then(async (intent) => {
+              if (!intent.shouldAutoControl) {
+                return undefined;
+              }
+              return await steerTalkRealtimeRelayAgentRun({
+                relaySessionId,
+                connId: params.connId,
+                text: question,
+                mode: intent.mode,
+                intent,
+              });
+            })
             .then((result) => {
+              if (!result) {
+                return;
+              }
               if (result.speak && !result.suppress && result.message.trim()) {
                 bridge.sendUserMessage(buildRealtimeVoiceAgentControlSpeechMessage(result.message));
               }
@@ -667,6 +686,9 @@ export function createTalkRealtimeRelaySession(
     id: relaySessionId,
     connId: params.connId,
     context: params.context,
+    cfg: params.cfg,
+    provider: params.provider,
+    providerConfig: params.providerConfig,
     bridge,
     talk,
     sessionKey: params.sessionKey?.trim() || undefined,
@@ -959,6 +981,7 @@ export async function steerTalkRealtimeRelayAgentRun(params: {
   sessionKey?: string;
   text: string;
   mode?: string;
+  intent?: RealtimeVoiceAgentControlIntent;
 }): Promise<RealtimeVoiceAgentControlResult> {
   const session = getRelaySession(params.relaySessionId, params.connId);
   const sessionKey = session.sessionKey;
@@ -974,6 +997,7 @@ export async function steerTalkRealtimeRelayAgentRun(params: {
     text: params.text,
     mode: params.mode,
     recentEvents: session.talk.recentEvents,
+    ...(params.intent ? { intent: params.intent } : {}),
   });
   const turnId = ensureRelayTurn(session);
   broadcastToOwner(session.context, session.connId, {

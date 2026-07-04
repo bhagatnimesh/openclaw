@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from io import StringIO
@@ -32,12 +33,14 @@ else:
     TELEGRAM_IMPORT_ERROR = None
 
 from claws.n4os.claw import N4OSClaw
+from claws.n4os.input_normalizer import improve_entered_text
 from telegram_audio import (
     AudioTranscriber,
-    CommandAudioTranscriber,
     VOICE_TRANSCRIBE_COMMAND_ENV,
     VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE,
+    VoiceTranscriptionTimeout,
     VoiceTranscriptionUnavailable,
+    create_default_audio_transcriber,
     has_audio,
     parse_voice_transcribe_command,
 )
@@ -55,8 +58,14 @@ HELP_MESSAGE = (
 )
 ERROR_MESSAGE = "Sorry, N4OS hit an error while handling that."
 UNSUPPORTED_MESSAGE = "Please send a text or voice message."
+VOICE_TRANSCRIPTION_STARTED_MESSAGE = "Got it, transcribing that voice message."
+VOICE_TRANSCRIPTION_RESULT_MESSAGE = "Transcribed: {text}"
 VOICE_TRANSCRIPTION_EMPTY_MESSAGE = "I could not hear any speech in that voice message."
 VOICE_TRANSCRIPTION_FAILED_MESSAGE = "Sorry, I could not transcribe that voice message."
+VOICE_TRANSCRIPTION_TIMEOUT_MESSAGE = (
+    "Sorry, voice transcription took too long. Please try a shorter voice message."
+)
+VOICE_TRANSCRIPTION_HANDLER_TIMEOUT_SECONDS = 90
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,8 @@ def configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def load_config(env_path: str | Path = ".env") -> TelegramConfig:
@@ -132,17 +143,18 @@ class N4OSTelegramBot:
         self.config = config
         self.claw = claw or N4OSClaw()
         self.logger = logger or LOGGER
-        self.audio_transcriber = audio_transcriber or CommandAudioTranscriber(
+        self.audio_transcriber = audio_transcriber or create_default_audio_transcriber(
             config.voice_transcribe_command,
         )
 
     def route_message(self, text: str) -> RouterResult:
         started = time.perf_counter()
+        improved_text = improve_entered_text(text)
         output = StringIO()
         # Existing N4OS claws print their user-facing messages; keep the
         # Telegram transport thin by capturing that router output verbatim.
         with redirect_stdout(output):
-            decision = self.claw.handle_request(text) or {}
+            decision = self.claw.handle_request(improved_text) or {}
 
         elapsed_ms = (time.perf_counter() - started) * 1000
         route = str(decision.get("route", "unknown"))
@@ -207,11 +219,25 @@ class N4OSTelegramBot:
             return
 
         if not text and has_audio(message):
+            await message.reply_text(VOICE_TRANSCRIPTION_STARTED_MESSAGE)
+            transcription_started = time.perf_counter()
             try:
-                text = (await self.audio_transcriber.transcribe(message)).strip()
+                transcript = await asyncio.wait_for(
+                    self.audio_transcriber.transcribe(message),
+                    timeout=VOICE_TRANSCRIPTION_HANDLER_TIMEOUT_SECONDS,
+                )
+                text = transcript.strip()
             except VoiceTranscriptionUnavailable:
                 await message.reply_text(VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE)
                 self.logger.info("chosen route=unsupported execution_ms=0.00")
+                return
+            except (VoiceTranscriptionTimeout, asyncio.TimeoutError):
+                elapsed_ms = (time.perf_counter() - transcription_started) * 1000
+                self.logger.warning(
+                    "Telegram audio transcription timed out execution_ms=%.2f",
+                    elapsed_ms,
+                )
+                await message.reply_text(VOICE_TRANSCRIPTION_TIMEOUT_MESSAGE)
                 return
             except Exception:
                 self.logger.exception("error while transcribing Telegram audio")
@@ -222,7 +248,13 @@ class N4OSTelegramBot:
                 await message.reply_text(VOICE_TRANSCRIPTION_EMPTY_MESSAGE)
                 self.logger.info("chosen route=unsupported execution_ms=0.00")
                 return
-            self.logger.info("transcribed Telegram audio chars=%d", len(text))
+            await message.reply_text(VOICE_TRANSCRIPTION_RESULT_MESSAGE.format(text=text))
+            elapsed_ms = (time.perf_counter() - transcription_started) * 1000
+            self.logger.info(
+                "transcribed Telegram audio chars=%d execution_ms=%.2f",
+                len(text),
+                elapsed_ms,
+            )
 
         if not text:
             await message.reply_text(UNSUPPORTED_MESSAGE)

@@ -676,7 +676,7 @@ Legacy `plugins.entries.openai.config.personality` is still read as a compatibil
     The bundled `openai` plugin registers batch speech-to-text through
     OpenClaw's media-understanding transcription surface.
 
-    - Default model: `gpt-4o-transcribe`
+    - Default model: `gpt-4o-mini-transcribe`
     - Endpoint: OpenAI REST `/v1/audio/transcriptions`
     - Input path: multipart audio file upload
     - Supported by OpenClaw wherever inbound audio transcription uses
@@ -694,7 +694,7 @@ Legacy `plugins.entries.openai.config.personality` is still read as a compatibil
               {
                 type: "provider",
                 provider: "openai",
-                model: "gpt-4o-transcribe",
+                model: "gpt-4o-mini-transcribe",
               },
             ],
           },
@@ -713,7 +713,7 @@ Legacy `plugins.entries.openai.config.personality` is still read as a compatibil
 
     | Setting | Config path | Default |
     |---------|------------|---------|
-    | Model | `plugins.entries.voice-call.config.streaming.providers.openai.model` | `gpt-4o-transcribe` |
+    | Model | `plugins.entries.voice-call.config.streaming.providers.openai.model` | `gpt-4o-mini-transcribe` |
     | Language | `...openai.language` | (unset) |
     | Prompt | `...openai.prompt` | (unset) |
     | Silence duration | `...openai.silenceDurationMs` | `800` |
@@ -745,6 +745,14 @@ Legacy `plugins.entries.openai.config.personality` is still read as a compatibil
     OpenAI recommends `marin` and `cedar` for the best Realtime quality. This
     is a separate set from the Text-to-speech voices above; do not assume a TTS
     voice such as `fable`, `nova`, or `onyx` is valid for Realtime sessions.
+
+    OpenAI realtime voice also exposes OpenClaw's optional active-run intent
+    classifier. For low-confidence transcripts, it calls the direct OpenAI
+    Responses API with `gpt-5.4-nano` and returns intent metadata. OpenClaw
+    preserves the raw transcript and only uses a rewritten semantic string for
+    high-confidence steer or follow-up actions; automatic cancel still requires
+    the local explicit cancel matcher. Azure OpenAI realtime configs skip this
+    classifier.
 
     <Note>
     Backend OpenAI realtime bridges use the GA Realtime WebSocket session shape, which does not accept `session.temperature`. Azure OpenAI deployments remain available via `azureEndpoint` and `azureDeployment` and keep the deployment-compatible session shape. Supports bidirectional tool calling and G.711 u-law audio.

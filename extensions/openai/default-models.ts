@@ -10,7 +10,7 @@ export const OPENAI_CODEX_DEFAULT_MODEL = OPENAI_DEFAULT_MODEL;
 export const OPENAI_DEFAULT_IMAGE_MODEL = "gpt-image-2";
 export const OPENAI_DEFAULT_TTS_MODEL = "gpt-4o-mini-tts";
 export const OPENAI_DEFAULT_TTS_VOICE = "alloy";
-export const OPENAI_DEFAULT_AUDIO_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
+export const OPENAI_DEFAULT_AUDIO_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 export const OPENAI_DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small";
 
 export function applyOpenAIProviderConfig(cfg: OpenClawConfig): OpenClawConfig {

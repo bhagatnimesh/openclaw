@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 import sys
 import tempfile
+import textwrap
 from typing import Any
 from unittest.mock import patch
 
 import telegram_audio
-from telegram_audio import CommandAudioTranscriber, VoiceTranscriptionUnavailable
+from telegram_audio import (
+    CommandAudioTranscriber,
+    VoiceTranscriptionTimeout,
+    VoiceTranscriptionUnavailable,
+    WhisperCliAudioTranscriber,
+    create_default_audio_transcriber,
+)
 from telegram_bot import (
     ERROR_MESSAGE,
     HELP_MESSAGE,
@@ -17,6 +25,10 @@ from telegram_bot import (
     N4OSTelegramBot,
     TelegramConfig,
     VOICE_TRANSCRIPTION_EMPTY_MESSAGE,
+    VOICE_TRANSCRIPTION_FAILED_MESSAGE,
+    VOICE_TRANSCRIPTION_RESULT_MESSAGE,
+    VOICE_TRANSCRIPTION_STARTED_MESSAGE,
+    VOICE_TRANSCRIPTION_TIMEOUT_MESSAGE,
     VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE,
     load_config,
 )
@@ -100,9 +112,11 @@ class FakeAudioTranscriber:
     def __init__(self, transcript: str) -> None:
         self.transcript = transcript
         self.messages: list[FakeMessage] = []
+        self.replies_at_start: list[str] = []
 
     async def transcribe(self, message: FakeMessage) -> str:
         self.messages.append(message)
+        self.replies_at_start = list(message.replies)
         return self.transcript
 
 
@@ -111,8 +125,21 @@ class UnavailableAudioTranscriber:
         raise VoiceTranscriptionUnavailable("not configured")
 
 
+class TimeoutAudioTranscriber:
+    async def transcribe(self, message: FakeMessage) -> str:
+        raise VoiceTranscriptionTimeout("timed out")
+
+
+class FailingAudioTranscriber:
+    async def transcribe(self, message: FakeMessage) -> str:
+        raise RuntimeError("transcription failed")
+
+
 class QuietLogger:
     def info(self, *args, **kwargs) -> None:
+        pass
+
+    def warning(self, *args, **kwargs) -> None:
         pass
 
     def exception(self, *args, **kwargs) -> None:
@@ -180,6 +207,20 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claw.requests, ["Add task buy milk"])
         self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
 
+    async def test_authorized_message_improves_voice_typed_text_before_routing(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("Can you add tax buy milk")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, ["add task buy milk"])
+        self.assertEqual(message.replies, ["router replied to: add task buy milk"])
+
     async def test_authorized_voice_routes_transcript_to_n4os(self):
         claw = FakeClaw()
         transcriber = FakeAudioTranscriber("Add task buy milk")
@@ -194,8 +235,40 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         await bot.handle_message(FakeUpdate(12345, message), None)
 
         self.assertEqual(transcriber.messages, [message])
+        self.assertEqual(transcriber.replies_at_start, [VOICE_TRANSCRIPTION_STARTED_MESSAGE])
         self.assertEqual(claw.requests, ["Add task buy milk"])
-        self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
+        self.assertEqual(
+            message.replies,
+            [
+                VOICE_TRANSCRIPTION_STARTED_MESSAGE,
+                VOICE_TRANSCRIPTION_RESULT_MESSAGE.format(text="Add task buy milk"),
+                "router replied to: Add task buy milk",
+            ],
+        )
+
+    async def test_authorized_voice_improves_transcript_before_routing(self):
+        claw = FakeClaw()
+        transcript = "Um can you remind me to order the lock tomorrow"
+        transcriber = FakeAudioTranscriber(transcript)
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            audio_transcriber=transcriber,
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, ["add task order the lock tomorrow"])
+        self.assertEqual(
+            message.replies,
+            [
+                VOICE_TRANSCRIPTION_STARTED_MESSAGE,
+                VOICE_TRANSCRIPTION_RESULT_MESSAGE.format(text=transcript),
+                "router replied to: add task order the lock tomorrow",
+            ],
+        )
 
     async def test_voice_requires_transcription_configuration(self):
         claw = FakeClaw()
@@ -209,7 +282,10 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         await bot.handle_message(FakeUpdate(12345, message), None)
 
-        self.assertEqual(message.replies, [VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE])
+        self.assertEqual(
+            message.replies,
+            [VOICE_TRANSCRIPTION_STARTED_MESSAGE, VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE],
+        )
         self.assertEqual(claw.requests, [])
 
     async def test_empty_voice_transcript_does_not_route(self):
@@ -224,7 +300,46 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         await bot.handle_message(FakeUpdate(12345, message), None)
 
-        self.assertEqual(message.replies, [VOICE_TRANSCRIPTION_EMPTY_MESSAGE])
+        self.assertEqual(
+            message.replies,
+            [VOICE_TRANSCRIPTION_STARTED_MESSAGE, VOICE_TRANSCRIPTION_EMPTY_MESSAGE],
+        )
+        self.assertEqual(claw.requests, [])
+
+    async def test_voice_timeout_replies_without_routing(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            audio_transcriber=TimeoutAudioTranscriber(),
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(
+            message.replies,
+            [VOICE_TRANSCRIPTION_STARTED_MESSAGE, VOICE_TRANSCRIPTION_TIMEOUT_MESSAGE],
+        )
+        self.assertEqual(claw.requests, [])
+
+    async def test_voice_transcription_error_replies_without_routing(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            audio_transcriber=FailingAudioTranscriber(),
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(
+            message.replies,
+            [VOICE_TRANSCRIPTION_STARTED_MESSAGE, VOICE_TRANSCRIPTION_FAILED_MESSAGE],
+        )
         self.assertEqual(claw.requests, [])
 
     async def test_command_audio_transcriber_downloads_voice_and_parses_json(self):
@@ -274,6 +389,99 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         local_entry = Path(telegram_audio.__file__).resolve().with_name("openclaw.mjs")
         self.assertIsNotNone(command)
         self.assertEqual(command[:2], (str(fake_node), str(local_entry)))
+
+    async def test_command_audio_transcriber_times_out_slow_command(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = Path(tmpdir) / "slow_stt.py"
+            script.write_text(
+                textwrap.dedent(
+                    """
+                    import time
+
+                    time.sleep(5)
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            telegram_file = FakeTelegramFile()
+            message = FakeMessage(voice=FakeTelegramVoice(telegram_file))
+            transcriber = CommandAudioTranscriber(
+                command=(sys.executable, str(script), "{{path}}"),
+                cwd=Path(tmpdir),
+                timeout_seconds=0.05,
+            )
+
+            with self.assertRaisesRegex(VoiceTranscriptionTimeout, "timed out"):
+                await transcriber.transcribe(message)
+
+    async def test_whisper_cli_audio_transcriber_reads_text_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            whisper = Path(tmpdir) / "whisper"
+            env_path = Path(tmpdir) / "path.txt"
+            whisper.write_text(
+                textwrap.dedent(
+                    f"""
+                    #!{sys.executable}
+                    import os
+                    import pathlib
+                    import sys
+
+                    output_dir = pathlib.Path(sys.argv[sys.argv.index("--output_dir") + 1])
+                    audio_path = pathlib.Path(sys.argv[-1])
+                    assert "--model" in sys.argv
+                    assert "tiny" in sys.argv
+                    assert audio_path.read_bytes() == b"audio bytes"
+                    pathlib.Path({str(env_path)!r}).write_text(os.environ["PATH"], encoding="utf-8")
+                    (output_dir / f"{{audio_path.stem}}.txt").write_text(
+                        "Add task from local whisper\\n",
+                        encoding="utf-8",
+                    )
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            whisper.chmod(0o755)
+            telegram_file = FakeTelegramFile()
+            message = FakeMessage(voice=FakeTelegramVoice(telegram_file))
+            transcriber = WhisperCliAudioTranscriber(str(whisper))
+
+            transcript = await transcriber.transcribe(message)
+            first_path_entry = env_path.read_text(encoding="utf-8").split(os.pathsep)[0]
+
+        self.assertEqual(transcript, "Add task from local whisper")
+        self.assertEqual(Path(first_path_entry).resolve(), Path(tmpdir).resolve())
+
+    async def test_whisper_cli_audio_transcriber_rejects_skipped_audio(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            whisper = Path(tmpdir) / "whisper"
+            whisper.write_text(
+                textwrap.dedent(
+                    f"""
+                    #!{sys.executable}
+                    print("Skipping message.m4a due to FileNotFoundError: ffmpeg")
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            whisper.chmod(0o755)
+            telegram_file = FakeTelegramFile()
+            message = FakeMessage(voice=FakeTelegramVoice(telegram_file))
+            transcriber = WhisperCliAudioTranscriber(str(whisper))
+
+            with self.assertRaisesRegex(RuntimeError, "Skipping message"):
+                await transcriber.transcribe(message)
+
+    def test_default_audio_transcriber_prefers_local_whisper(self):
+        with patch("telegram_audio._resolve_whisper_command", return_value="/tmp/whisper"):
+            transcriber = create_default_audio_transcriber()
+
+        self.assertIsInstance(transcriber, WhisperCliAudioTranscriber)
+
+    def test_default_audio_transcriber_uses_explicit_command(self):
+        transcriber = create_default_audio_transcriber(("fake-stt", "{{path}}"))
+
+        self.assertIsInstance(transcriber, CommandAudioTranscriber)
+        self.assertEqual(transcriber.command, ("fake-stt", "{{path}}"))
 
     async def test_help_uses_same_authorization_gate(self):
         bot = N4OSTelegramBot(
