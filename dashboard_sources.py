@@ -37,6 +37,36 @@ _DEFAULT_SOURCES: DashboardSources | None = None
 _DEFAULT_SOURCES_LOCK = threading.Lock()
 
 
+class _UnavailableSourceTools:
+    unavailable = True
+
+    def __init__(self, label: str, error: Exception):
+        self.label = label
+        self.error = error
+
+    def _response(self) -> dict[str, Any]:
+        return {
+            "status": "error",
+            "message": f"{self.label} source unavailable: {self.error.__class__.__name__}.",
+            "data": {"error_type": self.error.__class__.__name__},
+        }
+
+
+class _UnavailableCalendarTools(_UnavailableSourceTools):
+    def list_calendar_events(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+
+class _UnavailableTaskTools(_UnavailableSourceTools):
+    def list_tasks(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+
+class _UnavailableHomeBoardTools(_UnavailableSourceTools):
+    def list_items(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+
 @contextmanager
 def _isolated_claw_import(claw_dir: Path) -> Iterable[None]:
     module_names = ("tools", "provider", "intent", "matcher", "constants", "prompts", "claw")
@@ -61,25 +91,39 @@ def build_default_sources() -> DashboardSources:
     calendar_dir = ROOT / "claws" / "family-calendar"
     tasks_dir = ROOT / "claws" / "family-tasks"
 
-    with _isolated_claw_import(calendar_dir):
-        calendar_tools_module = importlib.import_module("tools")
-        calendar_provider_module = importlib.import_module("provider")
-        calendar_intent_module = importlib.import_module("intent")
-        calendar_tools = calendar_tools_module.CalendarTools(
-            calendar_provider_module.GoogleCalendarProvider(),
-        )
-        read_event_metadata = calendar_intent_module.read_metadata_from_description
+    try:
+        with _isolated_claw_import(calendar_dir):
+            calendar_tools_module = importlib.import_module("tools")
+            calendar_provider_module = importlib.import_module("provider")
+            calendar_intent_module = importlib.import_module("intent")
+            calendar_tools = calendar_tools_module.CalendarTools(
+                calendar_provider_module.GoogleCalendarProvider(),
+            )
+            read_event_metadata = calendar_intent_module.read_metadata_from_description
+    except Exception as error:
+        calendar_tools = _UnavailableCalendarTools("Calendar", error)
+        read_event_metadata = fallback_event_metadata
 
-    with _isolated_claw_import(tasks_dir):
-        task_tools_module = importlib.import_module("tools")
-        task_provider_module = importlib.import_module("provider")
-        task_intent_module = importlib.import_module("intent")
-        task_matcher_module = importlib.import_module("matcher")
-        task_tools = task_tools_module.FamilyTaskTools(
-            task_provider_module.GoogleTasksProvider(),
-        )
-        read_task_metadata = task_intent_module.read_metadata_from_notes
-        recommend_task_matches = task_matcher_module.recommend_task_matches
+    try:
+        with _isolated_claw_import(tasks_dir):
+            task_tools_module = importlib.import_module("tools")
+            task_provider_module = importlib.import_module("provider")
+            task_intent_module = importlib.import_module("intent")
+            task_matcher_module = importlib.import_module("matcher")
+            task_tools = task_tools_module.FamilyTaskTools(
+                task_provider_module.GoogleTasksProvider(),
+            )
+            read_task_metadata = task_intent_module.read_metadata_from_notes
+            recommend_task_matches = task_matcher_module.recommend_task_matches
+    except Exception as error:
+        task_tools = _UnavailableTaskTools("Tasks", error)
+        read_task_metadata = fallback_task_metadata
+        recommend_task_matches = fallback_recommend_task_matches
+
+    try:
+        home_board_tools = build_default_home_board_tools()
+    except Exception as error:
+        home_board_tools = _UnavailableHomeBoardTools("Home Board", error)
 
     return DashboardSources(
         calendar_tools=calendar_tools,
@@ -87,7 +131,7 @@ def build_default_sources() -> DashboardSources:
         read_event_metadata=read_event_metadata,
         read_task_metadata=read_task_metadata,
         recommend_task_matches=recommend_task_matches,
-        home_board_tools=build_default_home_board_tools(),
+        home_board_tools=home_board_tools,
     )
 
 
@@ -105,8 +149,18 @@ def default_sources() -> DashboardSources:
     global _DEFAULT_SOURCES
     with _DEFAULT_SOURCES_LOCK:
         if _DEFAULT_SOURCES is None:
-            _DEFAULT_SOURCES = build_default_sources()
+            sources = build_default_sources()
+            if not _has_unavailable_source(sources):
+                _DEFAULT_SOURCES = sources
+            return sources
         return _DEFAULT_SOURCES
+
+
+def _has_unavailable_source(sources: DashboardSources) -> bool:
+    return any(
+        getattr(tools, "unavailable", False)
+        for tools in (sources.calendar_tools, sources.task_tools, sources.home_board_tools)
+    )
 
 
 def _clean_text(value: Any, fallback: str = "") -> str:

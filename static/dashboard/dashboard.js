@@ -1,5 +1,13 @@
 (function () {
   var refreshMs = 5 * 60 * 1000;
+  var wakeLockCheckMs = 60 * 1000;
+  var defaultWakeLockWindow = "06:00-22:00";
+  var wakeLockSentinel = null;
+  var wakeLockPolicy = parseWakeLockPolicy();
+  var keepAliveVideo = null;
+  var keepAliveCanvas = null;
+  var keepAliveFrameTimer = null;
+  var keepAliveFrame = 0;
 
   function byId(id) {
     return document.getElementById(id);
@@ -28,8 +36,228 @@
     }
   }
 
+  function setSummaryChip(id, value, singular, plural) {
+    var node = byId(id);
+    if (!node) return;
+    var count = Number(value || 0);
+    node.innerHTML = "<strong>" + count + "</strong> " + escapeHtml(count === 1 ? singular : plural);
+  }
+
+  function classToken(value, fallback) {
+    return text(value, fallback).toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || fallback;
+  }
+
   function empty(label) {
     return '<p class="empty">' + escapeHtml(label) + "</p>";
+  }
+
+  function getQueryParam(name) {
+    try {
+      var query = new URLSearchParams(window.location.search);
+      return query.has(name) ? query.get(name) : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function parseClockMinutes(value) {
+    var match = /^(\d{1,2})(?::(\d{2}))?$/.exec(text(value).trim());
+    if (!match) return null;
+    var hour = Number(match[1]);
+    var minute = match[2] === undefined ? 0 : Number(match[2]);
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+    return hour * 60 + minute;
+  }
+
+  function formatClockMinutes(minutes) {
+    var normalized = ((minutes % 1440) + 1440) % 1440;
+    var hour24 = Math.floor(normalized / 60);
+    var minute = normalized % 60;
+    var period = hour24 >= 12 ? "PM" : "AM";
+    var hour12 = hour24 % 12 || 12;
+    return hour12 + ":" + String(minute).padStart(2, "0") + " " + period;
+  }
+
+  function parseWakeLockPolicy() {
+    var raw = text(getQueryParam("wake"), defaultWakeLockWindow).trim().toLowerCase();
+    if (raw === "off" || raw === "false" || raw === "0") {
+      return { mode: "off", label: "off" };
+    }
+    if (raw === "always" || raw === "on" || raw === "true" || raw === "1") {
+      return { mode: "always", label: "always" };
+    }
+
+    var parts = raw.split("-");
+    var start = parts.length === 2 ? parseClockMinutes(parts[0]) : null;
+    var end = parts.length === 2 ? parseClockMinutes(parts[1]) : null;
+    if (start === null || end === null) {
+      parts = defaultWakeLockWindow.split("-");
+      start = parseClockMinutes(parts[0]);
+      end = parseClockMinutes(parts[1]);
+    }
+
+    return {
+      mode: "window",
+      start: start,
+      end: end,
+      label: formatClockMinutes(start) + "-" + formatClockMinutes(end),
+    };
+  }
+
+  function isInsideWakeWindow(now) {
+    if (wakeLockPolicy.mode === "always") return true;
+    if (wakeLockPolicy.mode !== "window") return false;
+    var current = now.getHours() * 60 + now.getMinutes();
+    if (wakeLockPolicy.start === wakeLockPolicy.end) return true;
+    if (wakeLockPolicy.start < wakeLockPolicy.end) {
+      return current >= wakeLockPolicy.start && current < wakeLockPolicy.end;
+    }
+    return current >= wakeLockPolicy.start || current < wakeLockPolicy.end;
+  }
+
+  function shouldHoldWakeLock() {
+    return document.visibilityState === "visible" && isInsideWakeWindow(new Date());
+  }
+
+  function setWakeLockStatus(label, state, actionLabel) {
+    var node = byId("screen-status");
+    if (node) {
+      node.textContent = label;
+      node.dataset.state = state;
+    }
+    var button = byId("screen-wake-button");
+    if (button) {
+      button.hidden = !actionLabel;
+      if (actionLabel) button.textContent = actionLabel;
+    }
+  }
+
+  async function releaseNativeWakeLock() {
+    if (wakeLockSentinel) {
+      var sentinel = wakeLockSentinel;
+      wakeLockSentinel = null;
+      try {
+        await sentinel.release();
+      } catch (_error) {
+        // The browser may already have released it during tab or device state changes.
+      }
+    }
+  }
+
+  function drawKeepAliveFrame() {
+    if (!keepAliveCanvas) return;
+    var context = keepAliveCanvas.getContext("2d");
+    if (!context) return;
+    keepAliveFrame += 1;
+    context.fillStyle = keepAliveFrame % 2 === 0 ? "#ffffff" : "#fef7ef";
+    context.fillRect(0, 0, keepAliveCanvas.width, keepAliveCanvas.height);
+  }
+
+  function startKeepAliveFrames() {
+    drawKeepAliveFrame();
+    if (!keepAliveFrameTimer) {
+      keepAliveFrameTimer = window.setInterval(drawKeepAliveFrame, 30 * 1000);
+    }
+  }
+
+  function stopVideoKeepAlive() {
+    if (keepAliveFrameTimer) {
+      window.clearInterval(keepAliveFrameTimer);
+      keepAliveFrameTimer = null;
+    }
+    if (keepAliveVideo) {
+      keepAliveVideo.pause();
+    }
+  }
+
+  function ensureKeepAliveVideo() {
+    if (keepAliveVideo) return keepAliveVideo;
+    if (!document.createElement) return null;
+
+    var canvas = document.createElement("canvas");
+    if (!canvas.getContext || !canvas.captureStream) return null;
+
+    var video = document.createElement("video");
+    canvas.width = 2;
+    canvas.height = 2;
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.className = "screen-keepalive-media";
+    video.setAttribute("aria-hidden", "true");
+    video.setAttribute("muted", "");
+    video.setAttribute("playsinline", "");
+    video.srcObject = canvas.captureStream(1);
+    document.body.appendChild(video);
+
+    keepAliveCanvas = canvas;
+    keepAliveVideo = video;
+    return keepAliveVideo;
+  }
+
+  async function startVideoKeepAlive() {
+    var video = ensureKeepAliveVideo();
+    if (!video) {
+      var label = window.isSecureContext === false ? "Screen wake needs HTTPS" : "Screen wake unsupported";
+      setWakeLockStatus(label, "unsupported");
+      return false;
+    }
+
+    startKeepAliveFrames();
+    try {
+      var played = video.play();
+      if (played && typeof played.then === "function") {
+        await played;
+      }
+      setWakeLockStatus("Screen keepalive on", "fallback");
+      return true;
+    } catch (_error) {
+      stopVideoKeepAlive();
+      setWakeLockStatus("Tap for screen keepalive", "waiting", "Keep screen on");
+      return false;
+    }
+  }
+
+  async function releaseWakeLock(label, state) {
+    await releaseNativeWakeLock();
+    stopVideoKeepAlive();
+    setWakeLockStatus(label, state);
+  }
+
+  async function syncWakeLock() {
+    if (wakeLockPolicy.mode === "off") {
+      await releaseWakeLock("Screen wake off", "waiting");
+      return;
+    }
+    if (!shouldHoldWakeLock()) {
+      await releaseWakeLock("Screen wake " + wakeLockPolicy.label, "waiting");
+      return;
+    }
+    if (wakeLockSentinel) {
+      setWakeLockStatus("Screen staying on", "active");
+      return;
+    }
+    if (keepAliveVideo && !keepAliveVideo.paused) {
+      setWakeLockStatus("Screen keepalive on", "fallback");
+      return;
+    }
+
+    if (navigator.wakeLock && typeof navigator.wakeLock.request === "function") {
+      try {
+        wakeLockSentinel = await navigator.wakeLock.request("screen");
+        wakeLockSentinel.addEventListener("release", function () {
+          wakeLockSentinel = null;
+          setWakeLockStatus("Screen wake released", "waiting");
+        });
+        setWakeLockStatus("Screen staying on", "active");
+        return;
+      } catch (_error) {
+        await startVideoKeepAlive();
+        return;
+      }
+    }
+
+    await startVideoKeepAlive();
   }
 
   function listItem(title, detail) {
@@ -94,9 +322,10 @@
 
     node.innerHTML = Object.keys(grouped).sort().map(function (person) {
       var rows = grouped[person].map(function (item) {
+        var priority = classToken(item.priority, "medium");
         return (
           '<div class="home-board-item priority-' +
-          escapeHtml(item.priority || "medium") +
+          escapeHtml(priority) +
           '"><span class="home-board-check" aria-hidden="true"></span><div><strong>' +
           escapeHtml(item.message) +
           '</strong><span>' +
@@ -112,6 +341,20 @@
         "</div></section>"
       );
     }).join("");
+  }
+
+  function renderSummary(data) {
+    var summary = data.summary || {};
+    var family = data.family || {};
+    setSummaryChip("summary-open", summary.open_loop_count, "task", "tasks");
+    setSummaryChip("summary-prep", summary.prep_needed_count, "prep", "prep");
+    setSummaryChip("summary-home", summary.home_board_count, "home", "home");
+    setSummaryChip(
+      "summary-family",
+      (family.responsibilities || []).length + (family.child_events || []).length + (family.unassigned || []).length,
+      "family",
+      "family"
+    );
   }
 
   function renderOpenLoops(tasks) {
@@ -270,6 +513,7 @@
   }
 
   function render(data) {
+    renderSummary(data);
     setText("greeting", text(data.greeting, "Hello"));
     setText("date-label", data.date_label);
     setText("source-status", data.source_message || data.source_status);
@@ -309,5 +553,13 @@
   }
 
   loadDashboard();
+  syncWakeLock();
   window.setInterval(loadDashboard, refreshMs);
+  window.setInterval(syncWakeLock, wakeLockCheckMs);
+  document.addEventListener("visibilitychange", syncWakeLock);
+  window.addEventListener("focus", syncWakeLock);
+  var wakeButton = byId("screen-wake-button");
+  if (wakeButton) {
+    wakeButton.addEventListener("click", syncWakeLock);
+  }
 })();

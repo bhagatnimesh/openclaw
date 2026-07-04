@@ -458,6 +458,14 @@ def _home_board_today(
     return items, []
 
 
+def _source_error_response(label: str, error: Exception) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "message": f"{label} source unavailable: {error.__class__.__name__}.",
+        "data": {"error_type": error.__class__.__name__},
+    }
+
+
 def _planning_items(events: list[dict[str, Any]], tasks: list[dict[str, Any]], today: date) -> list[dict[str, Any]]:
     important_words = {
         "trip",
@@ -700,13 +708,22 @@ def build_dashboard_data(
     next_week_end = today_start + timedelta(days=7)
     planning_end = today_start + timedelta(days=90)
 
-    calendar_response = sources.calendar_tools.list_calendar_events(
-        time_min=today_start.isoformat(),
-        time_max=planning_end.isoformat(),
-        max_results=100,
-    )
-    task_response = sources.task_tools.list_tasks(show_completed=False)
     source_warnings = []
+
+    try:
+        calendar_response = sources.calendar_tools.list_calendar_events(
+            time_min=today_start.isoformat(),
+            time_max=planning_end.isoformat(),
+            max_results=100,
+        )
+    except Exception as error:
+        calendar_response = _source_error_response("Calendar", error)
+
+    try:
+        task_response = sources.task_tools.list_tasks(show_completed=False)
+    except Exception as error:
+        task_response = _source_error_response("Tasks", error)
+
     home_board_items, home_board_warnings = _home_board_today(
         sources,
         local_now.date(),
@@ -715,15 +732,19 @@ def build_dashboard_data(
     source_warnings.extend(home_board_warnings)
 
     if calendar_response.get("status") != "ok":
+        calendar_unavailable = True
         source_warnings.append(calendar_response.get("message", "Calendar source unavailable."))
         raw_events: list[dict[str, Any]] = []
     else:
+        calendar_unavailable = False
         raw_events = list(calendar_response.get("data", {}).get("events") or [])
 
     if task_response.get("status") != "ok":
+        tasks_unavailable = True
         source_warnings.append(task_response.get("message", "Task source unavailable."))
         raw_tasks: list[dict[str, Any]] = []
     else:
+        tasks_unavailable = False
         raw_tasks = list(task_response.get("data", {}).get("tasks") or [])
 
     events = [
@@ -753,6 +774,15 @@ def build_dashboard_data(
     filters = _decision_filters(available_minutes, prep_window)
     recommendations = _recommend_tasks(sources, tasks, filters, limit=8)
     best_next_action = _make_best_next_action(today_events, tasks, recommendations, local_now)
+    if calendar_unavailable and tasks_unavailable:
+        best_next_action = {
+            "title": "Reconnect Google sources",
+            "source": "source-warning",
+            "why": "Calendar and task data are not available right now.",
+            "reasons": source_warnings[:3],
+            "available_minutes": None,
+            "next_event": "",
+        }
 
     conflicts = _find_conflicts(today_events)
     busy_day = _busy_day_summary(today_events)

@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+import sys
 import tempfile
+from typing import Any
+from unittest.mock import patch
 
+import telegram_audio
+from telegram_audio import CommandAudioTranscriber, VoiceTranscriptionUnavailable
 from telegram_bot import (
     ERROR_MESSAGE,
     HELP_MESSAGE,
@@ -11,14 +16,26 @@ from telegram_bot import (
     UNAUTHORIZED_MESSAGE,
     N4OSTelegramBot,
     TelegramConfig,
+    VOICE_TRANSCRIPTION_EMPTY_MESSAGE,
+    VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE,
     load_config,
 )
 
 
 class FakeMessage:
-    def __init__(self, text: str | None = None, caption: str | None = None) -> None:
+    def __init__(
+        self,
+        text: str | None = None,
+        caption: str | None = None,
+        voice: Any | None = None,
+        audio: Any | None = None,
+        document: Any | None = None,
+    ) -> None:
         self.text = text
         self.caption = caption
+        self.voice = voice
+        self.audio = audio
+        self.document = document
         self.replies: list[str] = []
 
     async def reply_text(self, text: str) -> None:
@@ -53,6 +70,45 @@ class FakeClaw:
 class FailingClaw:
     def handle_request(self, request: str):
         raise RuntimeError(f"boom: {request}")
+
+
+class FakeVoice:
+    mime_type = "audio/ogg"
+
+
+class FakeTelegramFile:
+    def __init__(self) -> None:
+        self.downloads: list[Path] = []
+
+    async def download_to_drive(self, path: Path) -> Path:
+        self.downloads.append(path)
+        path.write_bytes(b"audio bytes")
+        return path
+
+
+class FakeTelegramVoice:
+    mime_type = "audio/ogg"
+
+    def __init__(self, telegram_file: FakeTelegramFile) -> None:
+        self.telegram_file = telegram_file
+
+    async def get_file(self) -> FakeTelegramFile:
+        return self.telegram_file
+
+
+class FakeAudioTranscriber:
+    def __init__(self, transcript: str) -> None:
+        self.transcript = transcript
+        self.messages: list[FakeMessage] = []
+
+    async def transcribe(self, message: FakeMessage) -> str:
+        self.messages.append(message)
+        return self.transcript
+
+
+class UnavailableAudioTranscriber:
+    async def transcribe(self, message: FakeMessage) -> str:
+        raise VoiceTranscriptionUnavailable("not configured")
 
 
 class QuietLogger:
@@ -93,6 +149,23 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies, [UNAUTHORIZED_MESSAGE])
         self.assertEqual(claw.requests, [])
 
+    async def test_unauthorized_voice_is_denied_without_transcription(self):
+        claw = FakeClaw()
+        transcriber = FakeAudioTranscriber("Add task buy milk")
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            audio_transcriber=transcriber,
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        await bot.handle_message(FakeUpdate(999, message), None)
+
+        self.assertEqual(message.replies, [UNAUTHORIZED_MESSAGE])
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(transcriber.messages, [])
+
     async def test_authorized_message_routes_to_n4os_and_replies_with_output(self):
         claw = FakeClaw()
         bot = N4OSTelegramBot(
@@ -106,6 +179,101 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(claw.requests, ["Add task buy milk"])
         self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
+
+    async def test_authorized_voice_routes_transcript_to_n4os(self):
+        claw = FakeClaw()
+        transcriber = FakeAudioTranscriber("Add task buy milk")
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            audio_transcriber=transcriber,
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(transcriber.messages, [message])
+        self.assertEqual(claw.requests, ["Add task buy milk"])
+        self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
+
+    async def test_voice_requires_transcription_configuration(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            audio_transcriber=UnavailableAudioTranscriber(),
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE])
+        self.assertEqual(claw.requests, [])
+
+    async def test_empty_voice_transcript_does_not_route(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            audio_transcriber=FakeAudioTranscriber("  "),
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [VOICE_TRANSCRIPTION_EMPTY_MESSAGE])
+        self.assertEqual(claw.requests, [])
+
+    async def test_command_audio_transcriber_downloads_voice_and_parses_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = Path(tmpdir) / "fake_stt.py"
+            script.write_text(
+                "import json\n"
+                "import pathlib\n"
+                "import sys\n"
+                "path = pathlib.Path(sys.argv[1])\n"
+                "assert path.read_bytes() == b'audio bytes'\n"
+                "print('build log before json')\n"
+                "payload = {'outputs': [{'text': 'Add task from voice'}]}\n"
+                "print(json.dumps(payload, indent=2))\n",
+                encoding="utf-8",
+            )
+            telegram_file = FakeTelegramFile()
+            message = FakeMessage(voice=FakeTelegramVoice(telegram_file))
+            transcriber = CommandAudioTranscriber(
+                command=(sys.executable, str(script), "{{path}}"),
+                cwd=Path(tmpdir),
+            )
+
+            transcript = await transcriber.transcribe(message)
+
+        self.assertEqual(transcript, "Add task from voice")
+        self.assertEqual(len(telegram_file.downloads), 1)
+        self.assertEqual(telegram_file.downloads[0].suffix, ".ogg")
+
+    async def test_command_audio_transcriber_finds_common_node_when_path_is_narrow(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_node = Path(tmpdir) / "node"
+            fake_node.write_text("#!/bin/sh\n", encoding="utf-8")
+            fake_node.chmod(0o755)
+
+            with (
+                patch("telegram_audio.shutil.which", return_value=None),
+                patch.object(
+                    telegram_audio,
+                    "COMMON_NODE_CANDIDATES",
+                    (str(fake_node),),
+                ),
+            ):
+                transcriber = CommandAudioTranscriber()
+
+        command = transcriber.command
+        local_entry = Path(telegram_audio.__file__).resolve().with_name("openclaw.mjs")
+        self.assertIsNotNone(command)
+        self.assertEqual(command[:2], (str(fake_node), str(local_entry)))
 
     async def test_help_uses_same_authorization_gate(self):
         bot = N4OSTelegramBot(
@@ -145,6 +313,23 @@ class TelegramConfigTest(unittest.TestCase):
 
         self.assertEqual(config.token, "token")
         self.assertEqual(config.allowed_user_id, 12345)
+
+    def test_load_config_reads_voice_transcribe_command(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text(
+                "TELEGRAM_BOT_TOKEN=token\n"
+                "ALLOWED_TELEGRAM_USER_ID=12345\n"
+                "N4OS_VOICE_TRANSCRIBE_COMMAND='fake-stt --json {{path}}'\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(env_path=env_path)
+
+        self.assertEqual(
+            config.voice_transcribe_command,
+            ("fake-stt", "--json", "{{path}}"),
+        )
 
     def test_load_config_treats_missing_allowed_user_id_as_setup_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:

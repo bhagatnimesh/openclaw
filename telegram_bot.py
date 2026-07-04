@@ -32,6 +32,15 @@ else:
     TELEGRAM_IMPORT_ERROR = None
 
 from claws.n4os.claw import N4OSClaw
+from telegram_audio import (
+    AudioTranscriber,
+    CommandAudioTranscriber,
+    VOICE_TRANSCRIBE_COMMAND_ENV,
+    VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE,
+    VoiceTranscriptionUnavailable,
+    has_audio,
+    parse_voice_transcribe_command,
+)
 
 
 LOGGER = logging.getLogger("n4os.telegram")
@@ -41,15 +50,20 @@ SETUP_USER_MESSAGE = (
 )
 UNAUTHORIZED_MESSAGE = "Unauthorized."
 HELP_MESSAGE = (
-    "N4OS is ready. Send a calendar request, task request, Home Board notice, or day briefing."
+    "N4OS is ready. Send a text or voice calendar request, task request, "
+    "Home Board notice, or day briefing."
 )
 ERROR_MESSAGE = "Sorry, N4OS hit an error while handling that."
+UNSUPPORTED_MESSAGE = "Please send a text or voice message."
+VOICE_TRANSCRIPTION_EMPTY_MESSAGE = "I could not hear any speech in that voice message."
+VOICE_TRANSCRIPTION_FAILED_MESSAGE = "Sorry, I could not transcribe that voice message."
 
 
 @dataclass(frozen=True)
 class TelegramConfig:
     token: str
     allowed_user_id: int | None
+    voice_transcribe_command: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -77,16 +91,29 @@ def load_config(env_path: str | Path = ".env") -> TelegramConfig:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing from .env.")
 
+    raw_voice_command = _env_value(env_values, VOICE_TRANSCRIBE_COMMAND_ENV)
+    if not raw_voice_command:
+        raw_voice_command = os.getenv(VOICE_TRANSCRIBE_COMMAND_ENV, "").strip()
+    voice_transcribe_command = parse_voice_transcribe_command(raw_voice_command)
+
     raw_allowed_user_id = _env_value(env_values, "ALLOWED_TELEGRAM_USER_ID")
     if not raw_allowed_user_id:
-        return TelegramConfig(token=token, allowed_user_id=None)
+        return TelegramConfig(
+            token=token,
+            allowed_user_id=None,
+            voice_transcribe_command=voice_transcribe_command,
+        )
 
     try:
         allowed_user_id = int(raw_allowed_user_id)
     except ValueError as error:
         raise RuntimeError("ALLOWED_TELEGRAM_USER_ID must be an integer.") from error
 
-    return TelegramConfig(token=token, allowed_user_id=allowed_user_id)
+    return TelegramConfig(
+        token=token,
+        allowed_user_id=allowed_user_id,
+        voice_transcribe_command=voice_transcribe_command,
+    )
 
 
 def _env_value(env_values: dict[str, str | None], key: str) -> str:
@@ -100,10 +127,14 @@ class N4OSTelegramBot:
         config: TelegramConfig,
         claw: N4OSClaw | None = None,
         logger: logging.Logger | None = None,
+        audio_transcriber: AudioTranscriber | None = None,
     ) -> None:
         self.config = config
         self.claw = claw or N4OSClaw()
         self.logger = logger or LOGGER
+        self.audio_transcriber = audio_transcriber or CommandAudioTranscriber(
+            config.voice_transcribe_command,
+        )
 
     def route_message(self, text: str) -> RouterResult:
         started = time.perf_counter()
@@ -161,7 +192,13 @@ class N4OSTelegramBot:
             or getattr(message, "caption", None)
             or ""
         ).strip()
-        self.logger.info("incoming message user_id=%s text=%r", user_id, text)
+        message_kind = "text" if text else ("audio" if has_audio(message) else "unsupported")
+        self.logger.info(
+            "incoming message user_id=%s kind=%s text=%r",
+            user_id,
+            message_kind,
+            text,
+        )
 
         auth_reply = self._authorization_reply(user_id)
         if auth_reply is not None:
@@ -169,8 +206,26 @@ class N4OSTelegramBot:
             self.logger.info("chosen route=unauthorized execution_ms=0.00")
             return
 
+        if not text and has_audio(message):
+            try:
+                text = (await self.audio_transcriber.transcribe(message)).strip()
+            except VoiceTranscriptionUnavailable:
+                await message.reply_text(VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE)
+                self.logger.info("chosen route=unsupported execution_ms=0.00")
+                return
+            except Exception:
+                self.logger.exception("error while transcribing Telegram audio")
+                await message.reply_text(VOICE_TRANSCRIPTION_FAILED_MESSAGE)
+                return
+
+            if not text:
+                await message.reply_text(VOICE_TRANSCRIPTION_EMPTY_MESSAGE)
+                self.logger.info("chosen route=unsupported execution_ms=0.00")
+                return
+            self.logger.info("transcribed Telegram audio chars=%d", len(text))
+
         if not text:
-            await message.reply_text("Please send a text message.")
+            await message.reply_text(UNSUPPORTED_MESSAGE)
             self.logger.info("chosen route=unsupported execution_ms=0.00")
             return
 

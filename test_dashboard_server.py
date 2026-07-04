@@ -4,6 +4,7 @@ from http.server import ThreadingHTTPServer
 from threading import Thread
 from urllib.request import urlopen
 
+import dashboard_sources
 from dashboard_data import (
     build_dashboard_data,
 )
@@ -78,6 +79,20 @@ class FakeTaskTools:
             "message": "ok",
             "data": {"tasks": self.tasks},
         }
+
+
+class FailingCalendarTools:
+    def list_calendar_events(self, time_min=None, time_max=None, max_results=100):
+        raise ConnectionResetError("calendar reset")
+
+
+class FailingTaskTools:
+    def list_tasks(self, show_completed=False):
+        raise ConnectionResetError("tasks reset")
+
+
+class StartupUnavailableCalendarTools(FailingCalendarTools):
+    unavailable = True
 
 
 class FakeHomeBoardTools:
@@ -275,6 +290,174 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data["home_board"]["today"][0]["person_or_group"], "Nysha")
         self.assertEqual(data["home_board"]["today"][0]["context_label"], "School")
 
+    def test_calendar_failure_preserves_task_and_home_board_data(self):
+        data = build_dashboard_data(
+            DashboardSources(
+                calendar_tools=FailingCalendarTools(),
+                task_tools=FakeTaskTools(
+                    [
+                        task(
+                            "Pay utility bill",
+                            due="2026-07-03T00:00:00.000Z",
+                            metadata={
+                                "owner": "dad",
+                                "duration_minutes": 10,
+                                "context": ["computer"],
+                                "urgency": "high",
+                            },
+                        ),
+                    ],
+                ),
+                read_event_metadata=fallback_event_metadata,
+                read_task_metadata=fallback_task_metadata,
+                recommend_task_matches=fallback_recommend_task_matches,
+                home_board_tools=FakeHomeBoardTools(
+                    [
+                        {
+                            "id": "home-1",
+                            "person_or_group": "Family",
+                            "message": "Pack snacks",
+                            "date": "2026-07-03",
+                            "context": "kitchen",
+                            "trigger": None,
+                            "status": "pending",
+                            "priority": "medium",
+                            "expires_at": None,
+                        },
+                    ],
+                ),
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["source_status"], "partial")
+        self.assertEqual(data["summary"]["open_loop_count"], 1)
+        self.assertEqual(data["summary"]["home_board_count"], 1)
+        self.assertEqual(data["tasks"]["open_loops"][0]["title"], "Pay utility bill")
+        self.assertEqual(data["home_board"]["today"][0]["message"], "Pack snacks")
+        self.assertTrue(
+            any("Calendar source unavailable: ConnectionResetError." in warning["detail"] for warning in data["warnings"]),
+        )
+
+    def test_single_source_failure_does_not_claim_both_sources_unavailable(self):
+        data = build_dashboard_data(
+            DashboardSources(
+                calendar_tools=FailingCalendarTools(),
+                task_tools=FakeTaskTools([]),
+                read_event_metadata=fallback_event_metadata,
+                read_task_metadata=fallback_task_metadata,
+                recommend_task_matches=fallback_recommend_task_matches,
+                home_board_tools=FakeHomeBoardTools(),
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["source_status"], "partial")
+        self.assertNotEqual(data["best_next_action"]["title"], "Reconnect Google sources")
+        self.assertTrue(
+            any("Calendar source unavailable: ConnectionResetError." in warning["detail"] for warning in data["warnings"]),
+        )
+
+    def test_task_failure_preserves_calendar_data(self):
+        data = build_dashboard_data(
+            DashboardSources(
+                calendar_tools=FakeCalendarTools(
+                    [
+                        event(
+                            "Passport appointment",
+                            "2026-07-03T11:00:00-07:00",
+                            "2026-07-03T12:00:00-07:00",
+                            metadata={
+                                "owner": "unknown",
+                                "person": "family",
+                                "category": "paperwork",
+                                "preparation_needed": True,
+                                "preparation_notes": "Bring documents",
+                            },
+                        ),
+                    ],
+                ),
+                task_tools=FailingTaskTools(),
+                read_event_metadata=fallback_event_metadata,
+                read_task_metadata=fallback_task_metadata,
+                recommend_task_matches=fallback_recommend_task_matches,
+                home_board_tools=FakeHomeBoardTools(),
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["source_status"], "partial")
+        self.assertEqual(data["summary"]["prep_needed_count"], 1)
+        self.assertEqual(data["calendar"]["today"][0]["title"], "Passport appointment")
+        self.assertEqual(data["best_next_action"]["title"], "Bring documents")
+        self.assertTrue(
+            any("Tasks source unavailable: ConnectionResetError." in warning["detail"] for warning in data["warnings"]),
+        )
+
+    def test_calendar_and_task_failure_surfaces_reconnect_action(self):
+        data = build_dashboard_data(
+            DashboardSources(
+                calendar_tools=FailingCalendarTools(),
+                task_tools=FailingTaskTools(),
+                read_event_metadata=fallback_event_metadata,
+                read_task_metadata=fallback_task_metadata,
+                recommend_task_matches=fallback_recommend_task_matches,
+                home_board_tools=FakeHomeBoardTools(
+                    [
+                        {
+                            "id": "home-1",
+                            "person_or_group": "Family",
+                            "message": "Pack snacks",
+                            "date": "2026-07-03",
+                            "context": "kitchen",
+                            "trigger": None,
+                            "status": "pending",
+                            "priority": "medium",
+                            "expires_at": None,
+                        },
+                    ],
+                ),
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["source_status"], "partial")
+        self.assertEqual(data["best_next_action"]["title"], "Reconnect Google sources")
+        self.assertEqual(data["best_next_action"]["source"], "source-warning")
+        self.assertEqual(data["summary"]["home_board_count"], 1)
+
+    def test_default_sources_retries_startup_unavailable_sources(self):
+        original_builder = dashboard_sources.build_default_sources
+        original_default = dashboard_sources._DEFAULT_SOURCES
+        calls = []
+
+        def fake_builder():
+            calls.append(None)
+            if len(calls) == 1:
+                return DashboardSources(
+                    calendar_tools=StartupUnavailableCalendarTools(),
+                    task_tools=FakeTaskTools([]),
+                    read_event_metadata=fallback_event_metadata,
+                    read_task_metadata=fallback_task_metadata,
+                    recommend_task_matches=fallback_recommend_task_matches,
+                    home_board_tools=FakeHomeBoardTools(),
+                )
+            return sources()
+
+        try:
+            dashboard_sources._DEFAULT_SOURCES = None
+            dashboard_sources.build_default_sources = fake_builder
+            first = dashboard_sources.default_sources()
+            second = dashboard_sources.default_sources()
+            third = dashboard_sources.default_sources()
+        finally:
+            dashboard_sources.build_default_sources = original_builder
+            dashboard_sources._DEFAULT_SOURCES = original_default
+
+        self.assertIsInstance(first.calendar_tools, StartupUnavailableCalendarTools)
+        self.assertIs(second, third)
+        self.assertEqual(len(calls), 2)
+
 
 class DashboardServerRouteTest(unittest.TestCase):
     def test_dashboard_route_accepts_trailing_slash(self):
@@ -290,6 +473,27 @@ class DashboardServerRouteTest(unittest.TestCase):
                         body = response.read().decode("utf-8")
                     self.assertEqual(response.status, 200)
                     self.assertIn("N4OS Family Chief of Staff", body)
+                    self.assertIn('id="screen-status"', body)
+                    self.assertIn('id="screen-wake-button"', body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_dashboard_static_js_includes_wake_lock_controller(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+
+        try:
+            with urlopen(base_url + "/static/dashboard/dashboard.js", timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn('navigator.wakeLock.request("screen")', body)
+            self.assertIn("startVideoKeepAlive", body)
+            self.assertIn("canvas.captureStream(1)", body)
+            self.assertIn("defaultWakeLockWindow", body)
         finally:
             server.shutdown()
             server.server_close()

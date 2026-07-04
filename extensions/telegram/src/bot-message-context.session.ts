@@ -195,6 +195,7 @@ export async function buildTelegramInboundContextPayload(params: {
   mentionFacts: TelegramMentionFacts;
   hasControlCommand: boolean;
   stickerCacheHit?: boolean;
+  audioTranscript?: string;
   audioTranscribedMediaIndex?: number;
   commandAuthorized: boolean;
   locationData?: NormalizedLocation;
@@ -245,6 +246,7 @@ export async function buildTelegramInboundContextPayload(params: {
     mentionFacts,
     hasControlCommand,
     stickerCacheHit,
+    audioTranscript,
     audioTranscribedMediaIndex,
     commandAuthorized,
     locationData,
@@ -587,6 +589,7 @@ export async function buildTelegramInboundContextPayload(params: {
       ForwardedFromSignature: visibleForwardOrigin?.fromSignature,
       ForwardedFromChatType: visibleForwardOrigin?.fromChatType,
       ForwardedFromMessageId: visibleForwardOrigin?.fromMessageId,
+      Transcript: audioTranscript,
       WasMentioned: isGroup ? effectiveWasMentioned : undefined,
       Sticker: allMedia[0]?.stickerMetadata,
       StickerMediaIncluded: allMedia[0]?.stickerMetadata ? currentMediaFacts.length > 0 : undefined,

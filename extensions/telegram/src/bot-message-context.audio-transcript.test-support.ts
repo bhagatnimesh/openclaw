@@ -68,6 +68,10 @@ function expectTranscriptRendered(
   const framed = `[Audio transcript (machine-generated, untrusted)]: ${JSON.stringify(transcript)}`;
   expect(ctx).not.toBeNull();
   expect(ctx?.ctxPayload?.BodyForAgent).toBe(framed);
+  expect(ctx?.ctxPayload?.BodyForCommands).toBe(transcript);
+  expect(ctx?.ctxPayload?.CommandBody).toBe(transcript);
+  expect(ctx?.ctxPayload?.RawBody).toBe(transcript);
+  expect(ctx?.ctxPayload?.Transcript).toBe(transcript);
   expect(ctx?.ctxPayload?.Body).toContain(framed);
   expect(ctx?.ctxPayload?.Body).not.toContain("<media:audio>");
   expect(ctx?.ctxPayload?.MediaTranscribedIndexes).toEqual([0]);
@@ -99,6 +103,46 @@ describe("buildTelegramMessageContext audio transcript body", () => {
 
     expect(transcribeFirstAudioMock).toHaveBeenCalledTimes(1);
     expectTranscriptRendered(ctx, "hey bot please help");
+  });
+
+  it("uses spoken control commands as actionable text command turns", async () => {
+    transcribeFirstAudioMock.mockResolvedValueOnce("/status");
+
+    const ctx = await buildTelegramMessageContextForTest({
+      message: {
+        message_id: 5,
+        chat: { id: -1001234567894, type: "supergroup", title: "Test Group 5" },
+        date: 1700000400,
+        text: undefined,
+        from: { id: 46, first_name: "Eli" },
+        voice: { file_id: "voice-5" },
+      },
+      allMedia: [{ path: "/tmp/voice5.ogg", contentType: "audio/ogg" }],
+      cfg: {
+        agents: { defaults: { model: DEFAULT_MODEL, workspace: DEFAULT_WORKSPACE } },
+        channels: { telegram: {} },
+        commands: { useAccessGroups: false },
+        messages: { groupChat: { mentionPatterns: [DEFAULT_MENTION_PATTERN] } },
+      },
+      resolveGroupActivation: () => true,
+      resolveGroupRequireMention: () => true,
+      resolveTelegramGroupConfig: () => ({
+        groupConfig: { requireMention: true },
+        topicConfig: undefined,
+      }),
+    });
+
+    expectTranscriptRendered(ctx, "/status");
+    expect(ctx?.ctxPayload?.CommandSource).toBe("text");
+    expect(ctx?.ctxPayload?.CommandTurn).toMatchObject({
+      authorized: true,
+      body: "/status",
+      commandName: "status",
+      kind: "text-slash",
+      source: "text",
+    });
+    expect(ctx?.ctxPayload?.MentionSource).toBe("command_bypass");
+    expect(ctx?.ctxPayload?.WasMentioned).toBe(true);
   });
 
   it("skips preflight transcription when disableAudioPreflight is true", async () => {

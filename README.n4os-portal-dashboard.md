@@ -23,6 +23,24 @@ python dashboard_server.py --host 0.0.0.0
 Then open `http://<mac-lan-ip>:8000/dashboard` from the Portal+ browser.
 `/dashboard` and `/dashboard/` both work.
 
+## Screen Wake
+
+The dashboard asks the browser to keep the screen awake while the page is
+visible during display hours. Default display hours are `06:00-22:00` in the
+browser's local time.
+
+Use a bookmark query parameter to change the behavior:
+
+- `http://<mac-lan-ip>:8000/dashboard?wake=always`
+- `http://<mac-lan-ip>:8000/dashboard?wake=off`
+- `http://<mac-lan-ip>:8000/dashboard?wake=07:30-21:00`
+
+Browser wake lock support requires `localhost` or HTTPS. When a Portal+ opens
+the page over plain LAN HTTP, the dashboard falls back to a tiny muted video
+keepalive. If the Portal blocks autoplay, tap `Keep screen on` once after the
+page loads. If the fallback is unavailable, use the Portal+ display settings or
+serve the dashboard through trusted HTTPS.
+
 ## Routes
 
 - `GET /dashboard` and `GET /dashboard/` serve the Portal+ dashboard.

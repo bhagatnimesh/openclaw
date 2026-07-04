@@ -81,6 +81,7 @@ export type TelegramInboundBodyResult = {
   canDetectMention: boolean;
   shouldBypassMention: boolean;
   hasControlCommand: boolean;
+  audioTranscript?: string;
   audioTranscribedMediaIndex?: number;
   stickerCacheHit: boolean;
   locationData?: NormalizedLocation;
@@ -348,6 +349,15 @@ export async function resolveTelegramInboundBody(params: {
   if (hasAudio && bodyText === "<media:audio>" && preflightTranscript) {
     bodyText = formatAudioTranscriptForAgent(preflightTranscript);
   }
+  if (preflightTranscript && !hasUserText) {
+    // RawBody/CommandBody carry the actionable transcript; BodyForAgent keeps
+    // the framed untrusted transcript so the model sees the modality boundary.
+    rawBody = preflightTranscript;
+  }
+  const transcriptHasControlCommand = preflightTranscript
+    ? hasControlCommand(preflightTranscript, cfg, { botUsername })
+    : false;
+  const hasControlCommandForTurn = hasControlCommandInMessage || transcriptHasControlCommand;
 
   const savedMediaPlaceholder = formatSavedMediaPlaceholder(allMedia);
   if (
@@ -386,7 +396,10 @@ export async function resolveTelegramInboundBody(params: {
   });
   const wasMentioned = options?.forceWasMentioned === true ? true : computedWasMentioned;
 
-  if (isGroup && commandGate.shouldBlockControlCommand) {
+  if (
+    isGroup &&
+    (commandGate.shouldBlockControlCommand || (transcriptHasControlCommand && !commandAuthorized))
+  ) {
     logInboundDrop({
       log: logVerbose,
       channel: "telegram",
@@ -417,7 +430,7 @@ export async function resolveTelegramInboundBody(params: {
       isGroup,
       requireMention: Boolean(requireMention),
       allowTextCommands: true,
-      hasControlCommand: hasControlCommandInMessage,
+      hasControlCommand: hasControlCommandForTurn,
       commandAuthorized,
     },
   });
@@ -498,7 +511,8 @@ export async function resolveTelegramInboundBody(params: {
     }),
     canDetectMention,
     shouldBypassMention: mentionDecision.shouldBypassMention,
-    hasControlCommand: hasControlCommandInMessage,
+    hasControlCommand: hasControlCommandForTurn,
+    ...(preflightTranscript !== undefined ? { audioTranscript: preflightTranscript } : {}),
     ...(audioTranscribedMediaIndex !== undefined && audioTranscribedMediaIndex >= 0
       ? { audioTranscribedMediaIndex }
       : {}),

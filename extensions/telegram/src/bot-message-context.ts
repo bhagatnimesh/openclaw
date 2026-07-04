@@ -522,6 +522,7 @@ export const buildTelegramMessageContext = async ({
     effectiveWasMentioned: bodyResult.effectiveWasMentioned,
     mentionFacts: bodyResult.mentionFacts,
     hasControlCommand: bodyResult.hasControlCommand,
+    audioTranscript: bodyResult.audioTranscript,
     stickerCacheHit: bodyResult.stickerCacheHit,
     ...(bodyResult.audioTranscribedMediaIndex !== undefined
       ? { audioTranscribedMediaIndex: bodyResult.audioTranscribedMediaIndex }
