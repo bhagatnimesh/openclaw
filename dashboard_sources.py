@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from __future__ import annotations
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 import importlib
@@ -8,15 +10,15 @@ from pathlib import Path
 import re
 import sys
 import threading
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 METADATA_MARKER = "N4OS_METADATA:"
 
-CalendarMetadataReader = Callable[[str | None], tuple[str, dict[str, Any]]]
-TaskMetadataReader = Callable[[str | None], tuple[str, dict[str, Any]]]
+CalendarMetadataReader = Callable[[Optional[str]], tuple[str, dict[str, Any]]]
+TaskMetadataReader = Callable[[Optional[str]], tuple[str, dict[str, Any]]]
 TaskRecommender = Callable[
     [list[dict[str, Any]], dict[str, Any], int],
     list[dict[str, Any]],
@@ -31,6 +33,7 @@ class DashboardSources:
     read_task_metadata: TaskMetadataReader
     recommend_task_matches: TaskRecommender
     home_board_tools: Any | None = None
+    decision_tools: Any | None = None
 
 
 _DEFAULT_SOURCES: DashboardSources | None = None
@@ -64,6 +67,11 @@ class _UnavailableTaskTools(_UnavailableSourceTools):
 
 class _UnavailableHomeBoardTools(_UnavailableSourceTools):
     def list_items(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+
+class _UnavailableDecisionTools(_UnavailableSourceTools):
+    def list_decisions(self, **_kwargs: Any) -> dict[str, Any]:
         return self._response()
 
 
@@ -125,6 +133,11 @@ def build_default_sources() -> DashboardSources:
     except Exception as error:
         home_board_tools = _UnavailableHomeBoardTools("Home Board", error)
 
+    try:
+        decision_tools = build_default_decision_tools()
+    except Exception as error:
+        decision_tools = _UnavailableDecisionTools("Decisions", error)
+
     return DashboardSources(
         calendar_tools=calendar_tools,
         task_tools=task_tools,
@@ -132,6 +145,7 @@ def build_default_sources() -> DashboardSources:
         read_task_metadata=read_task_metadata,
         recommend_task_matches=recommend_task_matches,
         home_board_tools=home_board_tools,
+        decision_tools=decision_tools,
     )
 
 
@@ -142,6 +156,16 @@ def build_default_home_board_tools() -> Any:
         home_board_provider_module = importlib.import_module("provider")
         return home_board_tools_module.HomeBoardTools(
             home_board_provider_module.SQLiteHomeBoardProvider(),
+        )
+
+
+def build_default_decision_tools() -> Any:
+    decisions_dir = ROOT / "claws" / "family-decisions"
+    with _isolated_claw_import(decisions_dir):
+        decision_tools_module = importlib.import_module("tools")
+        decision_provider_module = importlib.import_module("provider")
+        return decision_tools_module.FamilyDecisionTools(
+            decision_provider_module.SQLiteFamilyDecisionProvider(),
         )
 
 
@@ -159,7 +183,12 @@ def default_sources() -> DashboardSources:
 def _has_unavailable_source(sources: DashboardSources) -> bool:
     return any(
         getattr(tools, "unavailable", False)
-        for tools in (sources.calendar_tools, sources.task_tools, sources.home_board_tools)
+        for tools in (
+            sources.calendar_tools,
+            sources.task_tools,
+            sources.home_board_tools,
+            sources.decision_tools,
+        )
     )
 
 

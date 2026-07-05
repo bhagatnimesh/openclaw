@@ -43,6 +43,17 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(intent["description"], "with Rahul")
         self.assertEqual(intent["missing_fields"], [])
 
+    def test_noon_event_time(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Add lunch tomorrow at noon", now=now)
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Lunch")
+        self.assertEqual(intent["date"], "2026-07-03")
+        self.assertEqual(intent["start_time"], "12:00")
+        self.assertEqual(intent["missing_fields"], [])
+
     def test_event_with_ai_assistant_help_metadata(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 

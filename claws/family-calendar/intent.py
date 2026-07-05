@@ -523,6 +523,10 @@ def _time_from_match(match: re.Match[str], context: str) -> str | None:
 
 
 def _extract_standalone_time(user_text: str, context: str) -> str | None:
+    named_time = _extract_named_time(user_text)
+    if named_time is not None:
+        return named_time
+
     match = re.search(
         r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)\b",
         user_text,
@@ -532,6 +536,12 @@ def _extract_standalone_time(user_text: str, context: str) -> str | None:
         return None
 
     return _time_from_match(match, context)
+
+
+def _extract_named_time(user_text: str) -> str | None:
+    if re.search(r"\bnoon\b", user_text, flags=re.IGNORECASE):
+        return "12:00"
+    return None
 
 
 def _extract_action_time(user_text: str) -> str | None:
@@ -550,6 +560,10 @@ def _extract_time(user_text: str) -> str | None:
     action_time = _extract_action_time(user_text)
     if action_time is not None:
         return action_time
+
+    named_time = _extract_named_time(user_text)
+    if named_time is not None:
+        return named_time
 
     match = re.search(
         r"\b(?:at|around)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?\b",
@@ -926,7 +940,9 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
     title = re.sub(r"\bnext\s+\d+\s+(?:mondays|tuesdays|wednesdays|thursdays|fridays|saturdays|sundays)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(?:at|around)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\b(?:at|around)\s+noon\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bnoon\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bfor\s+\d+\s*(?:minute|minutes|min|hour|hours|hr|hrs)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bnext\s+(?=monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bnext\b", " ", title, flags=re.IGNORECASE)

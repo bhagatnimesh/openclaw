@@ -289,6 +289,29 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertEqual(metadata["person"], "Navya")
         self.assertEqual(metadata["category"], "school")
 
+    def test_missing_time_noon_followup_creates_original_event(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "Add appointment Friday",
+                reference_time=reference,
+            )
+
+        self.assertEqual(message, "Please provide a time for Appointment on Friday, July 3.")
+        self.assertIsNotNone(claw.pending_action)
+
+        with redirect_stdout(StringIO()):
+            handled = claw.handle_pending_response("noon")
+
+        self.assertTrue(handled)
+        self.assertIsNone(claw.pending_action)
+        self.assertEqual(provider.created[0]["summary"], "Appointment")
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-03T12:00:00-07:00")
+        self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-03T13:00:00-07:00")
+
     def test_preparation_followup_updates_last_created_event(self):
         provider = FakeProvider()
         claw = FamilyCalendarClaw.from_provider(provider)

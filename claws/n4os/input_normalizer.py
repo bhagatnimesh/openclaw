@@ -74,9 +74,17 @@ REMEMBER_TO_RE = re.compile(
 
 PHRASE_REPAIRS = (
     (re.compile(r"\bcalender\b", re.IGNORECASE), "calendar"),
+    (re.compile(r"\bdecision\s+(?:bried|breif|brif)\b", re.IGNORECASE), "decision brief"),
+    (re.compile(r"\b(?:bried|breif|brif)\s+decision\b", re.IGNORECASE), "brief decision"),
+    (re.compile(r"\bjet\s+lagged\b", re.IGNORECASE), "jetlagged"),
     (re.compile(r"\bhome\s+bored\b", re.IGNORECASE), "home board"),
     (re.compile(r"\bhouse\s+bored\b", re.IGNORECASE), "home board"),
     (re.compile(r"\bhomeboard\b", re.IGNORECASE), "home board"),
+    (re.compile(r"\bNyshas\s+School\b", re.IGNORECASE), "Nysha's school"),
+    (re.compile(r"\bNyshas\b", re.IGNORECASE), "Nysha's"),
+    (re.compile(r"\bNyshad\b", re.IGNORECASE), "Nysha"),
+    (re.compile(r"\bMonteserie\b", re.IGNORECASE), "Montessori"),
+    (re.compile(r"\bFUSD\s+number\b", re.IGNORECASE), "FUSD phone number"),
 )
 
 

@@ -270,6 +270,47 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_authorized_voice_repairs_family_task_dictation_before_routing(self):
+        claw = FakeClaw()
+        transcript = "\n".join(
+            [
+                "want to add a task for Monday at 4 p.m. to call FUSD "
+                "to follow up on Nyshas School waiting",
+                "list for Chad Bond. This task is for Namesh. "
+                "I want Noah to find out FUSD number to call",
+                "and the key talking points. I really want",
+                "Nyshad to meet Chad Bond from overflow",
+                "on ASS School to Mission Valley Monteserie",
+            ]
+        )
+        transcriber = FakeAudioTranscriber(transcript)
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            audio_transcriber=transcriber,
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(
+            claw.requests,
+            [
+                "\n".join(
+                    [
+                        "want to add a task for Monday at 4 p.m. to call FUSD "
+                        "to follow up on Nysha's school waiting",
+                        "list for Chad Bond. This task is for Namesh. "
+                        "I want Noah to find out FUSD phone number to call",
+                        "and the key talking points. I really want",
+                        "Nysha to meet Chad Bond from overflow",
+                        "on ASS School to Mission Valley Montessori",
+                    ]
+                )
+            ],
+        )
+
     async def test_voice_requires_transcription_configuration(self):
         claw = FakeClaw()
         bot = N4OSTelegramBot(

@@ -458,6 +458,99 @@ def _home_board_today(
     return items, []
 
 
+def _decision_due_label(decision: dict[str, Any], today: date) -> str:
+    due = _parse_date(_clean_text(decision.get("due")))
+    if due is None:
+        return "No due date"
+    days = (due - today).days
+    if days < 0:
+        return f"{abs(days)}d overdue"
+    if days == 0:
+        return "Due today"
+    if days == 1:
+        return "Due tomorrow"
+    return f"Due in {days}d"
+
+
+def _decision_missing_fields(decision: dict[str, Any]) -> list[str]:
+    missing = []
+    if _clean_text(decision.get("owner"), "unknown") == "unknown":
+        missing.append("owner")
+    if not _clean_text(decision.get("due")):
+        missing.append("timeline")
+    if not decision.get("options"):
+        missing.append("options")
+    open_steps = [
+        step for step in decision.get("next_steps") or []
+        if _clean_text(step.get("status"), "open") == "open"
+    ]
+    if not open_steps:
+        missing.append("next step")
+    return missing
+
+
+def _normalize_decision(decision: dict[str, Any], today: date) -> dict[str, Any]:
+    open_steps = [
+        step for step in decision.get("next_steps") or []
+        if _clean_text(step.get("status"), "open") == "open"
+    ]
+    next_step = open_steps[0] if open_steps else {}
+    owner = _clean_text(decision.get("owner"), "unknown")
+    return {
+        "id": _clean_text(decision.get("id")),
+        "short_id": _clean_text(decision.get("id"))[:8],
+        "title": _clean_text(decision.get("title"), "Untitled decision"),
+        "context": _clean_text(decision.get("context")),
+        "status": _clean_text(decision.get("status"), "inbox"),
+        "owner": owner,
+        "owner_label": "Unassigned" if owner == "unknown" else owner.title(),
+        "urgency": _clean_text(decision.get("urgency"), "normal"),
+        "size": _clean_text(decision.get("size"), "small"),
+        "due": _clean_text(decision.get("due")),
+        "due_label": _decision_due_label(decision, today),
+        "option_count": len(decision.get("options") or []),
+        "evidence_count": len(decision.get("evidence") or []),
+        "next_step": _clean_text(next_step.get("text"), "Assign one clear next step"),
+        "next_step_owner": _clean_text(next_step.get("owner"), "unknown"),
+        "next_step_due": _clean_text(next_step.get("due")),
+        "missing_fields": _decision_missing_fields(decision),
+        "outcome": _clean_text(decision.get("outcome")),
+        "updated_at": _clean_text(decision.get("updated_at")),
+    }
+
+
+def _open_decisions(
+    sources: DashboardSources,
+    today: date,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    tools = getattr(sources, "decision_tools", None)
+    if tools is None:
+        return [], []
+
+    try:
+        response = tools.list_decisions(include_decided=False)
+    except Exception as error:
+        return [], [f"Decisions source unavailable: {error.__class__.__name__}."]
+
+    if response.get("status") != "ok":
+        return [], [response.get("message", "Decisions source unavailable.")]
+
+    decisions = [
+        _normalize_decision(decision, today)
+        for decision in response.get("data", {}).get("decisions") or []
+    ]
+    decisions.sort(
+        key=lambda decision: (
+            {"critical": 0, "high": 1, "normal": 2, "low": 3}.get(decision["urgency"], 2),
+            decision["due"] == "",
+            decision["due"],
+            -len(decision["missing_fields"]),
+            decision["title"].lower(),
+        ),
+    )
+    return decisions, []
+
+
 def _source_error_response(label: str, error: Exception) -> dict[str, Any]:
     return {
         "status": "error",
@@ -660,6 +753,7 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "conflict_count": 0,
             "unassigned_count": 0,
             "home_board_count": 0,
+            "open_decision_count": 0,
         },
         "best_next_action": {
             "title": "No dashboard data yet",
@@ -687,6 +781,7 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
         },
         "planning": {"items": []},
         "home_board": {"today": []},
+        "decisions": {"open": [], "attention": []},
         "family": {
             "members": [],
             "responsibilities": [],
@@ -730,6 +825,11 @@ def build_dashboard_data(
         local_now,
     )
     source_warnings.extend(home_board_warnings)
+    open_decisions, decision_warnings = _open_decisions(
+        sources,
+        local_now.date(),
+    )
+    source_warnings.extend(decision_warnings)
 
     if calendar_response.get("status") != "ok":
         calendar_unavailable = True
@@ -825,6 +925,10 @@ def build_dashboard_data(
     family = _family_awareness(today_events, tasks)
     planning_items = _planning_items(events, tasks, local_now.date())
     unassigned_count = len(family["unassigned"])
+    attention_decisions = [
+        decision for decision in open_decisions
+        if decision["missing_fields"] or decision["urgency"] in ("critical", "high")
+    ][:6]
 
     def public_event(event: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in event.items() if not key.startswith("_")}
@@ -841,6 +945,7 @@ def build_dashboard_data(
             "conflict_count": len(conflicts),
             "unassigned_count": unassigned_count,
             "home_board_count": len(home_board_items),
+            "open_decision_count": len(open_decisions),
         },
         "best_next_action": best_next_action,
         "warnings": warnings[:8],
@@ -868,6 +973,10 @@ def build_dashboard_data(
         },
         "planning": {"items": planning_items},
         "home_board": {"today": home_board_items},
+        "decisions": {
+            "open": open_decisions[:12],
+            "attention": attention_decisions,
+        },
         "family": {
             "members": family["members"],
             "responsibilities": family["responsibilities"],
@@ -894,6 +1003,7 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
                 read_task_metadata=lambda notes: ("", {}),
                 recommend_task_matches=lambda tasks, filters, limit: [],
                 home_board_tools=build_default_home_board_tools(),
+                decision_tools=None,
             )
             items, warnings = _home_board_today(
                 home_board_sources,

@@ -11,6 +11,7 @@ Every coaching conversation, plan, review, reminder, and decision should be filt
 - Start with `AGENTS.md` when acting as an AI coach or planning partner.
 - Use `IDENTITY.md`, `MISSION.md`, `PRIORITIES.md`, and `PRINCIPLES.md` as stable context.
 - Use `DECISION_FILTER.md`, `OPERATING_RULES.md`, and the playbooks when helping with a live situation.
+- Use [FAMILY_DECISIONS_GUIDE.md](FAMILY_DECISIONS_GUIDE.md) to capture, enrich, brief, and close family decisions from chat.
 - Use daily and review templates to convert principles into action.
 - Use `PERSONAL_MODEL.md` to understand how to coach me well.
 - Use `archive/raw_notes.md` only for source nuance, not as the operating layer.
@@ -33,4 +34,3 @@ Recognition is optional.
 ## North Star
 
 Become the kind of person whose presence consistently makes people, systems, and organizations better.
-

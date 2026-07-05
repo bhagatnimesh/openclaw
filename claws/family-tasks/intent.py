@@ -207,6 +207,10 @@ ASSISTANT_DETAIL_LABEL_RE = re.compile(
     r"\b(?P<label>assistant\s+help|help|assistant\s+context|context|email|notes?)\s*:\s*",
     re.IGNORECASE,
 )
+ASSISTANT_GOAL_CONTEXT_RE = re.compile(
+    r"\b(?:i\s+really\s+want|goal\s+is|the\s+goal\s+is)\b",
+    re.IGNORECASE,
+)
 RUN_ASSISTANT_HELP_RE = re.compile(
     rf"\b(?:run|process|work|check|do|complete)\b.*"
     rf"\b(?:{ASSISTANT_NAME_PATTERN}|assistant(?:\s+help)?)\b.*"
@@ -269,7 +273,13 @@ def _normalize_assistant_help_request(value: str) -> str:
 def _split_assistant_details(value: str) -> tuple[str, str]:
     matches = list(ASSISTANT_DETAIL_LABEL_RE.finditer(value))
     if not matches:
-        return _normalize_assistant_help_request(value), ""
+        goal_match = ASSISTANT_GOAL_CONTEXT_RE.search(value)
+        if goal_match is None:
+            return _normalize_assistant_help_request(value), ""
+
+        help_request = _normalize_assistant_help_request(value[: goal_match.start()])
+        assistant_context = _clean_spaces(value[goal_match.start() :].strip(" ."))
+        return help_request, assistant_context
 
     help_parts = []
     context_parts = []

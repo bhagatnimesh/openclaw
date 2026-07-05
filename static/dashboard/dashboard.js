@@ -51,6 +51,27 @@
     return '<p class="empty">' + escapeHtml(label) + "</p>";
   }
 
+  function currentSectionId() {
+    var hash = window.location.hash || "#today";
+    if (!/^#[A-Za-z0-9_-]+$/.test(hash)) return "today";
+    return hash.slice(1) || "today";
+  }
+
+  function updateActiveNav() {
+    var activeHref = "#" + currentSectionId();
+    Array.prototype.forEach.call(document.querySelectorAll(".portal-nav a"), function (link) {
+      link.classList.toggle("is-active", link.getAttribute("href") === activeHref);
+    });
+  }
+
+  function scrollToHashSection() {
+    var id = currentSectionId();
+    var section = byId(id);
+    if (section) {
+      section.scrollIntoView({ block: "start" });
+    }
+  }
+
   function getQueryParam(name) {
     try {
       var query = new URLSearchParams(window.location.search);
@@ -348,6 +369,7 @@
     var family = data.family || {};
     setSummaryChip("summary-open", summary.open_loop_count, "task", "tasks");
     setSummaryChip("summary-prep", summary.prep_needed_count, "prep", "prep");
+    setSummaryChip("summary-decisions", summary.open_decision_count, "decision", "decisions");
     setSummaryChip("summary-home", summary.home_board_count, "home", "home");
     setSummaryChip(
       "summary-family",
@@ -465,6 +487,68 @@
     }).join("");
   }
 
+  function renderDecisionChips(decision) {
+    var chips = [
+      '<span class="chip warm">' + escapeHtml(decision.status || "inbox") + "</span>",
+      '<span class="chip">' + escapeHtml(decision.owner_label || "Unassigned") + "</span>",
+      '<span class="chip green">' + escapeHtml(decision.due_label || "No due date") + "</span>",
+    ];
+    if (decision.urgency === "critical" || decision.urgency === "high") {
+      chips.push('<span class="chip alert">' + escapeHtml(decision.urgency) + "</span>");
+    }
+    return chips.join("");
+  }
+
+  function renderDecisions(data) {
+    data = data || {};
+    var open = data.open || [];
+    var attention = data.attention || [];
+    setText("decision-count-label", open.length + " open");
+    setText("decision-attention-count", attention.length);
+
+    var attentionNode = byId("decision-attention");
+    if (attentionNode) {
+      attentionNode.innerHTML = attention.length
+        ? attention.map(function (decision) {
+            var missing = decision.missing_fields && decision.missing_fields.length
+              ? "Missing " + decision.missing_fields.join(", ")
+              : decision.due_label;
+            return listItem(decision.title, missing);
+          }).join("")
+        : empty("No open decision needs attention.");
+    }
+
+    var node = byId("decision-items");
+    if (!node) return;
+    if (!open.length) {
+      node.innerHTML = empty("No pending family decisions.");
+      return;
+    }
+    node.innerHTML = open.map(function (decision) {
+      var missing = decision.missing_fields || [];
+      var missingHtml = missing.length
+        ? '<p class="decision-missing">Missing: ' + escapeHtml(missing.join(", ")) + "</p>"
+        : '<p class="decision-ready">Ready for family discussion</p>';
+      return (
+        '<article class="decision-card"><div class="decision-card-top"><p class="eyebrow">' +
+        escapeHtml(decision.short_id || "decision") +
+        "</p>" +
+        renderDecisionChips(decision) +
+        "</div><h3>" +
+        escapeHtml(decision.title) +
+        '</h3><div class="decision-stats"><span>' +
+        escapeHtml((decision.option_count || 0) + " options") +
+        '</span><span>' +
+        escapeHtml((decision.evidence_count || 0) + " notes") +
+        "</span></div>" +
+        missingHtml +
+        '<div class="decision-next"><strong>Next step</strong><span>' +
+        escapeHtml(decision.next_step || "Assign one clear next step") +
+        "</span></div></article>"
+      );
+    }).join("");
+  }
+
   function renderFamily(data) {
     data = data || {};
     var members = data.members || [];
@@ -534,8 +618,11 @@
     var tasks = data.tasks || {};
     renderOpenLoops(tasks.open_loops || []);
     renderPlanning(data.planning ? data.planning.items : []);
+    renderDecisions(data.decisions || {});
     renderTaskGroups(tasks.groups || []);
     renderFamily(data.family || {});
+    updateActiveNav();
+    scrollToHashSection();
   }
 
   function loadDashboard() {
@@ -558,6 +645,10 @@
   window.setInterval(syncWakeLock, wakeLockCheckMs);
   document.addEventListener("visibilitychange", syncWakeLock);
   window.addEventListener("focus", syncWakeLock);
+  window.addEventListener("hashchange", function () {
+    updateActiveNav();
+    scrollToHashSection();
+  });
   var wakeButton = byId("screen-wake-button");
   if (wakeButton) {
     wakeButton.addEventListener("click", syncWakeLock);

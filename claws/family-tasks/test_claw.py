@@ -294,6 +294,7 @@ class FamilyTasksClawTest(unittest.TestCase):
     def test_add_task_from_request_stores_ai_assistant_help(self):
         provider = FakeProvider()
         claw = FamilyTasksClaw.from_provider(provider)
+        claw.auto_run_assistant_help = False
         now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
         with redirect_stdout(StringIO()):
@@ -314,7 +315,7 @@ class FamilyTasksClawTest(unittest.TestCase):
             message,
         )
         self.assertIn(
-            "Noah acknowledged: On your behalf, Noah will look up the FUSD phone number and draft quick talking points and update you here when done.",
+            "Noah queued: On your behalf, Noah should look up the FUSD phone number and draft quick talking points. Say 'Run Noah assistant help' to run queued help.",
             message,
         )
         created = provider.created[0]
@@ -335,6 +336,7 @@ class FamilyTasksClawTest(unittest.TestCase):
     def test_add_task_from_polite_timed_request_creates_task(self):
         provider = FakeProvider()
         claw = FamilyTasksClaw.from_provider(provider)
+        claw.auto_run_assistant_help = False
         now = datetime(2026, 7, 3, 21, 56, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
         with redirect_stdout(StringIO()):
@@ -358,9 +360,10 @@ class FamilyTasksClawTest(unittest.TestCase):
             message,
         )
         self.assertIn(
-            "Noah acknowledged: On your behalf, Noah will find out FUSD number to call and the key talking points",
+            "Noah queued: On your behalf, Noah should find out FUSD number to call and the key talking points. Say 'Run Noah assistant help' to run queued help.",
             message,
         )
+        self.assertNotIn("I really want", message)
         created = provider.created[0]
         notes, metadata = read_metadata_from_notes(created["notes"])
         self.assertEqual(
@@ -374,10 +377,12 @@ class FamilyTasksClawTest(unittest.TestCase):
             "Find out FUSD number to call",
             metadata["assistant_help_request"],
         )
+        self.assertIn("Nyshad to meet Chad Bond", metadata["assistant_context"])
 
     def test_add_task_from_noah_request_stores_assistant_metadata(self):
         provider = FakeProvider()
         claw = FamilyTasksClaw.from_provider(provider)
+        claw.auto_run_assistant_help = False
         now = datetime(2026, 7, 3, 22, 6, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
         with redirect_stdout(StringIO()):
@@ -401,9 +406,10 @@ class FamilyTasksClawTest(unittest.TestCase):
             message,
         )
         self.assertIn(
-            "Noah acknowledged: On your behalf, Noah will find out FUSD number to call and the key talking points",
+            "Noah queued: On your behalf, Noah should find out FUSD number to call and the key talking points. Say 'Run Noah assistant help' to run queued help.",
             message,
         )
+        self.assertNotIn("I really want", message)
         created = provider.created[0]
         notes, metadata = read_metadata_from_notes(created["notes"])
         self.assertEqual(
@@ -418,6 +424,49 @@ class FamilyTasksClawTest(unittest.TestCase):
             "Find out FUSD number to call",
             metadata["assistant_help_request"],
         )
+        self.assertIn("Nyshad to meet Chad Bond", metadata["assistant_context"])
+
+    def test_add_task_from_noah_request_runs_assistant_help_immediately(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 3, 22, 6, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        client = FakeResearchClient()
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "Call FUSD to get Nysha waiting list number. "
+                "I want Noah to help me get FUSD number for the question",
+                reference_time=now,
+                research_client=client,
+            )
+
+        self.assertIn(
+            "Created task: Call FUSD to get Nysha waiting list number (task id: task-123).",
+            message,
+        )
+        self.assertIn(
+            "Noah completed assistant help for Call FUSD to get Nysha waiting list number: "
+            "FUSD main line is 510-657-2350.",
+            message,
+        )
+        self.assertIn("Saved in task notes.", message)
+        self.assertEqual(
+            client.calls,
+            [
+                {
+                    "task_title": "Call FUSD to get Nysha waiting list number",
+                    "help_request": "Help me get FUSD number for the question",
+                    "assistant_context": "",
+                }
+            ],
+        )
+        self.assertEqual(provider.updated[0]["id"], "task-123")
+        notes, metadata = read_metadata_from_notes(provider.updated[0]["notes"])
+        self.assertIn("Noah result (2026-07-03 22:06 PDT):", notes)
+        self.assertIn("FUSD main line is 510-657-2350", notes)
+        self.assertFalse(metadata["assistant_help_needed"])
+        self.assertEqual(metadata["assistant_help_status"], "completed")
+        self.assertIn("510-657-2350", metadata["assistant_help_result_summary"])
 
     def test_run_noah_assistant_help_writes_result_to_task(self):
         provider = FakeProvider()

@@ -92,6 +92,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             data = get_dashboard_data()
             _json_response(self, data["home_board"]["today"])
             return
+        if route == "/api/decisions/open":
+            data = get_dashboard_data()
+            _json_response(self, data["decisions"]["open"])
+            return
         if route.startswith("/static/dashboard/"):
             relative = unquote(route.removeprefix("/static/dashboard/"))
             requested = (STATIC_ROOT / relative).resolve()
@@ -149,6 +153,10 @@ def create_app() -> Any:
     @app.get("/api/home-board/today", response_class=JSONResponse)
     def api_home_board_today() -> Any:
         return get_dashboard_data()["home_board"]["today"]
+
+    @app.get("/api/decisions/open", response_class=JSONResponse)
+    def api_decisions_open() -> Any:
+        return get_dashboard_data()["decisions"]["open"]
 
     return app
 

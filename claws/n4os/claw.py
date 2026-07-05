@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 try:
     from .intent_router import (
         CALENDAR_ROOT,
+        DECISIONS_ROOT,
         HOME_BOARD_ROOT,
         LOW_CONFIDENCE_THRESHOLD,
         TASKS_ROOT,
@@ -21,6 +22,7 @@ try:
 except ImportError:
     from intent_router import (
         CALENDAR_ROOT,
+        DECISIONS_ROOT,
         HOME_BOARD_ROOT,
         LOW_CONFIDENCE_THRESHOLD,
         TASKS_ROOT,
@@ -59,6 +61,10 @@ def _tasks_module() -> Any:
 
 def _home_board_module() -> Any:
     return load_scoped_module("_n4os_home_board_claw", HOME_BOARD_ROOT, "claw.py")
+
+
+def _decisions_module() -> Any:
+    return load_scoped_module("_n4os_family_decisions_claw", DECISIONS_ROOT, "claw.py")
 
 
 def _is_day_briefing_request(request: str) -> bool:
@@ -244,6 +250,8 @@ def _clarified_route(request: str) -> str | None:
         return "tasks"
     if normalized in ("home board", "today at home", "house board", "use home board"):
         return "home_board"
+    if normalized in ("decision", "decisions", "family decisions", "use decisions"):
+        return "decisions"
     if normalized in ("both", "calendar and tasks", "tasks and calendar"):
         return "both"
     return None
@@ -270,7 +278,7 @@ def _is_confident_new_route(decision: dict[str, Any], pending_owner: str) -> boo
     route = decision.get("route")
     confidence = float(decision.get("confidence") or 0)
     return (
-        route in ("calendar", "tasks", "home_board", "both")
+        route in ("calendar", "tasks", "home_board", "decisions", "both")
         and route != pending_owner
         and confidence >= LOW_CONFIDENCE_THRESHOLD
     )
@@ -278,11 +286,12 @@ def _is_confident_new_route(decision: dict[str, Any], pending_owner: str) -> boo
 
 @dataclass
 class N4OSClaw:
-    """Top-level N4OS router over family calendar, tasks, and Home Board claws."""
+    """Top-level N4OS router over family calendar, tasks, decisions, and Home Board claws."""
 
     calendar_claw: Any | None = None
     tasks_claw: Any | None = None
     home_board_claw: Any | None = None
+    decisions_claw: Any | None = None
     system_prompt: str = SYSTEM_PROMPT
     pending_route_clarification: PendingRouteClarification | None = None
 
@@ -369,6 +378,8 @@ class N4OSClaw:
             self._handle_tasks_request(request, reference_time)
         if decision["route"] == "home_board":
             self._handle_home_board_request(request, reference_time)
+        if decision["route"] == "decisions":
+            self._handle_decision_request(request, reference_time)
 
     def _calendar(self) -> Any:
         if self.calendar_claw is None:
@@ -399,6 +410,12 @@ class N4OSClaw:
             with module_scope(HOME_BOARD_ROOT):
                 self.home_board_claw = _home_board_module().HomeBoardClaw.default()
         return self.home_board_claw
+
+    def _decisions(self) -> Any:
+        if self.decisions_claw is None:
+            with module_scope(DECISIONS_ROOT):
+                self.decisions_claw = _decisions_module().FamilyDecisionsClaw.default()
+        return self.decisions_claw
 
     def _handle_calendar_request(
         self,
@@ -461,6 +478,13 @@ class N4OSClaw:
             claw.mark_done_from_request(request)
         else:
             claw.add_item_from_request(request, reference_time=reference_time)
+
+    def _handle_decision_request(
+        self,
+        request: str,
+        reference_time: datetime | None,
+    ) -> None:
+        self._decisions().handle_request(request, reference_time=reference_time)
 
     def _handle_day_briefing(
         self,

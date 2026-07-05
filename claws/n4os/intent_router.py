@@ -11,7 +11,7 @@ from types import ModuleType
 from typing import Any, Iterator, Literal
 
 
-Route = Literal["calendar", "tasks", "home_board", "both", "unknown"]
+Route = Literal["calendar", "tasks", "home_board", "decisions", "both", "unknown"]
 
 LOW_CONFIDENCE_THRESHOLD = 0.6
 
@@ -36,6 +36,22 @@ HOME_BOARD_INTENTS = {
     "list_items",
     "mark_done",
 }
+DECISION_INTENTS = {
+    "create_decision",
+    "list_decisions",
+    "decision_brief",
+    "add_option",
+    "add_evidence",
+    "add_next_step",
+    "record_decision",
+}
+DECISION_UPDATE_INTENTS = {
+    "decision_brief",
+    "add_option",
+    "add_evidence",
+    "add_next_step",
+    "record_decision",
+}
 
 LOCAL_MODULES = (
     "constants",
@@ -52,6 +68,7 @@ CLAW_ROOT = Path(__file__).resolve().parents[1]
 CALENDAR_ROOT = CLAW_ROOT / "family-calendar"
 TASKS_ROOT = CLAW_ROOT / "family-tasks"
 HOME_BOARD_ROOT = CLAW_ROOT / "home-board"
+DECISIONS_ROOT = CLAW_ROOT / "family-decisions"
 TASK_CUE_RE = re.compile(r"\b(tasks?|todos?|to-dos?|open loops?)\b")
 EXPLICIT_CLOCK_TIME_RE = re.compile(
     r"\b(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|"
@@ -128,14 +145,19 @@ def _home_board_intent_module() -> ModuleType:
     return load_scoped_module("_n4os_home_board_intent", HOME_BOARD_ROOT, "intent.py")
 
 
+def _decisions_intent_module() -> ModuleType:
+    return load_scoped_module("_n4os_family_decisions_intent", DECISIONS_ROOT, "intent.py")
+
+
 def _extract_intents(
     request: str,
     now: datetime | None,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     calendar_intent = _calendar_intent_module().extract_intent(request, now=now)
     task_intent = _tasks_intent_module().extract_intent(request, now=now)
     home_board_intent = _home_board_intent_module().extract_intent(request, now=now)
-    return calendar_intent, task_intent, home_board_intent
+    decision_intent = _decisions_intent_module().extract_intent(request, now=now)
+    return calendar_intent, task_intent, home_board_intent, decision_intent
 
 
 def _has_time_anchor(text: str) -> bool:
@@ -283,6 +305,46 @@ def _score_home_board(text: str, home_board_intent: dict[str, Any]) -> float:
     return max(0.0, min(score, 1.0))
 
 
+def _score_decisions(text: str, decision_intent: dict[str, Any]) -> float:
+    score = 0.0
+    intent = decision_intent.get("intent")
+    if intent in DECISION_UPDATE_INTENTS:
+        score += 0.6
+    elif intent in DECISION_INTENTS:
+        score += 0.25
+    if re.search(r"\b(decisions?|decide|decided|decision brief)\b", text):
+        score += 0.5
+    if re.search(r"\b(options?\s+(?:are|include|includes)|choices?\s+(?:are|include|includes)|add(?:ed)?\s+note|next step|challenges?|concerns?|risks?)\b", text):
+        score += 0.25
+    if re.search(r"\b(choose|whether|should we|are we going to|did we decide)\b", text):
+        score += 0.35
+    if re.search(r"\b(summer camp|school choice|birthday party|camp plan)\b", text):
+        score += 0.25
+    if re.search(r"\b(tasks?|todos?|calendar|event|appointment|home board|today at home)\b", text):
+        score -= 0.25
+    return max(0.0, min(score, 1.0))
+
+
+def _is_explicit_decision_request(text: str, decision_intent: dict[str, Any]) -> bool:
+    intent = decision_intent.get("intent")
+    if intent not in DECISION_INTENTS:
+        return False
+    if re.search(
+        r"\b(captured decision|track decision|capture decision|family decision|decision brief|decisions?)\b",
+        text,
+    ):
+        return True
+    return bool(
+        intent in DECISION_UPDATE_INTENTS
+        and re.search(
+            r"^\s*(?:give|provide|send|show)\s+(?:me\s+)?(?:the\s+)?(?:latest\s+|open\s+)?(?:decision\s+)?brief\b|"
+            r"^\s*(?:add(?:ed)?\s+)?(?:options?|evidence|research|notes?|next\s+steps?)\b|"
+            r"^\s*(?:challenges?|concerns?|risks?)\b",
+            text,
+        )
+    )
+
+
 def _is_combined_planning(text: str) -> bool:
     return bool(
         re.search(
@@ -297,25 +359,36 @@ def _is_combined_planning(text: str) -> bool:
     )
 
 
-def _summary(route: Route, calendar_intent: dict[str, Any], task_intent: dict[str, Any]) -> str:
+def _summary(
+    route: Route,
+    calendar_intent: dict[str, Any],
+    task_intent: dict[str, Any],
+    decision_intent: dict[str, Any] | None = None,
+) -> str:
     if route == "calendar":
         return f"Route to family-calendar for {calendar_intent.get('intent', 'calendar request')}."
     if route == "tasks":
         return f"Route to family-tasks for {task_intent.get('intent', 'task request')}."
     if route == "home_board":
         return "Route to home-board for household notice."
+    if route == "decisions":
+        intent = (decision_intent or {}).get("intent", "decision request")
+        return f"Route to family-decisions for {intent}."
     if route == "both":
         return (
             "Route to family-calendar and family-tasks for combined planning or briefing."
         )
-    return "Could not confidently choose Calendar, Tasks, Home Board, or Calendar + Tasks."
+    return "Could not confidently choose Calendar, Tasks, Home Board, Decisions, or Calendar + Tasks."
 
 
 def route_request(
     request: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    calendar_intent, task_intent, home_board_intent = _extract_intents(request, now)
+    calendar_intent, task_intent, home_board_intent, decision_intent = _extract_intents(
+        request,
+        now,
+    )
     text = _routing_text(request)
     if not text:
         return RouteDecision(
@@ -324,21 +397,40 @@ def route_request(
             confidence=0.0,
         ).to_dict()
 
+    if _is_explicit_decision_request(text, decision_intent):
+        return RouteDecision(
+            route="decisions",
+            intent_summary=_summary("decisions", calendar_intent, task_intent, decision_intent),
+            confidence=0.95,
+        ).to_dict()
+
     if _is_combined_planning(text):
         return RouteDecision(
             route="both",
-            intent_summary=_summary("both", calendar_intent, task_intent),
+            intent_summary=_summary("both", calendar_intent, task_intent, decision_intent),
             confidence=0.88,
+        ).to_dict()
+
+    if (
+        task_intent.get("intent") == "create_task"
+        and _has_assistant_help_metadata(task_intent)
+    ):
+        return RouteDecision(
+            route="tasks",
+            intent_summary=_summary("tasks", calendar_intent, task_intent, decision_intent),
+            confidence=0.95,
         ).to_dict()
 
     calendar_score = _score_calendar(text, calendar_intent)
     task_score = _score_tasks(text, task_intent)
     home_board_score = _score_home_board(text, home_board_intent)
+    decision_score = _score_decisions(text, decision_intent)
 
     scores: dict[Route, float] = {
         "calendar": calendar_score,
         "tasks": task_score,
         "home_board": home_board_score,
+        "decisions": decision_score,
     }
     best_route = max(scores, key=scores.get)
     confidence = scores[best_route]
@@ -357,6 +449,6 @@ def route_request(
 
     return RouteDecision(
         route=route,
-        intent_summary=_summary(route, calendar_intent, task_intent),
+        intent_summary=_summary(route, calendar_intent, task_intent, decision_intent),
         confidence=round(confidence, 2),
     ).to_dict()

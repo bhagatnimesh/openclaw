@@ -224,6 +224,10 @@ class TaskIntentTest(unittest.TestCase):
             "Find out FUSD number to call",
             intent["metadata"]["assistant_help_request"],
         )
+        self.assertIn(
+            "Nyshad to meet Chad Bond",
+            intent["metadata"]["assistant_context"],
+        )
         self.assertEqual(intent["metadata"]["effort_type"], "communication")
 
     def test_polite_timed_task_request_with_noah_help_creates_task(self):
@@ -257,6 +261,10 @@ class TaskIntentTest(unittest.TestCase):
             "Find out FUSD number to call",
             intent["metadata"]["assistant_help_request"],
         )
+        self.assertIn(
+            "Nyshad to meet Chad Bond",
+            intent["metadata"]["assistant_context"],
+        )
 
     def test_dropped_subject_timed_task_request_creates_task(self):
         now = datetime(2026, 7, 3, 22, 20, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -284,6 +292,10 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["due"], "2026-07-06")
         self.assertTrue(intent["metadata"]["assistant_help_needed"])
         self.assertEqual(intent["metadata"]["assistant_name"], "Noah")
+        self.assertIn(
+            "Nyshad to meet Chad Bond",
+            intent["metadata"]["assistant_context"],
+        )
 
     def test_call_mom_does_not_assign_owner_to_mom(self):
         now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))

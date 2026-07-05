@@ -97,8 +97,8 @@ def _format_assistant_acknowledgment(metadata: dict[str, Any] | None) -> str | N
     assistant_name = str(metadata.get("assistant_name") or "Noah").strip() or "Noah"
     action = _assistant_action_sentence(metadata.get("assistant_help_request"))
     return (
-        f"{assistant_name} acknowledged: On your behalf, {assistant_name} will "
-        f"{action} and update you here when done."
+        f"{assistant_name} queued: On your behalf, {assistant_name} should "
+        f"{action}. Say 'Run {assistant_name} assistant help' to run queued help."
     )
 
 
@@ -241,6 +241,7 @@ class FamilyTasksClaw:
     system_prompt: str = SYSTEM_PROMPT
     tool_guidance: str = TOOL_GUIDANCE
     pending_action: PendingAction | None = None
+    auto_run_assistant_help: bool = True
 
     @classmethod
     def from_provider(cls, provider: TasksProvider) -> "FamilyTasksClaw":
@@ -266,6 +267,7 @@ class FamilyTasksClaw:
         self,
         request: str,
         reference_time: datetime | None = None,
+        research_client: NoahResearchClient | None = None,
     ) -> str:
         intent = extract_intent(request, now=reference_time)
         missing = intent.get("missing_fields", [])
@@ -289,14 +291,86 @@ class FamilyTasksClaw:
             print(message)
             return message
 
-        message = _format_created_task_message(response.get("data", {}).get("task", {}))
-        assistant_acknowledgment = _format_assistant_acknowledgment(
-            intent.get("metadata"),
-        )
-        if assistant_acknowledgment:
-            message = f"{message}\n{assistant_acknowledgment}"
+        task = response.get("data", {}).get("task", {})
+        message = _format_created_task_message(task)
+        if self.auto_run_assistant_help:
+            assistant_result = self._run_noah_assistant_help_for_task(
+                task,
+                research_client=research_client,
+                reference_time=reference_time,
+            )
+            if assistant_result:
+                message = f"{message}\n{assistant_result}"
+        else:
+            assistant_acknowledgment = _format_assistant_acknowledgment(
+                intent.get("metadata"),
+            )
+            if assistant_acknowledgment:
+                message = f"{message}\n{assistant_acknowledgment}"
         print(message)
         return message
+
+    def _run_noah_assistant_help_for_task(
+        self,
+        task: dict[str, Any],
+        *,
+        research_client: NoahResearchClient | None,
+        reference_time: datetime | None,
+        task_list_id: str = DEFAULT_TASK_LIST_ID,
+    ) -> str | None:
+        if not _is_pending_assistant_help_task(task):
+            return None
+
+        task_id = str(task.get("id") or "").strip()
+        title = _assistant_task_title(task)
+        notes, metadata = read_metadata_from_notes(task.get("notes"))
+        if not task_id:
+            return f"Noah could not complete assistant help for {title}: missing Google Tasks id."
+
+        try:
+            client = research_client or OpenClawNoahResearchClient.from_env()
+        except RuntimeError as error:
+            return (
+                f"Noah could not start assistant help for {title}: {error} "
+                "The task remains queued for Run Noah assistant help."
+            )
+
+        help_request = str(metadata.get("assistant_help_request") or title).strip()
+        assistant_context = str(metadata.get("assistant_context") or "").strip()
+        attempted_at = _default_now(reference_time)
+        try:
+            result = client.research(
+                task_title=title,
+                help_request=help_request,
+                assistant_context=assistant_context,
+            )
+        except Exception as error:
+            error_metadata = _errored_assistant_metadata(metadata, error, attempted_at)
+            self.tools.update_task(
+                task_id=task_id,
+                notes=notes,
+                metadata=error_metadata,
+                task_list_id=task_list_id,
+            )
+            return f"Noah could not complete assistant help for {title}: {error}"
+
+        completed_at = _default_now(reference_time)
+        updated_notes = _append_noah_result_notes(
+            task.get("notes"),
+            result,
+            completed_at,
+        )
+        update_response = self.tools.update_task(
+            task_id=task_id,
+            notes=updated_notes,
+            metadata=_completed_assistant_metadata(metadata, result, completed_at),
+            task_list_id=task_list_id,
+        )
+        if update_response["status"] != "ok":
+            return f"Noah could not save assistant help for {title}: {update_response['message']}"
+
+        summary = _summarize_result(result.text, max_chars=160)
+        return f"Noah completed assistant help for {title}: {summary} Saved in task notes."
 
     def recommend_tasks_from_request(
         self,

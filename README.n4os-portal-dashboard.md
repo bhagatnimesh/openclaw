@@ -49,6 +49,7 @@ serve the dashboard through trusted HTTPS.
 - `GET /api/tasks/recommended` returns task recommendations.
 - `GET /api/planning` returns upcoming planning items.
 - `GET /api/home-board/today` returns today's pending Home Board notices.
+- `GET /api/decisions/open` returns pending family decisions.
 
 ## Scope
 
@@ -59,6 +60,10 @@ local SQLite, and only assembles dashboard-specific JSON.
 
 Home Board notices are short-lived household instructions for the `Today at Home`
 dashboard section. They are not Google Calendar events or Google Tasks.
+
+Family Decisions appear in the dashboard at `/dashboard/#decisions`. The
+dashboard is still read-only: decisions are captured, enriched, and closed
+through chat.
 
 ## Test
 

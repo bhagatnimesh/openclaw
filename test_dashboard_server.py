@@ -122,7 +122,19 @@ class FakeHomeBoardTools:
         }
 
 
-def sources(events=None, tasks=None, home_board_items=None):
+class FakeDecisionTools:
+    def __init__(self, decisions=None):
+        self.decisions = decisions or []
+
+    def list_decisions(self, status=None, include_decided=False):
+        return {
+            "status": "ok",
+            "message": "Family decisions returned.",
+            "data": {"decisions": self.decisions},
+        }
+
+
+def sources(events=None, tasks=None, home_board_items=None, decisions=None):
     return DashboardSources(
         calendar_tools=FakeCalendarTools(events or []),
         task_tools=FakeTaskTools(tasks or []),
@@ -130,6 +142,7 @@ def sources(events=None, tasks=None, home_board_items=None):
         read_task_metadata=fallback_task_metadata,
         recommend_task_matches=fallback_recommend_task_matches,
         home_board_tools=FakeHomeBoardTools(home_board_items),
+        decision_tools=FakeDecisionTools(decisions),
     )
 
 
@@ -290,6 +303,40 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data["home_board"]["today"][0]["person_or_group"], "Nysha")
         self.assertEqual(data["home_board"]["today"][0]["context_label"], "School")
 
+    def test_dashboard_includes_open_family_decisions(self):
+        data = build_dashboard_data(
+            sources(
+                decisions=[
+                    {
+                        "id": "05d837f2abcdef",
+                        "title": "Summer camp plan",
+                        "context": "",
+                        "status": "inbox",
+                        "owner": "unknown",
+                        "urgency": "high",
+                        "size": "large",
+                        "due": None,
+                        "options": [{"text": "Stay home"}, {"text": "Go to ICC"}],
+                        "evidence": [{"text": "Jetlagged"}],
+                        "next_steps": [],
+                        "updated_at": "2026-07-03T09:00:00-07:00",
+                    }
+                ],
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["summary"]["open_decision_count"], 1)
+        decision = data["decisions"]["open"][0]
+        self.assertEqual(decision["short_id"], "05d837f2")
+        self.assertEqual(decision["title"], "Summer camp plan")
+        self.assertEqual(decision["option_count"], 2)
+        self.assertEqual(decision["evidence_count"], 1)
+        self.assertEqual(decision["next_step"], "Assign one clear next step")
+        self.assertIn("owner", decision["missing_fields"])
+        self.assertIn("timeline", decision["missing_fields"])
+        self.assertIn("next step", decision["missing_fields"])
+
     def test_calendar_failure_preserves_task_and_home_board_data(self):
         data = build_dashboard_data(
             DashboardSources(
@@ -326,6 +373,7 @@ class DashboardDataTest(unittest.TestCase):
                         },
                     ],
                 ),
+                decision_tools=FakeDecisionTools(),
             ),
             now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
         )
@@ -348,6 +396,7 @@ class DashboardDataTest(unittest.TestCase):
                 read_task_metadata=fallback_task_metadata,
                 recommend_task_matches=fallback_recommend_task_matches,
                 home_board_tools=FakeHomeBoardTools(),
+                decision_tools=FakeDecisionTools(),
             ),
             now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
         )
@@ -417,6 +466,7 @@ class DashboardDataTest(unittest.TestCase):
                         },
                     ],
                 ),
+                decision_tools=FakeDecisionTools(),
             ),
             now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
         )
@@ -441,6 +491,7 @@ class DashboardDataTest(unittest.TestCase):
                     read_task_metadata=fallback_task_metadata,
                     recommend_task_matches=fallback_recommend_task_matches,
                     home_board_tools=FakeHomeBoardTools(),
+                    decision_tools=FakeDecisionTools(),
                 )
             return sources()
 
@@ -473,9 +524,35 @@ class DashboardServerRouteTest(unittest.TestCase):
                         body = response.read().decode("utf-8")
                     self.assertEqual(response.status, 200)
                     self.assertIn("N4OS Family Chief of Staff", body)
+                    self.assertIn('href="#decisions"', body)
+                    self.assertIn('id="decision-items"', body)
                     self.assertIn('id="screen-status"', body)
                     self.assertIn('id="screen-wake-button"', body)
         finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_decisions_api_route_returns_open_decisions(self):
+        import dashboard_server
+
+        original_get_dashboard_data = dashboard_server.get_dashboard_data
+
+        def fake_dashboard_data():
+            return {"decisions": {"open": [{"title": "Summer camp plan"}]}}
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.get_dashboard_data = fake_dashboard_data
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            with urlopen(base_url + "/api/decisions/open", timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("Summer camp plan", body)
+        finally:
+            dashboard_server.get_dashboard_data = original_get_dashboard_data
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)

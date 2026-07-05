@@ -16,6 +16,7 @@
         <nav class="portal-nav" aria-label="Dashboard sections">
           <a href="#today">Today</a>
           <a href="#planning">Planning</a>
+          <a href="#decisions">Decisions</a>
           <a href="#tasks">Tasks</a>
           <a href="#family">Family</a>
         </nav>
@@ -38,6 +39,7 @@
               <div class="summary-strip" aria-label="Dashboard summary">
                 <span id="summary-open"><strong>0</strong> task</span>
                 <span id="summary-prep"><strong>0</strong> prep</span>
+                <span id="summary-decisions"><strong>0</strong> decisions</span>
                 <span id="summary-home"><strong>0</strong> home</span>
                 <span id="summary-family"><strong>0</strong> family</span>
               </div>
@@ -96,6 +98,24 @@
             <span></span>
           </div>
           <div id="planning-items" class="planning-grid"></div>
+        </section>
+
+        <section id="decisions" class="section">
+          <div class="section-title">
+            <h2>Pending Decisions</h2>
+            <span></span>
+            <strong id="decision-count-label" class="section-count">0 open</strong>
+          </div>
+          <div class="decisions-layout">
+            <article class="panel decision-summary-panel">
+              <div class="panel-header">
+                <h3>Needs Attention</h3>
+                <span id="decision-attention-count">0</span>
+              </div>
+              <div id="decision-attention" class="compact-list"></div>
+            </article>
+            <div id="decision-items" class="decision-grid"></div>
+          </div>
         </section>
 
         <section id="tasks" class="section">

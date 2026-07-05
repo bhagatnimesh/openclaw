@@ -199,6 +199,14 @@ class FakeHomeBoardClaw:
         self.calls.append(("done", request, None))
 
 
+class FakeDecisionsClaw:
+    def __init__(self):
+        self.calls = []
+
+    def handle_request(self, request, reference_time=None):
+        self.calls.append(("handle", request, reference_time))
+
+
 class MissingGoogleTasksClaw:
     @classmethod
     def default(cls):
@@ -222,6 +230,34 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(
             improve_entered_text("Noah, help look up the FUSD phone number"),
             "Noah, help look up the FUSD phone number",
+        )
+
+    def test_input_improvement_repairs_decision_brief_typo(self):
+        self.assertEqual(
+            improve_entered_text("give me decision bried"),
+            "give me decision brief",
+        )
+
+    def test_input_improvement_repairs_decision_voice_note_terms(self):
+        self.assertEqual(
+            improve_entered_text("challenges she will be jet lagged"),
+            "challenges she will be jetlagged",
+        )
+
+    def test_input_improvement_repairs_family_task_dictation(self):
+        self.assertEqual(
+            improve_entered_text(_fusd_waitlist_request()),
+            "\n".join(
+                [
+                    "I want to add a task for Monday at 2 p.m. to call FUSD "
+                    "to follow up on Nysha's school waiting",
+                    "list for Chad Bond. This task is for Namesh. "
+                    "I want AI assistant to find out FUSD phone number to call",
+                    "and the key talking points. I really want",
+                    "Nysha to meet Chad Bond from overflow",
+                    "on ASS School to Mission Valley Montessori.",
+                ]
+            ),
         )
 
     def test_routes_calendar_creation(self):
@@ -325,6 +361,71 @@ class IntentRouterTest(unittest.TestCase):
         )
 
         self.assertEqual(decision["route"], "home_board")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_family_decision_capture(self):
+        decision = route_request(
+            "Track decision about summer camp plan owner mom by next Monday",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "decisions")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+        self.assertIn("family-decisions", decision["intent_summary"])
+
+    def test_routes_captured_decision_text_to_decisions_before_day_planning(self):
+        decision = route_request(
+            "Captured decision: Summer camp plan for Nysha for the last week. "
+            "Options are stay at home, go to ICC, challenges she will be jetlagged",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "decisions")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_noah_decision_research_to_decisions_before_task_assistant(self):
+        decision = route_request(
+            "Captured decision: school choice. I want Noah to compare commute and waitlist",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "decisions")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_decision_brief_typo_to_decision_brief(self):
+        decision = route_request(
+            improve_entered_text("give me decision bried"),
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "decisions")
+        self.assertIn("decision_brief", decision["intent_summary"])
+
+    def test_routes_decision_follow_up_options_to_decisions(self):
+        decision = route_request(
+            "options are stay at home, go to ICC",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "decisions")
+        self.assertIn("add_option", decision["intent_summary"])
+
+    def test_routes_decision_follow_up_note_to_decisions(self):
+        decision = route_request(
+            "Added note to Call FUSD to get Nysha waiting list number",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "decisions")
+        self.assertIn("add_evidence", decision["intent_summary"])
+
+    def test_routes_family_decision_question(self):
+        decision = route_request(
+            "Are we going to Rahul's birthday party?",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "decisions")
         self.assertGreaterEqual(decision["confidence"], 0.6)
 
     def test_routes_calendar_query(self):
@@ -467,13 +568,37 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(decision["route"], "tasks")
         self.assertIn("create_task", decision["intent_summary"])
         self.assertEqual(calendar.calls, [])
-        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+        self.assertEqual(
+            tasks.calls,
+            [("create", improve_entered_text(request), REFERENCE_TIME)],
+        )
 
     def test_dispatches_dropped_subject_task_request_to_task_creation(self):
         calendar = FakeCalendarClaw()
         tasks = FakeTasksClaw()
         claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
         request = _dropped_subject_fusd_waitlist_request()
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIn("create_task", decision["intent_summary"])
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(
+            tasks.calls,
+            [("create", improve_entered_text(request), REFERENCE_TIME)],
+        )
+
+    def test_dispatches_dated_noah_task_to_tasks_only(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = (
+            "Call FUSD to get Nysha waiting list number on Monday at 2 PM. "
+            "I want Noah to help me get FUSD phone number for the call and "
+            "some talking points to get Nysha to Chadbourne in home school asap"
+        )
 
         with redirect_stdout(StringIO()):
             decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
@@ -530,6 +655,28 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(calendar.calls, [])
         self.assertEqual(tasks.calls, [])
 
+    def test_dispatches_family_decision_to_decisions_claw(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        home_board = FakeHomeBoardClaw()
+        decisions = FakeDecisionsClaw()
+        claw = N4OSClaw(
+            calendar_claw=calendar,
+            tasks_claw=tasks,
+            home_board_claw=home_board,
+            decisions_claw=decisions,
+        )
+        request = "Track decision about summer camp plan owner mom by next Monday"
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "decisions")
+        self.assertEqual(decisions.calls, [("handle", request, REFERENCE_TIME)])
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [])
+        self.assertEqual(home_board.calls, [])
+
     def test_dispatches_time_bound_call_to_calendar(self):
         calendar = FakeCalendarClaw()
         tasks = FakeTasksClaw()
@@ -567,7 +714,7 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(decision["route"], "unknown")
         self.assertIn(
-            "Should I use Calendar, Tasks, Home Board, or Calendar + Tasks?",
+            "Should I use Calendar, Tasks, Home Board, Decisions, or Calendar + Tasks?",
             output.getvalue(),
         )
         self.assertEqual(calendar.calls, [])
