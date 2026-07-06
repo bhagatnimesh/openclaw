@@ -16,8 +16,9 @@ from typing import Any, Callable, Iterable, Optional
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 METADATA_MARKER = "N4OS_METADATA:"
+METADATA_EXTENDED_PROPERTY = "n4os_metadata"
 
-CalendarMetadataReader = Callable[[Optional[str]], tuple[str, dict[str, Any]]]
+CalendarMetadataReader = Callable[[Any], tuple[str, dict[str, Any]]]
 TaskMetadataReader = Callable[[Optional[str]], tuple[str, dict[str, Any]]]
 TaskRecommender = Callable[
     [list[dict[str, Any]], dict[str, Any], int],
@@ -107,7 +108,7 @@ def build_default_sources() -> DashboardSources:
             calendar_tools = calendar_tools_module.CalendarTools(
                 calendar_provider_module.GoogleCalendarProvider(),
             )
-            read_event_metadata = calendar_intent_module.read_metadata_from_description
+            read_event_metadata = calendar_intent_module.read_metadata_from_event
     except Exception as error:
         calendar_tools = _UnavailableCalendarTools("Calendar", error)
         read_event_metadata = fallback_event_metadata
@@ -199,7 +200,7 @@ def _clean_text(value: Any, fallback: str = "") -> str:
     return cleaned or fallback
 
 
-def fallback_event_metadata(description: str | None) -> tuple[str, dict[str, Any]]:
+def fallback_event_metadata(event_or_description: Any) -> tuple[str, dict[str, Any]]:
     defaults = {
         "owner": "unknown",
         "person": "family",
@@ -207,6 +208,24 @@ def fallback_event_metadata(description: str | None) -> tuple[str, dict[str, Any
         "preparation_needed": False,
         "preparation_notes": "",
     }
+    description = event_or_description
+    if isinstance(event_or_description, dict):
+        description = event_or_description.get("description")
+        extended_properties = event_or_description.get("extendedProperties")
+        if isinstance(extended_properties, dict):
+            private_properties = extended_properties.get("private")
+            if isinstance(private_properties, dict):
+                raw_metadata = private_properties.get(METADATA_EXTENDED_PROPERTY)
+                if isinstance(raw_metadata, str):
+                    try:
+                        parsed = json.loads(raw_metadata)
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        notes, _ = fallback_event_metadata(description)
+                        defaults.update(parsed)
+                        return notes, defaults
+
     if not description:
         return "", defaults
     marker_index = description.find(METADATA_MARKER)

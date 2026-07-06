@@ -57,6 +57,45 @@ class HomeBoardToolsTest(unittest.TestCase):
         self.assertEqual(done["data"]["item"]["status"], "done")
         self.assertEqual(pending["data"]["items"], [])
 
+    def test_mark_pending_restores_done_item(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tools = self._tools(tmpdir)
+            created = tools.add_item(
+                person_or_group="Helper",
+                message="Put food in fridge",
+                date="2026-07-03",
+                context="kitchen",
+                expires_at="2026-07-04T00:00:00-07:00",
+            )
+            item_id = created["data"]["item"]["id"]
+
+            tools.mark_done(item_id)
+            restored = tools.mark_pending(item_id)
+            pending = tools.list_items(date="2026-07-03", now=NOW)
+
+        self.assertEqual(restored["status"], "ok")
+        self.assertEqual(restored["data"]["item"]["status"], "pending")
+        self.assertEqual(pending["data"]["items"][0]["id"], item_id)
+
+    def test_delete_item_removes_item(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tools = self._tools(tmpdir)
+            created = tools.add_item(
+                person_or_group="Nysha",
+                message="Take journal",
+                date="2026-07-03",
+                context="school",
+                expires_at="2026-07-04T00:00:00-07:00",
+            )
+            item_id = created["data"]["item"]["id"]
+
+            deleted = tools.delete_item(item_id)
+            pending = tools.list_items(date="2026-07-03", now=NOW)
+
+        self.assertEqual(deleted["status"], "ok")
+        self.assertEqual(deleted["data"]["item"]["id"], item_id)
+        self.assertEqual(pending["data"]["items"], [])
+
     def test_expired_items_are_hidden_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tools = self._tools(tmpdir)

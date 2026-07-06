@@ -17,6 +17,12 @@ class FamilyDecisionProvider(Protocol):
     def get_decision(self, decision_id: str) -> dict[str, Any] | None:
         ...
 
+    def delete_decision(self, decision_id: str) -> dict[str, Any] | None:
+        ...
+
+    def restore_decision(self, decision: dict[str, Any]) -> dict[str, Any] | None:
+        ...
+
     def update_decision(self, decision_id: str, **fields: Any) -> dict[str, Any] | None:
         ...
 
@@ -231,6 +237,37 @@ class FamilyDecisionTools:
         if decision is None:
             return {"status": "error", "message": "Decision not found.", "data": {"decision_id": cleaned_id}}
         return {"status": "ok", "message": "Family decision returned.", "data": {"decision": decision, "gaps": decision_gaps(decision)}}
+
+    def delete_decision(self, decision_id: str | None) -> ToolResponse:
+        cleaned_id = _clean_optional(decision_id)
+        if cleaned_id is None:
+            return _missing_response(["decision_id"])
+        try:
+            decision = self.provider.delete_decision(cleaned_id)
+        except Exception as error:
+            return _error_response(error)
+        if decision is None:
+            return {"status": "error", "message": "Decision not found.", "data": {"decision_id": cleaned_id}}
+        return {
+            "status": "ok",
+            "message": "Family decision deleted.",
+            "data": {"decision": decision},
+        }
+
+    def restore_decision(self, decision: dict[str, Any] | None) -> ToolResponse:
+        if not isinstance(decision, dict) or _clean_optional(decision.get("id")) is None:
+            return _missing_response(["decision"])
+        try:
+            restored = self.provider.restore_decision(decision)
+        except Exception as error:
+            return _error_response(error)
+        if restored is None:
+            return {"status": "error", "message": "Decision not found.", "data": {}}
+        return {
+            "status": "ok",
+            "message": "Family decision restored.",
+            "data": {"decision": restored, "gaps": decision_gaps(restored)},
+        }
 
     def add_option(self, decision_id: str | None, text: str | None, pros: str | None = None, cons: str | None = None) -> ToolResponse:
         cleaned_id = _clean_optional(decision_id)

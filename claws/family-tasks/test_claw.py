@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from claw import (
     FamilyTasksClaw,
     _format_created_task_message,
+    _task_notes_and_metadata,
     handle_task_request,
     run_cli,
     run_interactive,
@@ -286,10 +287,33 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertEqual(message, "Created task: Call Rahul (task id: task-123).")
         created = provider.created[0]
         self.assertEqual(created["title"], "Call Rahul")
-        _, metadata = read_metadata_from_notes(created["notes"])
+        _, metadata = _task_notes_and_metadata(created)
         self.assertEqual(metadata["context"], ["car", "phone"])
         self.assertEqual(metadata["effort_type"], "communication")
         self.assertEqual(metadata["requires"], ["phone"])
+
+    def test_add_task_from_voice_chatter_creates_clean_google_task(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 5, 22, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "Add a task for tomorrow at 2pm to call up home warranty to check "
+                "how to handle with the solar panel, challenge, assign the task to Namesh",
+                reference_time=now,
+            )
+
+        self.assertEqual(
+            message,
+            "Created task: Call home warranty about the solar panel (task id: task-123).",
+        )
+        created = provider.created[0]
+        self.assertEqual(created["title"], "Call home warranty about the solar panel")
+        self.assertIsNone(created["notes"])
+        self.assertEqual(created["due"], "2026-07-06")
+        _, metadata = _task_notes_and_metadata(created)
+        self.assertEqual(metadata["owner"], "dad")
 
     def test_add_task_from_request_stores_ai_assistant_help(self):
         provider = FakeProvider()
@@ -319,7 +343,7 @@ class FamilyTasksClawTest(unittest.TestCase):
             message,
         )
         created = provider.created[0]
-        notes, metadata = read_metadata_from_notes(created["notes"])
+        notes, metadata = _task_notes_and_metadata(created)
         self.assertIn("Assistant help: Look up the FUSD phone number", notes)
         self.assertIn("Assistant context: Email: waitlist@example.com", notes)
         self.assertTrue(metadata["assistant_help_needed"])
@@ -365,7 +389,7 @@ class FamilyTasksClawTest(unittest.TestCase):
         )
         self.assertNotIn("I really want", message)
         created = provider.created[0]
-        notes, metadata = read_metadata_from_notes(created["notes"])
+        notes, metadata = _task_notes_and_metadata(created)
         self.assertEqual(
             created["title"],
             "Call FUSD to follow up on Nyshas School waiting list for Chad Bond",
@@ -411,7 +435,7 @@ class FamilyTasksClawTest(unittest.TestCase):
         )
         self.assertNotIn("I really want", message)
         created = provider.created[0]
-        notes, metadata = read_metadata_from_notes(created["notes"])
+        notes, metadata = _task_notes_and_metadata(created)
         self.assertEqual(
             created["title"],
             "Call FUSD to follow up on Nyshas School waiting list for Chad Bond",
@@ -461,7 +485,7 @@ class FamilyTasksClawTest(unittest.TestCase):
             ],
         )
         self.assertEqual(provider.updated[0]["id"], "task-123")
-        notes, metadata = read_metadata_from_notes(provider.updated[0]["notes"])
+        notes, metadata = _task_notes_and_metadata(provider.updated[0])
         self.assertIn("Noah result (2026-07-03 22:06 PDT):", notes)
         self.assertIn("FUSD main line is 510-657-2350", notes)
         self.assertFalse(metadata["assistant_help_needed"])
@@ -505,7 +529,7 @@ class FamilyTasksClawTest(unittest.TestCase):
                 }
             ],
         )
-        notes, metadata = read_metadata_from_notes(provider.tasks[0]["notes"])
+        notes, metadata = _task_notes_and_metadata(provider.tasks[0])
         self.assertIn("Noah result (2026-07-03 09:00 PDT):", notes)
         self.assertIn("FUSD main line is 510-657-2350", notes)
         self.assertIn("Sources:", notes)
@@ -550,7 +574,7 @@ class FamilyTasksClawTest(unittest.TestCase):
             )
 
         self.assertIn("Noah could not complete 1 assistant help task", message)
-        _, metadata = read_metadata_from_notes(provider.tasks[0]["notes"])
+        _, metadata = _task_notes_and_metadata(provider.tasks[0])
         self.assertTrue(metadata["assistant_help_needed"])
         self.assertEqual(metadata["assistant_help_status"], "error")
         self.assertEqual(
@@ -732,6 +756,113 @@ class FamilyTasksClawTest(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(provider.completed, ["task-1"])
+
+    def test_undo_reverts_created_task(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.add_task_from_request("Add task change water filter")
+            message = claw.undo_last_action()
+
+        self.assertIn("Undid task creation", message)
+        self.assertEqual(provider.deleted, ["task-123"])
+
+    def test_assign_owner_followup_updates_last_created_task(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.add_task_from_request("Add task add a phone screen to my phone tomorrow")
+            provider.tasks = [provider.created[-1]]
+            message = claw.assign_owner_from_request("assign it to nimesh")
+
+        self.assertIn("Updated task (owner=dad)", message)
+        _, metadata = _task_notes_and_metadata(provider.updated[-1])
+        self.assertEqual(metadata["owner"], "dad")
+
+    def test_assign_owner_by_title_updates_matching_task(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            _task("Add a phone screen to my phone", {"owner": "unknown"}),
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            message = claw.assign_owner_from_request(
+                "Assign Add a phone screen to my phone task to nimesh",
+            )
+
+        self.assertIn("Updated task (owner=dad)", message)
+        _, metadata = _task_notes_and_metadata(provider.updated[-1])
+        self.assertEqual(metadata["owner"], "dad")
+
+    def test_update_task_owner_accepts_non_assign_wording(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.add_task_from_request("Add task add a phone screen to my phone tomorrow")
+            first = claw.update_task_from_request("owner is nimesh")
+            second = claw.update_task_from_request("make it for niyati")
+
+        self.assertIn("Updated task (owner=dad)", first)
+        self.assertIn("Updated task (owner=mom)", second)
+        _, metadata = _task_notes_and_metadata(provider.updated[-1])
+        self.assertEqual(metadata["owner"], "mom")
+
+    def test_update_task_followup_appends_note_to_last_created_task(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.add_task_from_request("Add task add a phone screen to my phone tomorrow")
+            message = claw.update_task_from_request(
+                "add note warranty expires next week",
+            )
+
+        self.assertIn("Updated task (note)", message)
+        notes, _ = read_metadata_from_notes(provider.updated[-1]["notes"])
+        self.assertIn("warranty expires next week", notes)
+
+    def test_update_task_followup_queues_noah_help_on_last_created_task(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.add_task_from_request("Add task add a phone screen to my phone tomorrow")
+            message = claw.update_task_from_request(
+                "add Noah to help me find the right phone screen",
+            )
+
+        self.assertIn("Updated task (Noah help)", message)
+        _, metadata = _task_notes_and_metadata(provider.updated[-1])
+        self.assertTrue(metadata["assistant_help_needed"])
+        self.assertEqual(metadata["assistant_name"], "Noah")
+        self.assertEqual(
+            metadata["assistant_help_request"],
+            "find the right phone screen",
+        )
+
+    def test_undo_reverts_completed_task(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            {
+                "id": "task-1",
+                "title": "Change water filter",
+                "notes": write_metadata_to_notes(None, {"context": ["home"]}),
+                "status": "needsAction",
+            }
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.complete_task_from_request("Complete change water filter")
+            claw.handle_pending_response("yes")
+            message = claw.undo_last_action()
+
+        self.assertIn("Undid task completion", message)
+        self.assertEqual(provider.updated[-1]["status"], "needsAction")
 
     def test_handle_task_request_uses_pending_confirmation(self):
         provider = FakeProvider()

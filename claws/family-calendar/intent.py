@@ -30,6 +30,7 @@ WEEKDAY_RRULE_CODES = {
 }
 
 METADATA_MARKER = "N4OS_METADATA:"
+METADATA_EXTENDED_PROPERTY = "n4os_metadata"
 
 DEFAULT_METADATA = {
     "owner": "unknown",
@@ -43,11 +44,64 @@ DEFAULT_METADATA = {
     "assistant_context": "",
 }
 
-VALID_OWNERS = {"dad", "mom", "both", "unknown"}
+VALID_OWNERS = {"dad", "mom", "both", "grandmom", "unknown"}
 
 OWNER_NAME_ALIASES = {
+    "mom": "mom",
+    "mum": "mom",
+    "mummy": "mom",
     "niyati": "mom",
+    "niyaati": "mom",
+    "niyathi": "mom",
+    "dad": "dad",
+    "papa": "dad",
+    "papu": "dad",
+    "nimesh": "dad",
+    "namesh": "dad",
+    "both": "both",
+    "parents": "both",
+    "grand mom": "grandmom",
+    "grandmom": "grandmom",
+    "dadi": "grandmom",
+    "tarla": "grandmom",
+    "unknown": "unknown",
 }
+OWNER_ALIAS_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(OWNER_NAME_ALIASES, key=len, reverse=True)
+)
+
+PERSON_NAME_ALIASES = {
+    "elder one": "Nysha",
+    "big n": "Nysha",
+    "nisha": "Nysha",
+    "nysha": "Nysha",
+    "nyshoo": "Nysha",
+    "nyshuu": "Nysha",
+    "littler one": "Navya",
+    "smaller one": "Navya",
+    "small n": "Navya",
+    "naavya": "Navya",
+    "navya": "Navya",
+    "grand mom": "Tarla",
+    "grandmom": "Tarla",
+    "dadi": "Tarla",
+    "tarla": "Tarla",
+    "family": "family",
+}
+PERSON_ALIAS_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(PERSON_NAME_ALIASES, key=len, reverse=True)
+)
+
+OWNER_ACTION_WORD_PATTERN = (
+    r"take|handle|bring|drive|do|go|pick\s+up|pickup|drop\s+off|dropoff"
+)
+EVENT_TITLE_ACTION_WORD_PATTERN = (
+    r"cancel|downgrade|renew|call|text|email|message|book|schedule|pay|"
+    r"submit|pick\s+up|pickup|drop\s+off|dropoff|buy|get|return|prepare|"
+    r"send|order|reserve|change|replace|fix|repair"
+)
 
 CATEGORY_HINTS = {
     "school": ("school", "pickup", "class", "teacher", "homework"),
@@ -80,6 +134,18 @@ ASSISTANT_DETAIL_LABEL_RE = re.compile(
 
 def _clean_spaces(value: str) -> str:
     return " ".join(value.split()).strip()
+
+
+def _alias_key(value: str) -> str:
+    return _clean_spaces(value).lower()
+
+
+def _canonical_owner(value: str) -> str:
+    return OWNER_NAME_ALIASES.get(_alias_key(value), "unknown")
+
+
+def _canonical_person(value: str) -> str:
+    return PERSON_NAME_ALIASES.get(_alias_key(value), _clean_spaces(value))
 
 
 def _clean_assistant_text(value: Any) -> str:
@@ -316,6 +382,41 @@ def read_metadata_from_description(description: str | None) -> tuple[str, dict[s
     return notes, _normalize_metadata(parsed)
 
 
+def _read_metadata_from_extended_properties(event: dict[str, Any]) -> dict[str, Any] | None:
+    extended_properties = event.get("extendedProperties")
+    if not isinstance(extended_properties, dict):
+        return None
+
+    private_properties = extended_properties.get("private")
+    if not isinstance(private_properties, dict):
+        return None
+
+    raw_metadata = private_properties.get(METADATA_EXTENDED_PROPERTY)
+    if not isinstance(raw_metadata, str):
+        return None
+
+    try:
+        parsed = json.loads(raw_metadata)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    return _normalize_metadata(parsed)
+
+
+def read_metadata_from_event(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    notes, legacy_metadata = read_metadata_from_description(event.get("description"))
+    metadata = _read_metadata_from_extended_properties(event)
+    return notes, metadata or legacy_metadata
+
+
+def write_human_description(notes: str | None) -> str | None:
+    clean_notes, _ = read_metadata_from_description(notes)
+    return clean_notes or None
+
+
 def write_metadata_to_description(
     notes: str | None,
     metadata: dict[str, Any] | None,
@@ -327,6 +428,13 @@ def write_metadata_to_description(
         return f"Notes:\n{clean_notes}\n\n{METADATA_MARKER}\n{metadata_json}"
 
     return f"{METADATA_MARKER}\n{metadata_json}"
+
+
+def write_metadata_to_private_extended_properties(
+    metadata: dict[str, Any] | None,
+) -> dict[str, str]:
+    metadata_json = json.dumps(_normalize_metadata(metadata), separators=(",", ":"))
+    return {METADATA_EXTENDED_PROPERTY: metadata_json}
 
 
 def _default_now(now: datetime | None) -> datetime:
@@ -432,13 +540,14 @@ def _extract_week_briefing_range(
 
 def _extract_named_person_query(user_text: str) -> str | None:
     match = re.search(
-        r"\b(?:for|about)\s+([A-Z][a-z]+)\b",
+        rf"\b(?:for|about)\s+(?P<person>{PERSON_ALIAS_PATTERN})\b",
         user_text,
+        flags=re.IGNORECASE,
     )
     if match is None:
         return None
 
-    return match.group(1)
+    return _canonical_person(match.group("person"))
 
 
 def _extract_list_metadata_filter(user_text: str) -> dict[str, Any]:
@@ -452,16 +561,30 @@ def _extract_list_metadata_filter(user_text: str) -> dict[str, Any]:
     if owner_context is not None:
         if re.search(r"\b(?:i|me|my|am i)\b", lowered):
             filters["owner"] = "dad"
-        elif "mom" in lowered:
-            filters["owner"] = "mom"
-        elif re.search(r"\b(?:both|we|us|parents)\b", lowered):
-            filters["owner"] = "both"
+        else:
+            owner_match = re.search(
+                rf"\b(?P<owner>{OWNER_ALIAS_PATTERN})\b",
+                user_text,
+                flags=re.IGNORECASE,
+            )
+            if owner_match is not None:
+                filters["owner"] = _canonical_owner(owner_match.group("owner"))
+            elif re.search(r"\b(?:we|us)\b", lowered):
+                filters["owner"] = "both"
+
+    owner_query = re.search(
+        rf"\b(?:for|about)\s+(?P<owner>{OWNER_ALIAS_PATTERN})\b",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if owner_query is not None:
+        filters["owner"] = _canonical_owner(owner_query.group("owner"))
 
     if "preparation" in lowered or "prep" in lowered or re.search(r"\bneeds?\b", lowered):
         filters["preparation_needed"] = True
 
-    person = _extract_named_person_query(user_text)
-    if person is not None:
+    person = None if "owner" in filters else _extract_named_person_query(user_text)
+    if person is not None and person != "family":
         filters["person"] = person
         filters["text_query"] = person
 
@@ -736,8 +859,10 @@ def _extract_location(user_text: str) -> str | None:
 
 def _extract_pickup_parts(user_text: str) -> dict[str, str] | None:
     match = re.search(
-        r"\b(?P<adult>[A-Z][a-z]+)\s+picks?\s+up\s+(?P<child>[A-Z][a-z]+)\b(?P<rest>.*)",
+        rf"\b(?P<adult>{OWNER_ALIAS_PATTERN})\s+picks?\s+up\s+"
+        rf"(?P<child>{PERSON_ALIAS_PATTERN})\b(?P<rest>.*)",
         user_text,
+        flags=re.IGNORECASE,
     )
     if match is None:
         return None
@@ -760,8 +885,8 @@ def _extract_pickup_parts(user_text: str) -> dict[str, str] | None:
         )
         source = _clean_spaces(source.strip(" ,"))
 
-    child = match.group("child")
-    adult = match.group("adult")
+    child = _canonical_person(match.group("child"))
+    adult = _clean_spaces(match.group("adult")).title()
     if source:
         title = f"{child} {source} pickup"
         notes = f"{adult} picks up {child} from {source}"
@@ -839,9 +964,13 @@ def _extract_person(user_text: str) -> str:
     if pickup is not None:
         return pickup["child"]
 
-    match = re.search(r"\b(Nysha|Navya)\b", user_text, flags=re.IGNORECASE)
+    match = re.search(
+        rf"\b(?P<person>{PERSON_ALIAS_PATTERN})\b",
+        user_text,
+        flags=re.IGNORECASE,
+    )
     if match is not None:
-        return match.group(1)[:1].upper() + match.group(1)[1:].lower()
+        return _canonical_person(match.group("person"))
 
     if "family" in user_text.lower():
         return "family"
@@ -852,14 +981,28 @@ def _extract_person(user_text: str) -> str:
 def _extract_owner(user_text: str) -> str:
     pickup = _extract_pickup_parts(user_text)
     if pickup is not None:
-        adult = pickup["adult"].lower()
-        if adult in OWNER_NAME_ALIASES:
-            return OWNER_NAME_ALIASES[adult]
+        owner = _canonical_owner(pickup["adult"])
+        if owner != "unknown":
+            return owner
 
     lowered = user_text.lower()
-    if re.search(r"\bmom\b.+\b(?:take|handle|bring|drive|do|go)\b", lowered):
-        return "mom"
-    if re.search(r"\b(?:i|dad)\b.+\b(?:will\s+)?(?:take|handle|bring|drive|do|go)\b", lowered):
+    owner_annotation = re.search(
+        rf"\b(?:owner|owned\s+by|the\s+owner\s+is)\s*(?:is|:)?\s*"
+        rf"(?P<owner>{OWNER_ALIAS_PATTERN})\b",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if owner_annotation is not None:
+        return _canonical_owner(owner_annotation.group("owner"))
+
+    owner_action = re.search(
+        rf"\b(?P<owner>{OWNER_ALIAS_PATTERN})\b.+\b(?:will\s+)?(?:{OWNER_ACTION_WORD_PATTERN})\b",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if owner_action is not None:
+        return _canonical_owner(owner_action.group("owner"))
+    if re.search(r"\b(?:i|me)\b.+\b(?:will\s+)?(?:take|handle|bring|drive|do|go)\b", lowered):
         return "dad"
     if re.search(r"\b(?:we|both|parents)\b.+\b(?:will\s+)?(?:take|handle|bring|drive|do|go)\b", lowered):
         return "both"
@@ -888,8 +1031,26 @@ def _extract_preparation_notes(user_text: str) -> str:
     notes = _clean_spaces(match.group(0).strip(" ."))
     if re.search(r"\bneed to leave\b", notes, flags=re.IGNORECASE):
         return ""
+    if re.fullmatch(r"needs?\s+to\s+be\s+done", notes, flags=re.IGNORECASE):
+        return ""
 
     return notes
+
+
+def _strip_event_display_annotations(value: str) -> str:
+    title = re.sub(
+        r"\b(?:the\s+)?owner\s*(?:is|:)?\b.*$|\bowned\s+by\b.*$",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"[, ]+\b(?:need|needs|bring|prepare)\b.+$",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
+    return _clean_spaces(title.strip(" ,."))
 
 
 def _extract_metadata(user_text: str) -> dict[str, Any]:
@@ -930,6 +1091,13 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
 
     title = _strip_create_words(user_text)
     title = re.sub(
+        r"^\s*(?:i\s+had|there\s+is|this\s+is)\s+(?:a\s+)?"
+        r"(?:calendar\s+)?(?:event|invite|invitation|reminder)\s*(?:for|to)?\s*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
         r"\bevery\s+(?:day|weekday|weekdays|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
         " ",
         title,
@@ -947,17 +1115,20 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
     title = re.sub(r"\bnext\s+(?=monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bnext\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(
-        r"[, ]+\b(?:i|dad|mom|we|both|parents)\b.+?\b(?:will\s+)?(?:take|handle|bring|drive|do|go)\b.*$",
+        rf"[, ]+\b(?:i|we|both|parents|{OWNER_ALIAS_PATTERN})\b.+?\b"
+        rf"(?:will\s+)?(?:{OWNER_ACTION_WORD_PATTERN})\b.*$",
         " ",
         title,
         flags=re.IGNORECASE,
     )
-    title = re.sub(
-        r"[, ]+\b(?:need|needs|bring|prepare)\b.+$",
-        " ",
+    action_match = re.search(
+        rf"\bto\s+(?P<action>(?:{EVENT_TITLE_ACTION_WORD_PATTERN})\b.+)$",
         title,
         flags=re.IGNORECASE,
     )
+    if action_match is not None:
+        title = action_match.group("action")
+    title = _strip_event_display_annotations(title)
 
     with_match = re.search(r"\bwith\s+(.+)$", title, flags=re.IGNORECASE)
     if with_match is not None:

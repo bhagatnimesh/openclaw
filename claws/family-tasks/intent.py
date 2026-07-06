@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 from datetime import date, datetime, time, timedelta
 import json
 import re
@@ -46,7 +47,33 @@ VALID_LOCATIONS = {
     "specific",
     "unknown",
 }
-VALID_OWNERS = {"dad", "mom", "both", "unknown"}
+VALID_OWNERS = {"dad", "mom", "both", "grandmom", "unknown"}
+OWNER_ALIASES = {
+    "dad": "dad",
+    "father": "dad",
+    "nimesh": "dad",
+    "namesh": "dad",
+    "papa": "dad",
+    "papu": "dad",
+    "mom": "mom",
+    "mother": "mom",
+    "mum": "mom",
+    "mummy": "mom",
+    "niyati": "mom",
+    "niyaati": "mom",
+    "niyathi": "mom",
+    "both": "both",
+    "parents": "both",
+    "grand mom": "grandmom",
+    "grandmom": "grandmom",
+    "dadi": "grandmom",
+    "tarla": "grandmom",
+    "unknown": "unknown",
+}
+OWNER_ALIAS_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(OWNER_ALIASES, key=len, reverse=True)
+)
 LEGACY_MODE_TO_EFFORT_TYPE = {
     "call": "communication",
     "research": "research",
@@ -66,6 +93,54 @@ WEEKDAYS = {
     "saturday": 5,
     "sunday": 6,
 }
+MONTHS = {}
+for month_names in (calendar.month_name, calendar.month_abbr):
+    MONTHS.update(
+        {
+            value.lower(): index
+            for index, value in enumerate(month_names)
+            if value
+        },
+    )
+MONTHS["sept"] = 9
+MONTH_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(MONTHS, key=len, reverse=True)
+)
+DAY_ORDINALS = {
+    value: index + 1
+    for index, value in enumerate(
+        (
+            "first second third fourth fifth sixth seventh eighth ninth tenth "
+            "eleventh twelfth thirteenth fourteenth fifteenth sixteenth "
+            "seventeenth eighteenth nineteenth"
+        ).split(),
+    )
+}
+DAY_TENS = {"twentieth": 20, "thirtieth": 30}
+DAY_TENS_PREFIXES = {"twenty": 20, "thirty": 30}
+DAY_ONES_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(DAY_ORDINALS, key=len, reverse=True)
+    if DAY_ORDINALS[value] < 10
+)
+DAY_WORD_PATTERN = "|".join(
+    [
+        *(
+            re.escape(value)
+            for value in sorted(
+                [*DAY_ORDINALS, *DAY_TENS],
+                key=len,
+                reverse=True,
+            )
+        ),
+        rf"(?:twenty|thirty)[ -](?:{DAY_ONES_PATTERN})",
+    ]
+)
+MONTH_DAY_PATTERN = (
+    rf"(?:{MONTH_PATTERN})\s+"
+    rf"(?:\d{{1,2}}(?:st|nd|rd|th)?|{DAY_WORD_PATTERN})"
+)
 
 DEFAULT_METADATA = {
     "context": [],
@@ -125,6 +200,8 @@ ERRAND_WORDS = (
 )
 TASK_ACTION_WORDS = (
     "pack",
+    "cancel",
+    "downgrade",
     "bring",
     "buy",
     "get",
@@ -185,6 +262,16 @@ EXPLICIT_CLOCK_TIME_RE = re.compile(
 )
 TASK_OWNER_NOTE_RE = re.compile(
     r"\b(?:this\s+)?task\s+(?:is\s+)?for\s+[\w'.-]+\.?.*$",
+    re.IGNORECASE,
+)
+TASK_OWNER_ANNOTATION_RE = re.compile(
+    rf"\b(?:owner|owned\s+by|assign(?:ed)?(?:\s+the)?\s+task\s+to|"
+    rf"assign(?:ed)?\s+to|(?:this\s+)?task\s+(?:is\s+)?for)\s+"
+    rf"(?P<owner>{OWNER_ALIAS_PATTERN})\b\.?",
+    re.IGNORECASE,
+)
+DUE_DATE_ANNOTATION_RE = re.compile(
+    rf"\b(?:do\s+it\s+by|by|due)\s+{MONTH_DAY_PATTERN}\b\.?",
     re.IGNORECASE,
 )
 ASSISTANT_NAMES = ("Noah",)
@@ -464,6 +551,32 @@ def _clean_duration(value: Any) -> int | None:
     return duration if duration > 0 else None
 
 
+def _owner_from_alias(value: str) -> str:
+    return OWNER_ALIASES.get(_clean_spaces(value).lower(), "unknown")
+
+
+def _day_from_month_day_text(value: str) -> int | None:
+    numeric_day = re.fullmatch(r"(\d{1,2})(?:st|nd|rd|th)?", value)
+    if numeric_day is not None:
+        return int(numeric_day.group(1))
+
+    normalized = value.replace("-", " ")
+    if normalized in DAY_ORDINALS:
+        return DAY_ORDINALS[normalized]
+    if normalized in DAY_TENS:
+        return DAY_TENS[normalized]
+
+    if " " not in normalized:
+        return None
+
+    prefix, suffix = normalized.split(" ", 1)
+    tens = DAY_TENS_PREFIXES.get(prefix)
+    ones = DAY_ORDINALS.get(suffix)
+    if tens is None or ones is None or ones >= 10:
+        return None
+    return tens + ones
+
+
 def _contains_any_word(user_text: str, words: tuple[str, ...]) -> bool:
     return any(re.search(rf"\b{re.escape(word)}\b", user_text) for word in words)
 
@@ -565,6 +678,11 @@ def write_metadata_to_notes(
     return f"{METADATA_MARKER}\n{metadata_json}"
 
 
+def write_human_notes(notes: str | None) -> str | None:
+    human_notes, _ = read_metadata_from_notes(notes)
+    return human_notes or None
+
+
 def _current_or_next_weekday(reference: datetime, weekday: int) -> date:
     return (reference + timedelta(days=(weekday - reference.weekday()) % 7)).date()
 
@@ -600,6 +718,25 @@ def _extract_due_date(user_text: str, reference: datetime) -> tuple[str | None, 
     match = re.search(r"\bdue\s+(\d{4}-\d{2}-\d{2})\b", lowered)
     if match is not None:
         return match.group(1), "due date"
+
+    month_day = re.search(
+        rf"\b(?:by|due|on|do\s+it\s+by)?\s*"
+        rf"(?P<month>{MONTH_PATTERN})\s+"
+        rf"(?P<day>\d{{1,2}}(?:st|nd|rd|th)?|{DAY_WORD_PATTERN})\b",
+        lowered,
+    )
+    if month_day is not None:
+        month = MONTHS[month_day.group("month")]
+        day = _day_from_month_day_text(month_day.group("day"))
+        if day is None:
+            return None, ""
+        try:
+            due_date = date(reference.year, month, day)
+        except ValueError:
+            return None, ""
+        if due_date < reference.date():
+            due_date = date(reference.year + 1, month, day)
+        return due_date.isoformat(), "due date"
 
     return None, ""
 
@@ -718,13 +855,19 @@ def _infer_effort_type(user_text: str) -> str:
 
 def _infer_owner(user_text: str) -> str:
     lowered = user_text.lower()
-    if re.search(r"\b(?:dad|father)\s+will\b", lowered) or re.search(
+    explicit_owner = TASK_OWNER_ANNOTATION_RE.search(lowered)
+    if explicit_owner is not None:
+        return _owner_from_alias(explicit_owner.group("owner"))
+
+    if re.search(r"\b(?:dad|father|nimesh|namesh|papa|papu)\s+will\b", lowered) or re.search(
         r"\b(?:i|me)\s+(?:will|can|should|need to|have to)\b",
         lowered,
     ):
         return "dad"
-    if re.search(r"\b(?:mom|mother|niyati)\s+will\b", lowered):
+    if re.search(r"\b(?:mom|mother|mum|mummy|niyati|niyaati|niyathi)\s+will\b", lowered):
         return "mom"
+    if re.search(r"\b(?:grand\s*mom|dadi|tarla)\s+will\b", lowered):
+        return "grandmom"
     if re.search(r"\b(?:both|we|us|parents)\s+(?:will|can|should|need to|have to)\b", lowered):
         return "both"
     return "unknown"
@@ -852,12 +995,47 @@ def _strip_create_words(user_text: str) -> str:
         user_text,
         flags=re.IGNORECASE,
     ).strip()
+    cleaned = re.sub(
+        r"^\s*(?:i\s+had|there\s+is|this\s+is)\s+(?:a\s+)?"
+        r"(?:task|todo|to-do|open\s+loop)\s*(?:for|to)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     return LEADING_DUE_ACTION_RE.sub("", cleaned, count=1).strip()
 
 
 def _strip_task_annotations(title: str) -> str:
     cleaned = title
+    shopping_match = re.search(
+        r"^\s*go\s+to\s+(?P<place>.+?)\s+in\s+order\s+b(?:uy|y)\s+"
+        r"(?:the\s+)?(?P<item>.+?)(?:,\s*for\s+(?P<purpose>.+?))?"
+        r"(?:,\s*the\s+owner\s+is)?\s*$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if shopping_match is not None:
+        item = _clean_spaces(shopping_match.group("item"))
+        item = re.sub(r"\s+for\s+everyone$", "", item, flags=re.IGNORECASE)
+        purpose = _clean_spaces(shopping_match.group("purpose") or "")
+        cleaned = f"buy {item}{f' for {purpose}' if purpose else ''}"
+    cleaned = TASK_OWNER_ANNOTATION_RE.sub("", cleaned)
     cleaned = TASK_OWNER_NOTE_RE.sub("", cleaned)
+    cleaned = DUE_DATE_ANNOTATION_RE.sub("", cleaned)
+    cleaned = re.sub(
+        r"\s*,?\s*(?:the\s+)?owner\s*(?:is|:)?\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s*,\s*challenge\b.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bcall\s+up\b", "call", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\s+to\s+check\s+how\s+to\s+handle\s+with\s+(.+)$",
+        r" about \1",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\s*,\s*(?:needs?|requires?).*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:this\s+weekend|today|tomorrow|tonight)\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(
@@ -1026,7 +1204,15 @@ def _extract_query_after_action(user_text: str) -> str | None:
 
 
 def _normalize_create_request_text(user_text: str) -> str:
-    return CREATE_TASK_TRANSCRIPTION_RE.sub("add ", user_text, count=1)
+    normalized = CREATE_TASK_TRANSCRIPTION_RE.sub("add ", user_text, count=1)
+    return re.sub(
+        r"^\s*(?:i\s+had|there\s+is|this\s+is)\s+(?:a\s+)?"
+        r"(?:task|todo|to-do|open\s+loop)\s*(?:for|to)?\s*",
+        "add task ",
+        normalized,
+        count=1,
+        flags=re.IGNORECASE,
+    )
 
 
 def _is_run_assistant_help_request(user_text: str) -> bool:

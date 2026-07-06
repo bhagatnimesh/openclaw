@@ -188,6 +188,44 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data["summary"]["prep_needed_count"], 1)
         self.assertEqual(data["summary"]["unassigned_count"], 1)
 
+    def test_calendar_private_metadata_feeds_dashboard_without_visible_json(self):
+        import json
+
+        data = build_dashboard_data(
+            sources(
+                events=[
+                    {
+                        "id": "fox-subscription",
+                        "summary": "Cancel Fox 1 subscription",
+                        "start": {"dateTime": "2026-07-03T19:00:00-07:00"},
+                        "end": {"dateTime": "2026-07-03T20:00:00-07:00"},
+                        "description": "",
+                        "extendedProperties": {
+                            "private": {
+                                "n4os_metadata": json.dumps(
+                                    {
+                                        "owner": "dad",
+                                        "person": "family",
+                                        "category": "admin",
+                                        "preparation_needed": True,
+                                        "preparation_notes": "Cancel before renewal",
+                                    },
+                                ),
+                            },
+                        },
+                    },
+                ],
+            ),
+            now=datetime.fromisoformat("2026-07-03T08:00:00-07:00"),
+        )
+
+        event_data = data["calendar"]["today"][0]
+        self.assertEqual(event_data["title"], "Cancel Fox 1 subscription")
+        self.assertEqual(event_data["notes"], "")
+        self.assertEqual(event_data["owner"], "dad")
+        self.assertTrue(event_data["preparation_needed"])
+        self.assertEqual(event_data["preparation_notes"], "Cancel before renewal")
+
     def test_recommendations_include_contextual_task_groups(self):
         data = build_dashboard_data(
             sources(

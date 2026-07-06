@@ -132,7 +132,12 @@ function createCronScheduleSchema(): TSchema {
     Type.Object(
       {
         kind: optionalStringEnum(CRON_SCHEDULE_KINDS, { description: "Schedule kind" }),
-        at: Type.Optional(Type.String({ description: "ISO-8601 time (kind=at)" })),
+        at: Type.Optional(
+          Type.String({
+            description:
+              "Absolute ISO-8601 time (kind=at). For one-shot reminders, derive this from concrete dates/times in the user message, including framed voice transcripts; ask only when no date/time is present.",
+          }),
+        ),
         everyMs: optionalPositiveIntegerSchema({ description: "Interval ms (kind=every)" }),
         anchorMs: optionalNonNegativeIntegerSchema({
           description: "Start anchor ms (kind=every)",
@@ -890,6 +895,7 @@ Current binding needs sessionTarget="current".
 SCHEDULE TYPES (schedule.kind):
 - "at": one-shot absolute time
   { "kind": "at", "at": "<ISO-8601 timestamp>" }
+  For natural-language one-shot reminders, including voice transcript text, convert the stated date/time from the current message context into schedule.at. Ask only when no concrete date/time is present.
 - "every": recurring interval
   { "kind": "every", "everyMs": <ms>, "anchorMs": <optional-ms> }
 - "cron": expr in supplied timezone, or Gateway host local timezone when tz omitted

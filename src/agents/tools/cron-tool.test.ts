@@ -83,6 +83,14 @@ describe("cron tool", () => {
     expect(tool.description).toContain('"tz": "Asia/Shanghai"');
   });
 
+  it("tells models to extract concrete one-shot reminder times before asking", () => {
+    const tool = createTestCronTool();
+
+    expect(tool.description).toContain("including voice transcript text");
+    expect(tool.description).toContain("convert the stated date/time");
+    expect(tool.description).toContain("Ask only when no concrete date/time is present");
+  });
+
   function buildReminderAgentTurnJob(overrides: Record<string, unknown> = {}): {
     name: string;
     schedule: { at: string };

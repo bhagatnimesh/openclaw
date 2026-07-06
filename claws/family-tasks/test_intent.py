@@ -58,6 +58,35 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["due"], "2026-07-04")
         self.assertEqual(intent["metadata"]["effort_type"], "admin")
 
+    def test_thought_like_task_capture_uses_clean_title(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "I had a task to cancel Fox 1 subscription owner unknown "
+            "due September first",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Cancel Fox 1 subscription")
+        self.assertEqual(intent["due"], "2026-09-01")
+        self.assertEqual(intent["metadata"]["owner"], "unknown")
+
+    def test_voice_task_assignment_chatter_is_removed_from_title(self):
+        now = datetime(2026, 7, 5, 22, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add a task for tomorrow at 2pm to call up home warranty to check "
+            "how to handle with the solar panel, challenge, assign the task to Namesh",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Call home warranty about the solar panel")
+        self.assertEqual(intent["due"], "2026-07-06")
+        self.assertEqual(intent["metadata"]["owner"], "dad")
+        self.assertIsNone(intent["notes"])
+
     def test_call_during_commute_metadata(self):
         now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
@@ -71,6 +100,41 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["metadata"]["location"], "anywhere")
         self.assertEqual(intent["metadata"]["energy"], "low")
         self.assertEqual(intent["metadata"]["duration_minutes"], 20)
+
+    def test_explicit_niyati_owner_and_month_day_due_date(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add task cancel or downgrade gemini. owner niyati. "
+            "Do it by september first",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Cancel or downgrade gemini")
+        self.assertEqual(intent["due"], "2026-09-01")
+        self.assertEqual(intent["metadata"]["owner"], "mom")
+
+    def test_explicit_household_owner_aliases(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        cases = {
+            "mum": "mom",
+            "mummy": "mom",
+            "namesh": "dad",
+            "niyaati": "mom",
+            "niyathi": "mom",
+            "papa": "dad",
+            "papu": "dad",
+            "dadi": "grandmom",
+        }
+
+        for alias, owner in cases.items():
+            with self.subTest(alias=alias):
+                intent = extract_intent(
+                    f"Add task return library books owner {alias}",
+                    now=now,
+                )
+                self.assertEqual(intent["metadata"]["owner"], owner)
 
     def test_bare_time_bound_call_is_not_task_creation(self):
         now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))

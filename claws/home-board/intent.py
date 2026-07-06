@@ -16,7 +16,42 @@ VALID_CONTEXTS = {
     "general",
 }
 VALID_PRIORITIES = {"low", "medium", "high"}
-PERSON_WORDS = ("helper", "nysha", "nimesh", "dad", "mom", "family", "everyone")
+PERSON_ALIASES = {
+    "helper": "Helper",
+    "dad": "Dad",
+    "nimesh": "Dad",
+    "namesh": "Dad",
+    "papa": "Dad",
+    "papu": "Dad",
+    "mom": "Mom",
+    "mum": "Mom",
+    "mummy": "Mom",
+    "niyati": "Mom",
+    "niyaati": "Mom",
+    "niyathi": "Mom",
+    "elder one": "Nysha",
+    "big n": "Nysha",
+    "nisha": "Nysha",
+    "nysha": "Nysha",
+    "nyshoo": "Nysha",
+    "nyshuu": "Nysha",
+    "littler one": "Navya",
+    "smaller one": "Navya",
+    "small n": "Navya",
+    "naavya": "Navya",
+    "navya": "Navya",
+    "grand mom": "Tarla",
+    "grandmom": "Tarla",
+    "dadi": "Tarla",
+    "tarla": "Tarla",
+    "family": "Family",
+    "everyone": "Family",
+    "everybody": "Family",
+}
+PERSON_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(PERSON_ALIASES, key=len, reverse=True)
+)
 ACTION_WORDS = (
     "take",
     "bring",
@@ -149,6 +184,8 @@ def _normalize_person(value: str) -> str:
         return "Family"
     if lowered in ("i", "me", "myself"):
         return "Me"
+    if lowered in PERSON_ALIASES:
+        return PERSON_ALIASES[lowered]
     if not cleaned:
         return "Family"
     return cleaned[:1].upper() + cleaned[1:]
@@ -163,12 +200,33 @@ def _normalize_message(value: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
+    if re.fullmatch(r"needs?\s+to\s+be\s+done", cleaned, flags=re.IGNORECASE):
+        return ""
     return _title_text(cleaned)
+
+
+def _strip_add_item_prefix(text: str) -> str:
+    cleaned = re.sub(
+        r"^\s*(?:please\s+)?(?:(?:add|create|capture|remember)\s+)?"
+        r"(?:an?\s+)?(?:(?:home\s+board|today\s+at\s+home|house\s+board)\s+)?"
+        r"(?:item|notice|reminder)\s*(?:for|to|:)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^\s*(?:i\s+had|there\s+is|this\s+is)\s+(?:a\s+)?"
+        r"(?:home\s+board\s+)?(?:item|notice|reminder)\s*(?:for|to)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return _clean_spaces(cleaned)
 
 
 def _extract_before_pattern(text: str) -> tuple[str, str] | None:
     match = re.search(
-        r"\bbefore\s+(?P<person>[A-Za-z][A-Za-z0-9_-]*|I|we|everyone|family)\s+"
+        rf"\bbefore\s+(?P<person>{PERSON_PATTERN}|I|we|everyone|family)\s+"
         r"(?P<leave>leaves?|leave|leaving)\b[:,]?\s*(?P<body>.+)",
         text,
         flags=re.IGNORECASE,
@@ -192,7 +250,7 @@ def _extract_person_and_message(text: str) -> tuple[str, str]:
         return before_match
 
     match = re.search(
-        r"^(?P<person>[A-Za-z][A-Za-z0-9_-]*)\s*:\s*(?P<body>.+)$",
+        rf"^(?P<person>{PERSON_PATTERN}|[A-Za-z][A-Za-z0-9_-]*)\s*:\s*(?P<body>.+)$",
         text,
         flags=re.IGNORECASE,
     )
@@ -200,7 +258,7 @@ def _extract_person_and_message(text: str) -> tuple[str, str]:
         return _normalize_person(match.group("person")), match.group("body")
 
     match = re.search(
-        r"^(?P<person>[A-Za-z][A-Za-z0-9_-]*)\s*,?\s+"
+        rf"^(?P<person>{PERSON_PATTERN}|[A-Za-z][A-Za-z0-9_-]*)\s*,?\s+"
         r"(?P<body>(?:should|needs?\s+to|has\s+to|must|take|bring|put|keep|return|carry|remind|pick|drop|sign|submit).*)$",
         text,
         flags=re.IGNORECASE,
@@ -227,7 +285,7 @@ def _extract_person_and_message(text: str) -> tuple[str, str]:
         return _normalize_person(match.group("person")), body
 
     match = re.search(
-        r"\bremind\s+(?P<person>me|us|her|him|them|everyone|family|[A-Za-z][A-Za-z0-9_-]*)\s+to\s+(?P<body>.+)",
+        rf"\bremind\s+(?P<person>me|us|her|him|them|everyone|family|{PERSON_PATTERN}|[A-Za-z][A-Za-z0-9_-]*)\s+to\s+(?P<body>.+)",
         text,
         flags=re.IGNORECASE,
     )
@@ -244,7 +302,7 @@ def _looks_like_home_board_add(text: str) -> bool:
     lowered = text.lower()
     return bool(
         re.search(r"\bbefore\b", lowered)
-        or re.search(rf"\b({'|'.join(PERSON_WORDS)})\b", lowered)
+        or re.search(rf"\b(?:{PERSON_PATTERN})\b", lowered)
         or re.search(rf"\b({'|'.join(ACTION_WORDS)})\b", lowered)
     )
 
@@ -269,13 +327,13 @@ def _split_bulk_segments(text: str) -> list[str]:
         return line_segments
 
     normalized = re.sub(
-        rf"\s+(?=({'|'.join(PERSON_WORDS)})\b\s*(?:[:,]|should|needs?\s+to|has\s+to|must|take|bring|put|keep|return|carry|remind|pick|drop|sign|submit))",
+        rf"\s+(?=(?:{PERSON_PATTERN})\b\s*(?:[:,]|should|needs?\s+to|has\s+to|must|take|bring|put|keep|return|carry|remind|pick|drop|sign|submit))",
         "\n",
         cleaned,
         flags=re.IGNORECASE,
     )
     pieces = re.split(
-        r"\s*(?:;|\n|,(?=\s*(?:helper|nysha|nimesh|dad|mom|family|everyone)\b))\s*",
+        rf"\s*(?:;|\n|,(?=\s*(?:{PERSON_PATTERN})\b))\s*",
         normalized,
         flags=re.IGNORECASE,
     )
@@ -341,7 +399,7 @@ def extract_intent(request: str, now: datetime | None = None) -> dict[str, Any]:
 
     batch_items = []
     if "\n" in request or ";" in request or re.search(
-        rf",\s*(?:{'|'.join(PERSON_WORDS)})\b",
+        rf",\s*(?:{PERSON_PATTERN})\b",
         request,
         flags=re.IGNORECASE,
     ):
@@ -354,7 +412,9 @@ def extract_intent(request: str, now: datetime | None = None) -> dict[str, Any]:
         }
 
     item_date, date_anchor = _extract_date(cleaned_request, reference)
-    body_without_date = _strip_date_words(cleaned_request, date_anchor)
+    body_without_date = _strip_add_item_prefix(
+        _strip_date_words(cleaned_request, date_anchor),
+    )
     person, raw_message = _extract_person_and_message(body_without_date)
     message = _normalize_message(raw_message)
     context, trigger = _infer_context(cleaned_request)

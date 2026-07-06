@@ -47,6 +47,11 @@
           - "extensions/workboard/**"
           - "docs/plugins/workboard.md"
           - "docs/plugins/reference/workboard.md"
+"plugin: science-lab":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/science-lab/**"
+          - "docs/plugins/science-lab.md"
 "plugin: migrate-hermes":
   - changed-files:
       - any-glob-to-any-file:

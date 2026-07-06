@@ -18,6 +18,7 @@ class FakeProvider:
         description=None,
         location=None,
         recurrence=None,
+        private_extended_properties=None,
     ):
         event = {
             "id": "created-1",
@@ -28,6 +29,10 @@ class FakeProvider:
             "location": location,
             "recurrence": recurrence,
         }
+        if private_extended_properties:
+            event["extendedProperties"] = {
+                "private": private_extended_properties,
+            }
         self.created.append(event)
         return event
 

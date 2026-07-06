@@ -70,6 +70,18 @@ class FamilyDecisionToolsTest(unittest.TestCase):
         self.assertEqual(decided["outcome"], "Choose Mission Valley Montessori")
         self.assertEqual(decided["rationale"], "Best fit for friendship and commute.")
 
+    def test_restore_decision_reverts_related_details(self):
+        decision = self.tools.create_decision("School choice")["data"]["decision"]
+        before = self.tools.read_decision(decision["id"])["data"]["decision"]
+        self.tools.add_option(decision["id"], "Choose Mission Valley Montessori")
+
+        response = self.tools.restore_decision(before)
+        restored = response["data"]["decision"]
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(restored["options"], [])
+        self.assertEqual(restored["status"], "inbox")
+
 
 if __name__ == "__main__":
     unittest.main()

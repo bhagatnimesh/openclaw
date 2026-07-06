@@ -1,6 +1,4 @@
 import unittest
-
-from intent import read_metadata_from_notes
 from tools import FamilyTaskTools
 
 
@@ -60,7 +58,7 @@ class FailingProvider(FakeProvider):
 
 
 class FamilyTaskToolsTest(unittest.TestCase):
-    def test_create_task_writes_metadata_to_notes(self):
+    def test_create_task_keeps_google_notes_human_readable(self):
         provider = FakeProvider()
         tools = FamilyTaskTools(provider)
 
@@ -84,12 +82,13 @@ class FamilyTaskToolsTest(unittest.TestCase):
         created = provider.created[0]
         self.assertEqual(created["title"], "Call Rahul")
         self.assertEqual(created["due"], "2026-07-04")
-        notes, metadata = read_metadata_from_notes(created["notes"])
-        self.assertEqual(notes, "Call after school drop-off.")
-        self.assertEqual(metadata["context"], ["car", "phone"])
-        self.assertEqual(metadata["effort_type"], "communication")
-        self.assertEqual(metadata["requires"], ["phone"])
-        self.assertEqual(metadata["can_do_while"], ["driving", "commuting"])
+        self.assertEqual(created["notes"], "Call after school drop-off.")
+        self.assertNotIn("N4OS_METADATA", created["notes"])
+        task = response["data"]["task"]
+        self.assertEqual(task["_n4os_metadata"]["context"], ["car", "phone"])
+        self.assertEqual(task["_n4os_metadata"]["effort_type"], "communication")
+        self.assertEqual(task["_n4os_metadata"]["requires"], ["phone"])
+        self.assertEqual(task["_n4os_metadata"]["can_do_while"], ["driving", "commuting"])
 
     def test_complete_task_requires_confirmation(self):
         provider = FakeProvider()
@@ -126,7 +125,7 @@ class FamilyTaskToolsTest(unittest.TestCase):
         self.assertEqual(response["status"], "needs_information")
         self.assertEqual(
             response["data"]["missing_fields"],
-            ["title, notes, due, or metadata"],
+            ["title, notes, due, status, or metadata"],
         )
 
     def test_create_task_formats_invalid_scope_error(self):

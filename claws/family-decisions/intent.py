@@ -18,7 +18,32 @@ VALID_STATUSES = {
 }
 VALID_URGENCIES = {"low", "normal", "high", "critical"}
 VALID_SIZES = {"small", "medium", "large"}
-VALID_OWNERS = {"dad", "mom", "both", "family", "unknown"}
+VALID_OWNERS = {"dad", "mom", "both", "grandmom", "family", "unknown"}
+OWNER_ALIASES = {
+    "dad": "dad",
+    "nimesh": "dad",
+    "namesh": "dad",
+    "papa": "dad",
+    "papu": "dad",
+    "mom": "mom",
+    "mum": "mom",
+    "mummy": "mom",
+    "niyati": "mom",
+    "niyaati": "mom",
+    "niyathi": "mom",
+    "both": "both",
+    "parents": "both",
+    "grand mom": "grandmom",
+    "grandmom": "grandmom",
+    "dadi": "grandmom",
+    "tarla": "grandmom",
+    "family": "family",
+    "everyone": "family",
+}
+OWNER_ALIAS_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(OWNER_ALIASES, key=len, reverse=True)
+)
 BRIEF_WORD_RE = r"(?:brief|bried|breif|brif)"
 DETAIL_MARKER_RE = re.compile(
     r"\b(?:options?|choices?)\b\s*(?:are|is|include|includes|:)|"
@@ -112,15 +137,13 @@ def _due_date(text: str, reference: datetime) -> str | None:
 
 
 def _owner(text: str) -> str:
-    lowered = text.lower()
-    if re.search(r"\b(?:owner|owned by|for)\s+(dad|nimesh)\b", lowered):
-        return "dad"
-    if re.search(r"\b(?:owner|owned by|for)\s+(mom|niyati)\b", lowered):
-        return "mom"
-    if re.search(r"\b(?:owner|owned by|for)\s+(both|parents)\b", lowered):
-        return "both"
-    if re.search(r"\b(?:owner|owned by|for)\s+(family|everyone)\b", lowered):
-        return "family"
+    match = re.search(
+        rf"\b(?:owner|owned by|for)\s+(?P<owner>{OWNER_ALIAS_PATTERN})\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match is not None:
+        return OWNER_ALIASES[match.group("owner").lower()]
     return "unknown"
 
 
@@ -164,6 +187,13 @@ def _strip_decision_prefix(text: str) -> str:
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(
+        r"^\s*(?:i\s+had|there\s+is|this\s+is)\s+(?:a\s+)?"
+        r"(?:family\s+)?decision\s*(?:about|for|on|to|:)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
         r"^\s*(?:we\s+need\s+to\s+)?(?:decide|choose)\s+(?:whether\s+|if\s+|on\s+)?",
         "",
         cleaned,
@@ -172,7 +202,12 @@ def _strip_decision_prefix(text: str) -> str:
     cleaned = re.sub(r"\bby\s+\d{4}-\d{2}-\d{2}\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bby\s+next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bby\s+(today|tomorrow|this week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(owner|owned by|for)\s+(dad|mom|nimesh|niyati|both|parents|family|everyone)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        rf"\b(owner|owned by|for)\s+(?:{OWNER_ALIAS_PATTERN})\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     return _clean_spaces(cleaned)
 
 
@@ -301,10 +336,71 @@ def _decided_text(text: str) -> str:
     return _clean_spaces(value)
 
 
+def _decision_index(text: str) -> int | None:
+    match = re.search(
+        r"\b(?:close|complete|finish|resolve|mark)\s+(?:the\s+)?decision\s+#?\s*(\d+)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        match = re.search(
+            r"\bdecision\s+#?\s*(\d+)\b.*\bdone\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if match is None:
+        return None
+    try:
+        index = int(match.group(1))
+    except ValueError:
+        return None
+    return index if index > 0 else None
+
+
+def _closed_text(text: str) -> str:
+    value = re.sub(
+        r"^\s*(?:close|complete|finish|resolve|mark)\s+(?:the\s+)?decision\s+#?\s*\d+\s*(?:as|done|closed|complete|completed|resolved)?\s*[:.,-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"^\s*(?:decision\s+)?[0-9a-f]{6,32}\s*:?\s*", "", value, flags=re.IGNORECASE)
+    return _clean_spaces(value) or "Done"
+
+
+def _is_close_request(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(close|complete|finish|resolve|mark)\s+(?:the\s+)?decision\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        or re.search(r"\bdecision\s+#?\s*\d+\b.*\bdone\b", text, flags=re.IGNORECASE)
+    )
+
+
+def _is_bulk_close_request(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(close|complete|finish|resolve|mark)\s+(?:all|every)\s+(?:family\s+)?decisions\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _is_list_request(text: str) -> bool:
     return bool(
-        re.search(r"\b(list|show|what|review|open)\b", text, flags=re.IGNORECASE)
-        and re.search(r"\b(decisions?|open decisions?|pending decisions?)\b", text, flags=re.IGNORECASE)
+        re.search(
+            r"\b(list|show|tell|what|review|open|pending)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        and re.search(
+            r"\b(?:decisions?|open decisions?|pending decisions?)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
     )
 
 
@@ -330,6 +426,15 @@ def extract_intent(request: str, now: datetime | None = None) -> dict[str, Any]:
     decision_id = _decision_id(text)
     has_capture_prefix = _has_decision_capture_prefix(text)
 
+    if _is_bulk_close_request(text):
+        return {"intent": "bulk_record_decisions"}
+    if _is_close_request(text):
+        return {
+            "intent": "record_decision",
+            "decision_id": decision_id,
+            "decision_index": _decision_index(text),
+            "outcome": _closed_text(text),
+        }
     if _is_list_request(text):
         return {"intent": "list_decisions", "status": None}
     if _is_brief_request(text):

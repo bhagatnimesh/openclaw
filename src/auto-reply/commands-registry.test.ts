@@ -218,6 +218,9 @@ describe("commands registry", () => {
       "stop",
       "skill",
       "tasks",
+      "calendar",
+      "event",
+      "task",
       "whoami",
       "compact",
     ]);
@@ -257,6 +260,27 @@ describe("commands registry", () => {
     const sideNativeSpec = requireNativeSpec(listNativeCommandSpecs(), "side");
     expect(sideNativeSpec.acceptsArgs).toBe(true);
     expect(sideNativeSpec.isAlias).toBe(true);
+  });
+
+  it("exposes scheduling slash aliases for reminders, events, and tasks", () => {
+    const schedule = requireChatCommand("schedule");
+    expect(schedule.nativeName).toBe("calendar");
+    expect(schedule.nativeAliases).toEqual(["event", "task", "schedule"]);
+    expect(schedule.textAliases).toEqual(["/schedule", "/calendar", "/event", "/task"]);
+    expect(schedule.acceptsArgs).toBe(true);
+    expect(schedule.category).toBe("tools");
+
+    expect(normalizeCommandBody("/calendar add for Tuesday 8 PM to cancel fox 1")).toBe(
+      "/schedule add for Tuesday 8 PM to cancel fox 1",
+    );
+    expect(resolveTextCommand("/event Tuesday 8 PM cancel fox 1")).toMatchObject({
+      command: expect.objectContaining({ key: "schedule" }),
+      args: "Tuesday 8 PM cancel fox 1",
+    });
+    expect(requireNativeCommand("calendar", "telegram").key).toBe("schedule");
+    expect(requireNativeCommand("event", "telegram").key).toBe("schedule");
+    expect(requireNativeCommand("task", "telegram").key).toBe("schedule");
+    expect(requireNativeCommand("schedule", "telegram").key).toBe("schedule");
   });
 
   it("matches text command names case-insensitively without changing args", () => {

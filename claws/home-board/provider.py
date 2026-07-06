@@ -180,3 +180,34 @@ class SQLiteHomeBoardProvider:
                 {"id": item_id},
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def mark_pending(self, item_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE home_board_items
+                SET status = 'pending', done_at = NULL
+                WHERE id = :id
+                """,
+                {"id": item_id},
+            )
+            row = connection.execute(
+                "SELECT * FROM home_board_items WHERE id = :id",
+                {"id": item_id},
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def delete_item(self, item_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM home_board_items WHERE id = :id",
+                {"id": item_id},
+            ).fetchone()
+            if row is None:
+                return None
+            item = dict(row)
+            connection.execute(
+                "DELETE FROM home_board_items WHERE id = :id",
+                {"id": item_id},
+            )
+        return item

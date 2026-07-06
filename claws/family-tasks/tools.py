@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal, Protocol, TypedDict
 
 from constants import DEFAULT_TASK_LIST_ID
-from intent import write_metadata_to_notes
+from intent import normalize_metadata, write_human_notes
 from matcher import recommend_task_matches
 
 
@@ -133,12 +133,15 @@ class FamilyTaskTools:
         try:
             task = self.provider.create_task(
                 title=cleaned_title,
-                notes=write_metadata_to_notes(notes, metadata),
+                notes=write_human_notes(notes),
                 due=_clean_optional(due),
                 task_list_id=task_list_id,
             )
         except Exception as error:
             return _provider_error_response(error)
+
+        if metadata is not None:
+            task["_n4os_metadata"] = normalize_metadata(metadata)
 
         return {
             "status": "ok",
@@ -171,6 +174,7 @@ class FamilyTaskTools:
         title: str | None = None,
         notes: str | None = None,
         due: str | None = None,
+        status: str | None = None,
         metadata: dict[str, Any] | None = None,
         task_list_id: str = DEFAULT_TASK_LIST_ID,
     ) -> ToolResponse:
@@ -179,23 +183,29 @@ class FamilyTaskTools:
             return _missing_response(["task_id"])
 
         has_notes_update = notes is not None or metadata is not None
+        cleaned_status = _clean_optional(status)
         if (
             _clean_optional(title) is None
             and _clean_optional(due) is None
+            and cleaned_status is None
             and not has_notes_update
         ):
-            return _missing_response(["title, notes, due, or metadata"])
+            return _missing_response(["title, notes, due, status, or metadata"])
 
         try:
             task = self.provider.update_task(
                 task_id=cleaned_task_id,
                 title=_clean_optional(title),
-                notes=write_metadata_to_notes(notes, metadata) if has_notes_update else None,
+                notes=write_human_notes(notes) if has_notes_update else None,
                 due=_clean_optional(due),
+                status=cleaned_status,
                 task_list_id=task_list_id,
             )
         except Exception as error:
             return _provider_error_response(error)
+
+        if metadata is not None:
+            task["_n4os_metadata"] = normalize_metadata(metadata)
 
         return {
             "status": "ok",

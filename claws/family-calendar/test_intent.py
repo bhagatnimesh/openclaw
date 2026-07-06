@@ -54,6 +54,23 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(intent["start_time"], "12:00")
         self.assertEqual(intent["missing_fields"], [])
 
+    def test_thought_like_calendar_capture_uses_clean_display_text(self):
+        now = datetime(2026, 7, 6, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add calendar event tomorrow at 7pm to cancel Fox 1 subscription, "
+            "the owner is unknown. needs to be done",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Cancel Fox 1 subscription")
+        self.assertEqual(intent["date"], "2026-07-07")
+        self.assertEqual(intent["start_time"], "19:00")
+        self.assertIsNone(intent["description"])
+        self.assertFalse(intent["metadata"]["preparation_needed"])
+        self.assertEqual(intent["missing_fields"], [])
+
     def test_event_with_ai_assistant_help_metadata(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
@@ -401,18 +418,54 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertFalse(intent["metadata"]["preparation_needed"])
         self.assertEqual(intent["missing_fields"], [])
 
+    def test_pickup_phrase_uses_household_aliases(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Dadi picks up Small N on Monday at 6 PM from gymnastics",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Navya gymnastics pickup")
+        self.assertEqual(intent["description"], "Dadi picks up Navya from gymnastics")
+        self.assertEqual(intent["metadata"]["owner"], "grandmom")
+        self.assertEqual(intent["metadata"]["person"], "Navya")
+
+    def test_list_filters_use_household_aliases(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        owner_intent = extract_intent("What is mummy handling this weekend?", now=now)
+        tts_owner_intent = extract_intent("What is Namesh handling this weekend?", now=now)
+        person_intent = extract_intent("What events are for Big N?", now=now)
+        tts_person_intent = extract_intent("What events are for Nisha?", now=now)
+
+        self.assertEqual(owner_intent["metadata_filter"], {"owner": "mom"})
+        self.assertEqual(tts_owner_intent["metadata_filter"], {"owner": "dad"})
+        self.assertEqual(
+            person_intent["metadata_filter"],
+            {"person": "Nysha", "text_query": "Nysha"},
+        )
+        self.assertEqual(
+            tts_person_intent["metadata_filter"],
+            {"person": "Nysha", "text_query": "Nysha"},
+        )
+
     def test_named_person_query_defaults_to_next_thirty_days(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
         intent = extract_intent("what events are for Niyati", now=now)
+        tts_intent = extract_intent("what events are for Niyaati", now=now)
 
         self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(tts_intent["intent"], "list_events")
         self.assertEqual(intent["start"], "2026-07-02T12:00:00-07:00")
         self.assertEqual(intent["end"], "2026-08-01T12:00:00-07:00")
         self.assertEqual(
             intent["metadata_filter"],
-            {"person": "Niyati", "text_query": "Niyati"},
+            {"owner": "mom"},
         )
+        self.assertEqual(tts_intent["metadata_filter"], {"owner": "mom"})
         self.assertEqual(intent["missing_fields"], [])
 
     def test_metadata_description_helpers_preserve_notes(self):

@@ -258,8 +258,171 @@ class SQLiteFamilyDecisionProvider:
             ]
         return decision
 
+    def delete_decision(self, decision_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT id FROM family_decisions WHERE id LIKE :id || '%'",
+                {"id": decision_id},
+            ).fetchone()
+            if row is None:
+                return None
+            full_id = row["id"]
+            decision = self.get_decision(full_id)
+            params = {"decision_id": full_id}
+            connection.execute(
+                "DELETE FROM family_decision_next_steps WHERE decision_id = :decision_id",
+                params,
+            )
+            connection.execute(
+                "DELETE FROM family_decision_evidence WHERE decision_id = :decision_id",
+                params,
+            )
+            connection.execute(
+                "DELETE FROM family_decision_options WHERE decision_id = :decision_id",
+                params,
+            )
+            connection.execute(
+                "DELETE FROM family_decision_events WHERE decision_id = :decision_id",
+                params,
+            )
+            connection.execute(
+                "DELETE FROM family_decisions WHERE id = :decision_id",
+                params,
+            )
+        return decision
+
+    def restore_decision(self, decision: dict[str, Any]) -> dict[str, Any] | None:
+        decision_id = str(decision.get("id") or "").strip()
+        if not decision_id:
+            return None
+        with self._connection() as connection:
+            params = {"decision_id": decision_id}
+            connection.execute(
+                "DELETE FROM family_decision_next_steps WHERE decision_id = :decision_id",
+                params,
+            )
+            connection.execute(
+                "DELETE FROM family_decision_evidence WHERE decision_id = :decision_id",
+                params,
+            )
+            connection.execute(
+                "DELETE FROM family_decision_options WHERE decision_id = :decision_id",
+                params,
+            )
+            connection.execute(
+                "DELETE FROM family_decision_events WHERE decision_id = :decision_id",
+                params,
+            )
+            connection.execute(
+                "DELETE FROM family_decisions WHERE id = :decision_id",
+                params,
+            )
+            connection.execute(
+                """
+                INSERT INTO family_decisions (
+                    id, title, context, status, owner, urgency, size, due,
+                    outcome, rationale, created_at, updated_at, decided_at
+                )
+                VALUES (
+                    :id, :title, :context, :status, :owner, :urgency, :size, :due,
+                    :outcome, :rationale, :created_at, :updated_at, :decided_at
+                )
+                """,
+                {
+                    "id": decision_id,
+                    "title": decision.get("title") or "Untitled decision",
+                    "context": decision.get("context"),
+                    "status": decision.get("status") or "inbox",
+                    "owner": decision.get("owner") or "unknown",
+                    "urgency": decision.get("urgency") or "normal",
+                    "size": decision.get("size") or "small",
+                    "due": decision.get("due"),
+                    "outcome": decision.get("outcome"),
+                    "rationale": decision.get("rationale"),
+                    "created_at": decision.get("created_at") or self._now(),
+                    "updated_at": decision.get("updated_at") or self._now(),
+                    "decided_at": decision.get("decided_at"),
+                },
+            )
+            for event in decision.get("events", []):
+                connection.execute(
+                    """
+                    INSERT INTO family_decision_events (id, decision_id, kind, text, created_at)
+                    VALUES (:id, :decision_id, :kind, :text, :created_at)
+                    """,
+                    {
+                        "id": event.get("id") or uuid4().hex,
+                        "decision_id": decision_id,
+                        "kind": event.get("kind") or "restored",
+                        "text": event.get("text") or "Restored decision state",
+                        "created_at": event.get("created_at") or self._now(),
+                    },
+                )
+            for option in decision.get("options", []):
+                connection.execute(
+                    """
+                    INSERT INTO family_decision_options (id, decision_id, text, pros, cons, created_at)
+                    VALUES (:id, :decision_id, :text, :pros, :cons, :created_at)
+                    """,
+                    {
+                        "id": option.get("id") or uuid4().hex,
+                        "decision_id": decision_id,
+                        "text": option.get("text") or "",
+                        "pros": option.get("pros"),
+                        "cons": option.get("cons"),
+                        "created_at": option.get("created_at") or self._now(),
+                    },
+                )
+            for item in decision.get("evidence", []):
+                connection.execute(
+                    """
+                    INSERT INTO family_decision_evidence (id, decision_id, text, source, created_at)
+                    VALUES (:id, :decision_id, :text, :source, :created_at)
+                    """,
+                    {
+                        "id": item.get("id") or uuid4().hex,
+                        "decision_id": decision_id,
+                        "text": item.get("text") or "",
+                        "source": item.get("source"),
+                        "created_at": item.get("created_at") or self._now(),
+                    },
+                )
+            for step in decision.get("next_steps", []):
+                connection.execute(
+                    """
+                    INSERT INTO family_decision_next_steps (
+                        id, decision_id, text, owner, due, status, created_at, completed_at
+                    )
+                    VALUES (
+                        :id, :decision_id, :text, :owner, :due, :status, :created_at, :completed_at
+                    )
+                    """,
+                    {
+                        "id": step.get("id") or uuid4().hex,
+                        "decision_id": decision_id,
+                        "text": step.get("text") or "",
+                        "owner": step.get("owner") or "unknown",
+                        "due": step.get("due"),
+                        "status": step.get("status") or "open",
+                        "created_at": step.get("created_at") or self._now(),
+                        "completed_at": step.get("completed_at"),
+                    },
+                )
+        return self.get_decision(decision_id)
+
     def update_decision(self, decision_id: str, **fields: Any) -> dict[str, Any] | None:
-        allowed = {"title", "context", "status", "owner", "urgency", "size", "due", "outcome", "rationale"}
+        allowed = {
+            "title",
+            "context",
+            "status",
+            "owner",
+            "urgency",
+            "size",
+            "due",
+            "outcome",
+            "rationale",
+            "decided_at",
+        }
         updates = {key: value for key, value in fields.items() if key in allowed}
         if not updates:
             return self.get_decision(decision_id)

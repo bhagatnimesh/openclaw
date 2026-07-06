@@ -1,19 +1,56 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import importlib.util
 from pathlib import Path
 import re
 import sys
 from types import ModuleType
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal, Protocol, Union, cast
 
 
-Route = Literal["calendar", "tasks", "home_board", "decisions", "both", "unknown"]
+Route = Literal[
+    "calendar",
+    "tasks",
+    "home_board",
+    "decisions",
+    "science_lab",
+    "both",
+    "unknown",
+]
+FollowupKind = Literal[
+    "none",
+    "clarification",
+    "pending_response",
+    "modify_previous",
+    "status_previous",
+    "complete_previous",
+    "add_note",
+    "select_target",
+]
 
 LOW_CONFIDENCE_THRESHOLD = 0.6
+VALID_ROUTES = {
+    "calendar",
+    "tasks",
+    "home_board",
+    "decisions",
+    "science_lab",
+    "both",
+    "unknown",
+}
+VALID_FOLLOWUP_KINDS = {
+    "none",
+    "clarification",
+    "pending_response",
+    "modify_previous",
+    "status_previous",
+    "complete_previous",
+    "add_note",
+    "select_target",
+}
 
 CALENDAR_INTENTS = {
     "create_event",
@@ -26,6 +63,7 @@ CALENDAR_INTENTS = {
 TASK_INTENTS = {
     "create_task",
     "recommend_tasks",
+    "update_task",
     "complete_task",
     "delete_task",
     "run_assistant_help",
@@ -44,6 +82,7 @@ DECISION_INTENTS = {
     "add_evidence",
     "add_next_step",
     "record_decision",
+    "bulk_record_decisions",
 }
 DECISION_UPDATE_INTENTS = {
     "decision_brief",
@@ -69,6 +108,7 @@ CALENDAR_ROOT = CLAW_ROOT / "family-calendar"
 TASKS_ROOT = CLAW_ROOT / "family-tasks"
 HOME_BOARD_ROOT = CLAW_ROOT / "home-board"
 DECISIONS_ROOT = CLAW_ROOT / "family-decisions"
+SCIENCE_LAB_ROOT = CLAW_ROOT / "science-lab"
 TASK_CUE_RE = re.compile(r"\b(tasks?|todos?|to-dos?|open loops?)\b")
 EXPLICIT_CLOCK_TIME_RE = re.compile(
     r"\b(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|"
@@ -80,6 +120,15 @@ ASSISTANT_HELP_MARKER_LINE_RE = re.compile(
     rf"^\s*(?:(?:i\s+)?(?:want|need|could\s+use)\s+(?:an?\s+)?ai\s+assistant"
     rf"(?:\s+(?:help|support))?|ask\s+(?:{ASSISTANT_NAME_PATTERN})\s+"
     rf"(?:to\s+help|for\s+help)|(?:{ASSISTANT_NAME_PATTERN})\s*,?\s+help)\.?\s*$",
+    re.IGNORECASE,
+)
+OBJECT_UPDATE_RE = re.compile(
+    r"\b(?:assign|make|set|put|change|update)\b.*\b(?:to|for)\s+[\w'. -]+\s*$|"
+    r"\b(?:assign|add|append|modify|edit|update|set|make|change|put)\b"
+    r".*\b(?:owner|owned|for|note|notes|description|context|"
+    r"noah|novah|assistant|help)\b|"
+    r"\b(?:owner|owned\s+by|notes?|description|context)\s*(?:is|are|:)\b|"
+    r"\b(?:assign(?:ed)?\s+to|belongs\s+to)\b",
     re.IGNORECASE,
 )
 
@@ -96,6 +145,53 @@ class RouteDecision:
             "intent_summary": self.intent_summary,
             "confidence": self.confidence,
         }
+
+
+@dataclass(frozen=True)
+class N4OSIntentFrame:
+    route: Route
+    action: str
+    confidence: float
+    followup_kind: FollowupKind = "none"
+    target: dict[str, Any] = field(default_factory=dict)
+    slots: dict[str, Any] = field(default_factory=dict)
+    missing_fields: list[str] = field(default_factory=list)
+    normalized_request: str = ""
+    clarification_question: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "route": self.route,
+            "action": self.action,
+            "confidence": self.confidence,
+            "followup_kind": self.followup_kind,
+            "target": dict(self.target),
+            "slots": dict(self.slots),
+            "missing_fields": list(self.missing_fields),
+            "normalized_request": self.normalized_request,
+            "clarification_question": self.clarification_question,
+        }
+
+    def to_route_decision(self) -> dict[str, Any]:
+        return RouteDecision(
+            route=self.route,
+            intent_summary=_frame_summary(self),
+            confidence=self.confidence,
+        ).to_dict()
+
+
+class IntentInterpreter(Protocol):
+    def interpret(
+        self,
+        request: str,
+        *,
+        now: datetime | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> N4OSIntentFrame | dict[str, Any]:
+        ...
+
+
+InterpreterCallable = Callable[..., Union[N4OSIntentFrame, dict[str, Any]]]
 
 
 @contextmanager
@@ -206,6 +302,22 @@ def _has_assistant_help_metadata(task_intent: dict[str, Any]) -> bool:
     return isinstance(metadata, dict) and bool(metadata.get("assistant_help_needed"))
 
 
+def _is_object_update_request(text: str) -> bool:
+    return OBJECT_UPDATE_RE.search(text) is not None
+
+
+def _is_create_task_request(task_intent: dict[str, Any]) -> bool:
+    return task_intent.get("intent") == "create_task" and not task_intent.get(
+        "missing_fields",
+    )
+
+
+def _is_create_calendar_request(calendar_intent: dict[str, Any]) -> bool:
+    return calendar_intent.get("intent") == "create_event" and not calendar_intent.get(
+        "missing_fields",
+    )
+
+
 def _score_calendar(text: str, calendar_intent: dict[str, Any]) -> float:
     score = 0.0
     intent = calendar_intent.get("intent")
@@ -280,6 +392,8 @@ def _score_tasks(text: str, task_intent: dict[str, Any]) -> float:
         score += 0.2
     if re.search(r"^\s*(add|create|capture|remember)\b", text) and "task" in text:
         score += 0.2
+    if _is_object_update_request(text) and re.search(r"\b(tasks?|todos?|to-dos?)\b", text):
+        score += 0.65
 
     return min(score, 1.0)
 
@@ -295,6 +409,8 @@ def _score_home_board(text: str, home_board_intent: dict[str, Any]) -> float:
         score += 0.45
     if re.search(r"\b(helper|nysha|nimesh|dad|mom|family|everyone)\b", text):
         score += 0.25
+    if _is_object_update_request(text):
+        score -= 0.35
     if re.search(r"\b(journal|form|payment|fridge|food|passport|lunch|library book|permission slip)\b", text):
         score += 0.25
     if _has_task_cue(text) and not re.search(
@@ -322,6 +438,22 @@ def _score_decisions(text: str, decision_intent: dict[str, Any]) -> float:
         score += 0.25
     if re.search(r"\b(tasks?|todos?|calendar|event|appointment|home board|today at home)\b", text):
         score -= 0.25
+    return max(0.0, min(score, 1.0))
+
+
+def _score_science_lab(text: str) -> float:
+    score = 0.0
+    if re.search(r"\b(science\s+lab|science\s+experiments?|experiment\s+guide)\b", text):
+        score += 0.7
+    if re.search(
+        r"\b(experiments?|materials?|inventory|amazon|guide|script|quiz|reflection)\b",
+        text,
+    ):
+        score += 0.25
+    if re.search(r"\b(kids?|children|parent|parents?|six|seven|four)\b", text):
+        score += 0.15
+    if re.search(r"\b(calendar|tasks?|todos?|home board|today at home|decisions?)\b", text):
+        score -= 0.2
     return max(0.0, min(score, 1.0))
 
 
@@ -374,6 +506,8 @@ def _summary(
     if route == "decisions":
         intent = (decision_intent or {}).get("intent", "decision request")
         return f"Route to family-decisions for {intent}."
+    if route == "science_lab":
+        return "Route to science-lab for experiment planning."
     if route == "both":
         return (
             "Route to family-calendar and family-tasks for combined planning or briefing."
@@ -381,56 +515,279 @@ def _summary(
     return "Could not confidently choose Calendar, Tasks, Home Board, Decisions, or Calendar + Tasks."
 
 
-def route_request(
+def _action_for_route(
+    route: Route,
+    calendar_intent: dict[str, Any],
+    task_intent: dict[str, Any],
+    home_board_intent: dict[str, Any],
+    decision_intent: dict[str, Any],
+) -> str:
+    if route == "calendar":
+        return str(calendar_intent.get("intent") or "calendar_request")
+    if route == "tasks":
+        return str(task_intent.get("intent") or "task_request")
+    if route == "home_board":
+        return str(home_board_intent.get("intent") or "home_board_request")
+    if route == "decisions":
+        return str(decision_intent.get("intent") or "decision_request")
+    if route == "science_lab":
+        return "plan_experiments"
+    if route == "both":
+        return "combined_planning"
+    return "unknown"
+
+
+def _frame_summary(frame: N4OSIntentFrame) -> str:
+    if frame.route == "calendar":
+        return f"Route to family-calendar for {frame.action}."
+    if frame.route == "tasks":
+        return f"Route to family-tasks for {frame.action}."
+    if frame.route == "home_board":
+        return f"Route to home-board for {frame.action}."
+    if frame.route == "decisions":
+        return f"Route to family-decisions for {frame.action}."
+    if frame.route == "science_lab":
+        return f"Route to science-lab for {frame.action}."
+    if frame.route == "both":
+        return "Route to family-calendar and family-tasks for combined planning or briefing."
+    return frame.clarification_question or "Could not confidently choose Calendar, Tasks, Home Board, Decisions, or Calendar + Tasks."
+
+
+def _round_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, min(confidence, 1.0)), 2)
+
+
+def _clean_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    cleaned = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+def _coerce_record(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _coerce_intent_frame(
+    raw: N4OSIntentFrame | dict[str, Any],
+    request: str,
+) -> N4OSIntentFrame:
+    if isinstance(raw, N4OSIntentFrame):
+        return raw
+    if not isinstance(raw, dict):
+        raise ValueError("intent interpreter returned a non-object frame")
+
+    route = str(raw.get("route") or "unknown")
+    if route not in VALID_ROUTES:
+        raise ValueError(f"intent interpreter returned invalid route: {route}")
+
+    followup_kind = str(raw.get("followup_kind") or "none")
+    if followup_kind not in VALID_FOLLOWUP_KINDS:
+        raise ValueError(
+            f"intent interpreter returned invalid followup_kind: {followup_kind}"
+        )
+
+    action = str(raw.get("action") or "unknown").strip() or "unknown"
+    clarification = raw.get("clarification_question")
+    return N4OSIntentFrame(
+        route=cast(Route, route),
+        action=action,
+        confidence=_round_confidence(raw.get("confidence")),
+        followup_kind=cast(FollowupKind, followup_kind),
+        target=_coerce_record(raw.get("target")),
+        slots=_coerce_record(raw.get("slots")),
+        missing_fields=_clean_string_list(raw.get("missing_fields")),
+        normalized_request=str(raw.get("normalized_request") or request),
+        clarification_question=str(clarification).strip() if clarification else None,
+    )
+
+
+def _call_interpreter(
+    interpreter: IntentInterpreter | InterpreterCallable,
+    request: str,
+    now: datetime | None,
+    context: dict[str, Any] | None,
+) -> N4OSIntentFrame | dict[str, Any]:
+    interpret = getattr(interpreter, "interpret", None)
+    if callable(interpret):
+        return interpret(request, now=now, context=context)
+    return interpreter(request, now=now, context=context)
+
+
+def _contextual_followup_frame(
+    request: str,
+    context: dict[str, Any] | None,
+) -> N4OSIntentFrame | None:
+    if not context:
+        return None
+
+    text = request.lower().strip(" .!?")
+    last_route = str(context.get("last_route") or "")
+    if _is_object_update_request(text) and last_route in {"calendar", "tasks"}:
+        return N4OSIntentFrame(
+            route=cast(Route, last_route),
+            action="update_event" if last_route == "calendar" else "update_task",
+            confidence=0.92,
+            followup_kind="modify_previous",
+            normalized_request=request,
+        )
+
+    if last_route == "home_board" and text in {
+        "done",
+        "complete",
+        "completed",
+        "mark done",
+        "finished",
+    }:
+        return N4OSIntentFrame(
+            route="home_board",
+            action="mark_done",
+            confidence=0.84,
+            followup_kind="complete_previous",
+            normalized_request=request,
+        )
+
+    if last_route == "decisions" and text in {
+        "status",
+        "update",
+        "updates",
+        "what is the status",
+        "what's the status",
+    }:
+        return N4OSIntentFrame(
+            route="decisions",
+            action="decision_brief",
+            confidence=0.82,
+            followup_kind="status_previous",
+            normalized_request="decision brief",
+        )
+
+    if last_route == "calendar" and re.search(r"^(?:add\s+)?(?:note|context|fyi)\b", text):
+        return N4OSIntentFrame(
+            route="calendar",
+            action="create_event",
+            confidence=0.8,
+            followup_kind="add_note",
+            normalized_request=request,
+        )
+
+    return None
+
+
+def _rule_intent_frame(
     request: str,
     now: datetime | None = None,
-) -> dict[str, Any]:
+    context: dict[str, Any] | None = None,
+) -> N4OSIntentFrame:
     calendar_intent, task_intent, home_board_intent, decision_intent = _extract_intents(
         request,
         now,
     )
     text = _routing_text(request)
     if not text:
-        return RouteDecision(
+        return N4OSIntentFrame(
             route="unknown",
-            intent_summary="Empty request.",
+            action="unknown",
             confidence=0.0,
-        ).to_dict()
+            missing_fields=["request"],
+            normalized_request=request,
+            clarification_question="Empty request.",
+        )
+
+    context_frame = _contextual_followup_frame(request, context)
+    if context_frame is not None:
+        return context_frame
 
     if _is_explicit_decision_request(text, decision_intent):
-        return RouteDecision(
+        return N4OSIntentFrame(
             route="decisions",
-            intent_summary=_summary("decisions", calendar_intent, task_intent, decision_intent),
+            action=_action_for_route(
+                "decisions",
+                calendar_intent,
+                task_intent,
+                home_board_intent,
+                decision_intent,
+            ),
             confidence=0.95,
-        ).to_dict()
+            normalized_request=request,
+        )
 
     if _is_combined_planning(text):
-        return RouteDecision(
+        return N4OSIntentFrame(
             route="both",
-            intent_summary=_summary("both", calendar_intent, task_intent, decision_intent),
+            action="combined_planning",
             confidence=0.88,
-        ).to_dict()
+            normalized_request=request,
+        )
+
+    if (
+        _is_object_update_request(text)
+        and not _is_create_task_request(task_intent)
+        and not _is_create_calendar_request(calendar_intent)
+    ):
+        if re.search(r"\b(calendar|event|appointment)\b", text):
+            return N4OSIntentFrame(
+                route="calendar",
+                action="update_event",
+                confidence=0.86,
+                followup_kind="modify_previous",
+                normalized_request=request,
+            )
+        if re.search(r"\b(tasks?|todos?|to-dos?)\b", text):
+            return N4OSIntentFrame(
+                route="tasks",
+                action="update_task",
+                confidence=0.86,
+                followup_kind="modify_previous",
+                normalized_request=request,
+            )
+
+    science_lab_score = _score_science_lab(text)
+    if science_lab_score >= LOW_CONFIDENCE_THRESHOLD:
+        return N4OSIntentFrame(
+            route="science_lab",
+            action="plan_experiments",
+            confidence=round(science_lab_score, 2),
+            normalized_request=request,
+        )
 
     if (
         task_intent.get("intent") == "create_task"
         and _has_assistant_help_metadata(task_intent)
     ):
-        return RouteDecision(
+        return N4OSIntentFrame(
             route="tasks",
-            intent_summary=_summary("tasks", calendar_intent, task_intent, decision_intent),
+            action=_action_for_route(
+                "tasks",
+                calendar_intent,
+                task_intent,
+                home_board_intent,
+                decision_intent,
+            ),
             confidence=0.95,
-        ).to_dict()
+            normalized_request=request,
+        )
 
     calendar_score = _score_calendar(text, calendar_intent)
     task_score = _score_tasks(text, task_intent)
     home_board_score = _score_home_board(text, home_board_intent)
     decision_score = _score_decisions(text, decision_intent)
+    science_lab_score = _score_science_lab(text)
 
     scores: dict[Route, float] = {
         "calendar": calendar_score,
         "tasks": task_score,
         "home_board": home_board_score,
         "decisions": decision_score,
+        "science_lab": science_lab_score,
     }
     best_route = max(scores, key=scores.get)
     confidence = scores[best_route]
@@ -447,8 +804,58 @@ def route_request(
     else:
         route = best_route
 
-    return RouteDecision(
+    return N4OSIntentFrame(
         route=route,
-        intent_summary=_summary(route, calendar_intent, task_intent, decision_intent),
+        action=_action_for_route(
+            route,
+            calendar_intent,
+            task_intent,
+            home_board_intent,
+            decision_intent,
+        ),
         confidence=round(confidence, 2),
-    ).to_dict()
+        normalized_request=request,
+        clarification_question=(
+            "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, or Calendar + Tasks?"
+            if route == "unknown"
+            else None
+        ),
+    )
+
+
+def interpret_request(
+    request: str,
+    now: datetime | None = None,
+    context: dict[str, Any] | None = None,
+    interpreter: IntentInterpreter | InterpreterCallable | None = None,
+) -> N4OSIntentFrame:
+    if interpreter is None:
+        return _rule_intent_frame(request, now=now, context=context)
+
+    try:
+        frame = _coerce_intent_frame(
+            _call_interpreter(interpreter, request, now, context),
+            request,
+        )
+    except Exception:
+        return _rule_intent_frame(request, now=now, context=context)
+
+    if frame.confidence < LOW_CONFIDENCE_THRESHOLD:
+        fallback = _rule_intent_frame(request, now=now, context=context)
+        if fallback.route != "unknown" and fallback.confidence >= LOW_CONFIDENCE_THRESHOLD:
+            return fallback
+    return frame
+
+
+def route_request(
+    request: str,
+    now: datetime | None = None,
+    context: dict[str, Any] | None = None,
+    interpreter: IntentInterpreter | InterpreterCallable | None = None,
+) -> dict[str, Any]:
+    return interpret_request(
+        request,
+        now=now,
+        context=context,
+        interpreter=interpreter,
+    ).to_route_decision()

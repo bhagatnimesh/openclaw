@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from claw import FamilyCalendarClaw, _format_created_event_message, match_events, run_cli
 from intent import (
     extract_intent,
+    read_metadata_from_event,
     read_metadata_from_description,
     write_metadata_to_description,
 )
@@ -31,6 +32,7 @@ class FakeProvider:
         description=None,
         location=None,
         recurrence=None,
+        private_extended_properties=None,
     ):
         event = {
             "id": "event-123",
@@ -42,6 +44,10 @@ class FakeProvider:
             "location": location,
             "recurrence": recurrence,
         }
+        if private_extended_properties:
+            event["extendedProperties"] = {
+                "private": private_extended_properties,
+            }
         self.created.append(event)
         return event
 
@@ -68,6 +74,7 @@ class FakeProvider:
         timezone=DEFAULT_TIMEZONE,
         description=None,
         location=None,
+        private_extended_properties=None,
     ):
         event = {
             "id": event_id,
@@ -77,6 +84,10 @@ class FakeProvider:
             "description": description,
             "location": location,
         }
+        if private_extended_properties:
+            event["extendedProperties"] = {
+                "private": private_extended_properties,
+            }
         self.updated.append(event)
         return event
 
@@ -133,12 +144,88 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertIn("https://calendar.google.com/calendar/event?eid=event-123", message)
         self.assertNotIn("event id:", message)
         self.assertEqual(provider.created[0]["summary"], "Dinner")
-        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        self.assertNotIn("N4OS_METADATA", provider.created[0]["description"] or "")
+        self.assertIn("extendedProperties", provider.created[0])
+        notes, metadata = read_metadata_from_event(provider.created[0])
         self.assertEqual(notes, "with Rahul")
         self.assertEqual(metadata["owner"], "unknown")
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-03T19:00:00-07:00")
         self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-03T20:00:00-07:00")
-        self.assertEqual(provider.created[0]["start"]["timeZone"], DEFAULT_TIMEZONE)
+
+    def test_assign_owner_followup_updates_last_created_event(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add calendar event for Tuesday 8 PM to cancel Fox 1",
+                reference_time=datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE)),
+            )
+            message = claw.assign_owner_from_request("assign it to nimesh")
+
+        self.assertIn("Assigned event to dad", message)
+        _, metadata = read_metadata_from_event(provider.updated[-1])
+        self.assertEqual(metadata["owner"], "dad")
+
+    def test_assign_owner_by_title_updates_matching_event(self):
+        provider = FakeProvider()
+        provider.events = [
+            _fake_event(
+                "Cancel Fox 1",
+                "2026-07-07T20:00:00-07:00",
+                "2026-07-07T21:00:00-07:00",
+            ),
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            message = claw.assign_owner_from_request(
+                "Assign Cancel Fox 1 event to nimesh",
+                reference_time=datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE)),
+            )
+
+        self.assertIn("Assigned event to dad", message)
+        _, metadata = read_metadata_from_event(provider.updated[-1])
+        self.assertEqual(metadata["owner"], "dad")
+
+    def test_undo_reverts_created_event(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add dinner Friday at 7 with Rahul",
+                reference_time=reference,
+            )
+            message = claw.undo_last_action()
+
+        self.assertIn("Undid calendar event creation", message)
+        self.assertEqual(provider.deleted, ["event-123"])
+
+    def test_undo_reverts_updated_event(self):
+        provider = FakeProvider()
+        provider.events = [
+            _fake_event(
+                "Dinner with Rahul",
+                "2026-07-03T19:00:00-07:00",
+                "2026-07-03T20:00:00-07:00",
+                location="Fremont",
+            )
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.update_event_from_request(
+                "Move dinner with Rahul to Friday at 8pm",
+                reference_time=reference,
+            )
+            claw.handle_pending_response("yes")
+            message = claw.undo_last_action()
+
+        self.assertIn("Undid calendar event update", message)
+        self.assertEqual(provider.updated[-1]["start"]["dateTime"], "2026-07-03T19:00:00-07:00")
 
     def test_create_event_from_request_stores_ai_assistant_help(self):
         provider = FakeProvider()
@@ -159,7 +246,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
             )
 
         self.assertEqual(provider.created[0]["summary"], "Nysha school meeting")
-        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        notes, metadata = read_metadata_from_event(provider.created[0])
         self.assertIn("Assistant help: Find the teacher email", notes)
         self.assertIn("Assistant context: ask about waitlist status", notes)
         self.assertTrue(metadata["assistant_help_needed"])
@@ -187,7 +274,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
             )
 
         self.assertEqual(provider.created[0]["summary"], "Great Mall shopping for India trip")
-        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        notes, metadata = read_metadata_from_event(provider.created[0])
         self.assertEqual(notes, "get some tshirts for India trip")
         self.assertEqual(metadata["category"], "shopping")
         self.assertEqual(provider.created[0]["location"], "Great Mall")
@@ -208,7 +295,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
 
         self.assertEqual(provider.created[0]["summary"], "Leave for SFO flight")
         self.assertEqual(provider.created[0]["location"], "SFO")
-        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        notes, metadata = read_metadata_from_event(provider.created[0])
         self.assertEqual(notes, "Flight from SFO at 2:00 PM")
         self.assertEqual(metadata["category"], "travel")
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-10T11:30:00-07:00")
@@ -283,7 +370,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-07T18:00:00-07:00")
         self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-07T19:00:00-07:00")
         self.assertEqual(provider.created[0]["location"], "school")
-        notes, metadata = read_metadata_from_description(provider.created[0]["description"])
+        notes, metadata = read_metadata_from_event(provider.created[0])
         self.assertEqual(notes, "Niyati picks up Navya from school")
         self.assertEqual(metadata["owner"], "mom")
         self.assertEqual(metadata["person"], "Navya")
@@ -333,7 +420,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertEqual(provider.updated[0]["id"], "event-123")
         self.assertEqual(provider.updated[0]["summary"], "Kids should be picked from school")
         self.assertEqual(provider.updated[0]["start"]["dateTime"], "2026-07-09T18:00:00-07:00")
-        notes, metadata = read_metadata_from_description(provider.updated[0]["description"])
+        notes, metadata = read_metadata_from_event(provider.updated[0])
         self.assertEqual(notes, "Preparation: carry snacks for the kids they will be hungry")
         self.assertTrue(metadata["preparation_needed"])
         self.assertEqual(
@@ -362,7 +449,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
 
         self.assertEqual(message, "Added note to Kids should be picked from school.")
         self.assertEqual(provider.updated[-1]["id"], "event-123")
-        notes, metadata = read_metadata_from_description(provider.updated[-1]["description"])
+        notes, metadata = read_metadata_from_event(provider.updated[-1])
         self.assertIn("Preparation: carry snacks for the kids they will be hungry", notes)
         self.assertIn("Note: Nysha needs to be taken to art class", notes)
         self.assertTrue(metadata["preparation_needed"])
@@ -839,7 +926,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertIn("- Pack costume or materials", message)
         self.assertIn("- Confirm drop-off/pickup plan", message)
 
-    def test_list_events_for_named_pickup_adult_without_date(self):
+    def test_list_events_for_owner_alias_without_date(self):
         provider = FakeProvider()
         provider.events = [
             {
@@ -851,7 +938,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
                 "description": write_metadata_to_description(
                     "Niyati picks up Nysha from art class",
                     {
-                        "owner": "unknown",
+                        "owner": "mom",
                         "person": "Nysha",
                         "category": "school",
                         "preparation_needed": False,
@@ -867,7 +954,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
                 "description": write_metadata_to_description(
                     None,
                     {
-                        "owner": "mom",
+                        "owner": "dad",
                         "person": "Navya",
                         "category": "activity",
                         "preparation_needed": False,

@@ -23,6 +23,7 @@ class CalendarProvider(Protocol):
         description: str | None = None,
         location: str | None = None,
         recurrence: list[str] | None = None,
+        private_extended_properties: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -46,6 +47,7 @@ class CalendarProvider(Protocol):
         timezone: str = DEFAULT_TIMEZONE,
         description: str | None = None,
         location: str | None = None,
+        private_extended_properties: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -100,6 +102,7 @@ class CalendarTools:
         description: str | None = None,
         location: str | None = None,
         recurrence: list[str] | None = None,
+        private_extended_properties: dict[str, str] | None = None,
     ) -> ToolResponse:
         missing_fields: list[str] = []
         cleaned_title = _clean_optional(title)
@@ -124,6 +127,7 @@ class CalendarTools:
             description=_clean_optional(description),
             location=_clean_optional(location),
             recurrence=recurrence,
+            private_extended_properties=private_extended_properties,
         )
         return {
             "status": "ok",
@@ -181,6 +185,7 @@ class CalendarTools:
         timezone: str | None = DEFAULT_TIMEZONE,
         description: str | None = None,
         location: str | None = None,
+        private_extended_properties: dict[str, str] | None = None,
     ) -> ToolResponse:
         missing_fields: list[str] = []
         cleaned_event_id = _clean_optional(event_id)
@@ -208,6 +213,7 @@ class CalendarTools:
             timezone=_clean_optional(timezone) or DEFAULT_TIMEZONE,
             description=_clean_optional(description),
             location=_clean_optional(location),
+            private_extended_properties=private_extended_properties,
         )
         return {
             "status": "ok",

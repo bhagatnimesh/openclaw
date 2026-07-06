@@ -21,6 +21,24 @@ class FamilyDecisionIntentTest(unittest.TestCase):
         self.assertEqual(intent["due"], "2026-07-06")
         self.assertEqual(intent["size"], "large")
 
+    def test_extracts_household_owner_aliases(self):
+        cases = {
+            "mummy": "mom",
+            "namesh": "dad",
+            "niyaati": "mom",
+            "papu": "dad",
+            "dadi": "grandmom",
+        }
+
+        for alias, owner in cases.items():
+            with self.subTest(alias=alias):
+                intent = extract_intent(
+                    f"Track decision about weekend logistics owner {alias}",
+                    now=REFERENCE_TIME,
+                )
+                self.assertEqual(intent["owner"], owner)
+                self.assertNotIn(alias, intent["title"].lower())
+
     def test_extracts_captured_decision_prefix(self):
         intent = extract_intent(
             "Captured decision: Summer camp plan for Nysha for the last week. "
@@ -34,6 +52,19 @@ class FamilyDecisionIntentTest(unittest.TestCase):
         self.assertNotIn("Options are", intent["title"])
         self.assertEqual(intent["initial_options"], ["Stay at home", "Go to ICC"])
         self.assertEqual(intent["initial_evidence"], ["She will be jetlagged"])
+
+    def test_thought_like_decision_capture_uses_clean_title(self):
+        intent = extract_intent(
+            "I had a decision to choose summer camp owner dad by next Monday "
+            "options are ICC or home",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(intent["intent"], "create_decision")
+        self.assertEqual(intent["title"], "Summer camp")
+        self.assertEqual(intent["owner"], "dad")
+        self.assertEqual(intent["due"], "2026-07-06")
+        self.assertEqual(intent["initial_options"], ["ICC", "Home"])
 
     def test_marks_researching_when_ai_help_requested(self):
         intent = extract_intent(
@@ -49,6 +80,26 @@ class FamilyDecisionIntentTest(unittest.TestCase):
         intent = extract_intent("give me decision bried", now=REFERENCE_TIME)
 
         self.assertEqual(intent["intent"], "decision_brief")
+
+    def test_treats_pending_decisions_as_list_request(self):
+        for request in (
+            "tell me the pending decisions",
+            "pending decisions",
+            "what are the pending decisions",
+        ):
+            with self.subTest(request=request):
+                intent = extract_intent(request, now=REFERENCE_TIME)
+                self.assertEqual(intent["intent"], "list_decisions")
+
+    def test_close_decision_number_wins_over_brief_typo(self):
+        intent = extract_intent(
+            "Close the decision 2. Give me decision bried done",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(intent["intent"], "record_decision")
+        self.assertEqual(intent["decision_index"], 2)
+        self.assertEqual(intent["outcome"], "Give me decision brief done")
 
     def test_treats_follow_up_options_as_latest_decision_update(self):
         intent = extract_intent("options are stay at home, go to ICC", now=REFERENCE_TIME)
@@ -80,7 +131,7 @@ class FamilyDecisionIntentTest(unittest.TestCase):
             "add_evidence",
         )
         next_step = extract_intent(
-            "Add next step abc123: call camp owner dad by tomorrow",
+            "Add next step abc123: call camp owner papa by tomorrow",
             now=REFERENCE_TIME,
         )
         self.assertEqual(next_step["intent"], "add_next_step")

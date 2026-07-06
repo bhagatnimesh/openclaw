@@ -51,6 +51,12 @@ class HomeBoardProvider(Protocol):
     ) -> dict[str, Any] | None:
         ...
 
+    def mark_pending(self, item_id: str) -> dict[str, Any] | None:
+        ...
+
+    def delete_item(self, item_id: str) -> dict[str, Any] | None:
+        ...
+
 
 class ToolResponse(TypedDict, total=False):
     status: Literal["ok", "needs_information", "error"]
@@ -195,6 +201,50 @@ class HomeBoardTools:
         return {
             "status": "ok",
             "message": "Home Board item marked done.",
+            "data": {"item": item},
+        }
+
+    def mark_pending(self, item_id: str | None = None) -> ToolResponse:
+        cleaned_item_id = _clean_optional(item_id)
+        if cleaned_item_id is None:
+            return _missing_response(["item_id"])
+
+        try:
+            item = self.provider.mark_pending(cleaned_item_id)
+        except Exception as error:
+            return _error_response(error)
+        if item is None:
+            return {
+                "status": "error",
+                "message": f"Home Board item {cleaned_item_id} was not found.",
+                "data": {"item_id": cleaned_item_id},
+            }
+
+        return {
+            "status": "ok",
+            "message": "Home Board item restored to pending.",
+            "data": {"item": item},
+        }
+
+    def delete_item(self, item_id: str | None = None) -> ToolResponse:
+        cleaned_item_id = _clean_optional(item_id)
+        if cleaned_item_id is None:
+            return _missing_response(["item_id"])
+
+        try:
+            item = self.provider.delete_item(cleaned_item_id)
+        except Exception as error:
+            return _error_response(error)
+        if item is None:
+            return {
+                "status": "error",
+                "message": f"Home Board item {cleaned_item_id} was not found.",
+                "data": {"item_id": cleaned_item_id},
+            }
+
+        return {
+            "status": "ok",
+            "message": "Home Board item deleted.",
             "data": {"item": item},
         }
 

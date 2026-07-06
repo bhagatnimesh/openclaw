@@ -98,7 +98,7 @@ def _normalize_event(
     timezone: ZoneInfo,
 ) -> dict[str, Any]:
     start, end, all_day = _event_start_end(event, timezone)
-    notes, metadata = read_metadata(event.get("description"))
+    notes, metadata = read_metadata(event)
     owner = _clean_text(metadata.get("owner"), "unknown").lower()
     person = _clean_text(metadata.get("person"), "family")
     category = _clean_text(metadata.get("category"))
@@ -999,7 +999,7 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
             home_board_sources = DashboardSources(
                 calendar_tools=None,
                 task_tools=None,
-                read_event_metadata=lambda description: ("", {}),
+                read_event_metadata=lambda event: ("", {}),
                 read_task_metadata=lambda notes: ("", {}),
                 recommend_task_matches=lambda tasks, filters, limit: [],
                 home_board_tools=build_default_home_board_tools(),

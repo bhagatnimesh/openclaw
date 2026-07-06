@@ -646,11 +646,16 @@ Legacy `plugins.entries.openai.config.personality` is still read as a compatibil
     | Speed | `messages.tts.providers.openai.speed` | (unset) |
     | Instructions | `messages.tts.providers.openai.instructions` | (unset, `gpt-4o-mini-tts` only) |
     | Format | `messages.tts.providers.openai.responseFormat` | `opus` for voice notes, `mp3` for files |
-    | API key | `messages.tts.providers.openai.apiKey` | Falls back to `OPENAI_API_KEY` |
+    | API key | `messages.tts.providers.openai.apiKey` | Prefer `"${OPENAI_TTS_API_KEY}"` for TTS-only use; falls back to `OPENAI_API_KEY` |
     | Base URL | `messages.tts.providers.openai.baseUrl` | `https://api.openai.com/v1` |
     | Extra body | `messages.tts.providers.openai.extraBody` / `extra_body` | (unset) |
 
-    Available models: `gpt-4o-mini-tts`, `tts-1`, `tts-1-hd`. Available voices: `alloy`, `ash`, `ballad`, `cedar`, `coral`, `echo`, `fable`, `juniper`, `marin`, `onyx`, `nova`, `sage`, `shimmer`, `verse`.
+    Available models: `gpt-4o-mini-tts`, `tts-1`, `tts-1-hd`. OpenAI
+    recommends `gpt-4o-mini-tts` for reliable text-to-speech and supports
+    `instructions` on that model. Available voices: `alloy`, `ash`, `ballad`,
+    `cedar`, `coral`, `echo`, `fable`, `juniper`, `marin`, `onyx`, `nova`,
+    `sage`, `shimmer`, `verse`; use `marin` or `cedar` when you want the
+    highest-quality built-in OpenAI voices.
 
     `extraBody` is merged into `/audio/speech` request JSON after OpenClaw's generated fields, so use it for OpenAI-compatible endpoints that require additional keys such as `lang`. Prototype keys are ignored.
 
@@ -658,8 +663,14 @@ Legacy `plugins.entries.openai.config.personality` is still read as a compatibil
     {
       messages: {
         tts: {
+          provider: "openai",
           providers: {
-            openai: { model: "gpt-4o-mini-tts", speakerVoice: "coral" },
+            openai: {
+              apiKey: "${OPENAI_TTS_API_KEY}",
+              model: "gpt-4o-mini-tts",
+              speakerVoice: "marin",
+              instructions: "Speak naturally, warmly, and clearly.",
+            },
           },
         },
       },
@@ -667,7 +678,13 @@ Legacy `plugins.entries.openai.config.personality` is still read as a compatibil
     ```
 
     <Note>
-    Set `OPENAI_TTS_BASE_URL` to override the TTS base URL without affecting the chat API endpoint. OpenAI TTS and Realtime voice are both configured through an OpenAI Platform API key; OAuth-only installs can still use Codex-backed chat models, but not OpenAI live talk-back.
+    Keep the secret value outside tracked config: export `OPENAI_TTS_API_KEY`
+    in the environment used to start OpenClaw, then reference it from
+    `messages.tts.providers.openai.apiKey`. Set `OPENAI_TTS_BASE_URL` to
+    override the TTS base URL without affecting the chat API endpoint. OpenAI
+    TTS and Realtime voice are both configured through an OpenAI Platform API
+    key; OAuth-only installs can still use Codex-backed chat models, but not
+    OpenAI live talk-back.
     </Note>
 
   </Accordion>

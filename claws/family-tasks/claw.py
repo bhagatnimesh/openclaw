@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import re
 import sys
 from typing import Any
 
 from constants import DEFAULT_TASK_LIST_ID
-from intent import extract_intent, read_metadata_from_notes
+from intent import OWNER_ALIAS_PATTERN, OWNER_ALIASES, extract_intent, read_metadata_from_notes
 from matcher import match_tasks
 from noah_assistant import (
     NoahResearchClient,
@@ -40,7 +40,7 @@ def _format_due(task: dict[str, Any]) -> str:
 
 def _format_task_choice(task: dict[str, Any]) -> str:
     title = task.get("title") or "Untitled task"
-    _, metadata = read_metadata_from_notes(task.get("notes"))
+    _, metadata = _task_notes_and_metadata(task)
     parts = [title, _format_due(task)]
     duration = metadata.get("duration_minutes")
     if duration is not None:
@@ -118,11 +118,19 @@ def _assistant_task_title(task: dict[str, Any]) -> str:
     return str(task.get("title") or "Untitled task").strip()
 
 
+def _task_notes_and_metadata(task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    notes, legacy_metadata = read_metadata_from_notes(task.get("notes"))
+    metadata = task.get("_n4os_metadata")
+    if isinstance(metadata, dict):
+        return notes, metadata
+    return notes, legacy_metadata
+
+
 def _is_pending_assistant_help_task(task: dict[str, Any]) -> bool:
     if task.get("status") == "completed":
         return False
 
-    _, metadata = read_metadata_from_notes(task.get("notes"))
+    _, metadata = _task_notes_and_metadata(task)
     return bool(metadata.get("assistant_help_needed")) and (
         metadata.get("assistant_help_status") != "completed"
     )
@@ -233,6 +241,111 @@ def _is_task_list_request(request: str) -> bool:
     return has_task_cue is not None and has_list_verb is not None
 
 
+OWNER_TARGET_RE = re.compile(
+    rf"^\s*(?:assign|set|make|change|update|put)\s+"
+    rf"(?P<target>.+?)\s+"
+    rf"(?:to|for|owner\s+to|owner\s+as|as\s+owner)\s+"
+    rf"(?P<owner>{OWNER_ALIAS_PATTERN})\b\.?\s*$",
+    re.IGNORECASE,
+)
+OWNER_ONLY_RE = re.compile(
+    rf"\b(?:owner|owned\s+by|assign(?:ed)?\s+to|belongs\s+to|for)\s*"
+    rf"(?:is|:|to|as)?\s*(?P<owner>{OWNER_ALIAS_PATTERN})\b",
+    re.IGNORECASE,
+)
+OWNER_AS_RE = re.compile(
+    rf"\b(?P<owner>{OWNER_ALIAS_PATTERN})\s+as\s+(?:the\s+)?owner\b",
+    re.IGNORECASE,
+)
+NOTE_UPDATE_RE = re.compile(
+    r"^\s*(?:add|append|set|update|put)?\s*"
+    r"(?:a\s+)?(?:note|notes|description|context)\s*"
+    r"(?:is|are|to|:)?\s+(?P<note>.+?)\s*$",
+    re.IGNORECASE,
+)
+ASSISTANT_UPDATE_RE = re.compile(
+    r"\b(?:add|ask|have|queue|put|set\s+up)?\s*"
+    r"(?P<assistant>noah|novah|ai\s+assistant|assistant)\b"
+    r".*?\b(?:help|research|find|look\s+up|figure\s+out|call|email|draft)\b"
+    r"(?P<help>.*)$",
+    re.IGNORECASE,
+)
+PRONOUN_TARGETS = {"it", "this", "that", "this task", "that task", "the task"}
+
+
+@dataclass(frozen=True)
+class TaskUpdateRequest:
+    owner: str | None = None
+    note: str | None = None
+    assistant_help_request: str | None = None
+    target: str | None = None
+
+
+def _clean_task_target(value: str) -> str | None:
+    cleaned = re.sub(r"\btask\b", "", value, flags=re.IGNORECASE).strip(" .")
+    cleaned = re.sub(r"^(?:add|create|capture|remember)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned or None
+
+
+def _owner_from_request(request: str) -> tuple[str | None, str | None]:
+    target_match = OWNER_TARGET_RE.search(request)
+    if target_match is not None:
+        owner = OWNER_ALIASES.get(target_match.group("owner").strip().lower(), "unknown")
+        target = " ".join(target_match.group("target").lower().split())
+        if target in PRONOUN_TARGETS:
+            return owner, None
+        return owner, _clean_task_target(target_match.group("target"))
+
+    for pattern in (OWNER_ONLY_RE, OWNER_AS_RE):
+        match = pattern.search(request)
+        if match is not None:
+            return OWNER_ALIASES.get(match.group("owner").strip().lower(), "unknown"), None
+    return None, None
+
+
+def _note_from_request(request: str) -> str | None:
+    match = NOTE_UPDATE_RE.search(request)
+    if match is None:
+        return None
+    note = match.group("note").strip(" .")
+    return note or None
+
+
+def _assistant_help_from_request(request: str) -> str | None:
+    match = ASSISTANT_UPDATE_RE.search(request)
+    if match is None:
+        return None
+
+    help_request = re.sub(
+        r"^\s*(?:me\s+)?(?:(?:to|with|on|for)\s+)?"
+        r"(?:(?:the|this|that)\s+task|it|this|that)?\s*",
+        "",
+        match.group("help"),
+        flags=re.IGNORECASE,
+    ).strip(" .,:;-")
+    return help_request or "help with this task"
+
+
+def _task_update_from_request(request: str) -> TaskUpdateRequest | None:
+    owner, target = _owner_from_request(request)
+    note = _note_from_request(request)
+    assistant_help = _assistant_help_from_request(request)
+    if owner is None and note is None and assistant_help is None:
+        return None
+    return TaskUpdateRequest(
+        owner=owner if owner != "unknown" else None,
+        note=note,
+        assistant_help_request=assistant_help,
+        target=target,
+    )
+
+
+def _append_human_note(notes: str, note: str) -> str:
+    if not notes.strip():
+        return note
+    return f"{notes.strip()}\n\n{note}"
+
+
 @dataclass
 class FamilyTasksClaw:
     """Small OpenClaw entry point for the Family Tasks claw."""
@@ -242,6 +355,8 @@ class FamilyTasksClaw:
     tool_guidance: str = TOOL_GUIDANCE
     pending_action: PendingAction | None = None
     auto_run_assistant_help: bool = True
+    last_created_task: dict[str, Any] | None = None
+    undo_stack: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_provider(cls, provider: TasksProvider) -> "FamilyTasksClaw":
@@ -261,6 +376,7 @@ class FamilyTasksClaw:
             "delete_task": self.tools.delete_task,
             "recommend_tasks": self.tools.recommend_tasks,
             "run_assistant_help": self.run_noah_assistant_help,
+            "undo_task_action": self.undo_last_action,
         }
 
     def add_task_from_request(
@@ -292,6 +408,15 @@ class FamilyTasksClaw:
             return message
 
         task = response.get("data", {}).get("task", {})
+        self.last_created_task = dict(task) if task else None
+        if task.get("id"):
+            self.undo_stack.append(
+                {
+                    "action": "delete_task",
+                    "task": dict(task),
+                    "task_list_id": DEFAULT_TASK_LIST_ID,
+                },
+            )
         message = _format_created_task_message(task)
         if self.auto_run_assistant_help:
             assistant_result = self._run_noah_assistant_help_for_task(
@@ -310,6 +435,112 @@ class FamilyTasksClaw:
         print(message)
         return message
 
+    def assign_owner_from_request(
+        self,
+        request: str,
+        task_list_id: str = DEFAULT_TASK_LIST_ID,
+    ) -> str:
+        return self.update_task_from_request(request, task_list_id=task_list_id)
+
+    def update_task_from_request(
+        self,
+        request: str,
+        task_list_id: str = DEFAULT_TASK_LIST_ID,
+    ) -> str:
+        update = _task_update_from_request(request)
+        if update is None:
+            message = "Please say what to update on the task."
+            print(message)
+            return message
+
+        if update.target is None:
+            task = self.last_created_task
+            if task is None:
+                message = "I do not know which task to update."
+                print(message)
+                return message
+            return self._update_task(task, update, task_list_id)
+
+        response = self.tools.list_tasks(task_list_id=task_list_id)
+        if response["status"] != "ok":
+            message = response["message"]
+            print(message)
+            return message
+
+        matches = match_tasks(update.target, response.get("data", {}).get("tasks", []))
+        if not matches:
+            message = "I couldn't find a matching task. Try including more of the title."
+            print(message)
+            return message
+        if len(matches) > 1:
+            lines = ["Multiple matching tasks found. Which one should I update?"]
+            for index, task in enumerate(matches, start=1):
+                lines.append(f"{index}. {_format_task_choice(task)}")
+            message = "\n".join(lines)
+            print(message)
+            return message
+        return self._update_task(matches[0], update, task_list_id)
+
+    def _update_task(
+        self,
+        task: dict[str, Any],
+        update: TaskUpdateRequest,
+        task_list_id: str,
+    ) -> str:
+        task_id = task.get("id")
+        if not task_id:
+            message = "Matching task has no Google Tasks id, so I did not update it."
+            print(message)
+            return message
+
+        notes, metadata = _task_notes_and_metadata(task)
+        changes = []
+        if update.owner is not None:
+            metadata["owner"] = update.owner
+            changes.append(f"owner={update.owner}")
+        if update.note is not None:
+            notes = _append_human_note(notes, update.note)
+            changes.append("note")
+        if update.assistant_help_request is not None:
+            metadata["assistant_help_needed"] = True
+            metadata["assistant_name"] = "Noah"
+            metadata["assistant_help_request"] = update.assistant_help_request
+            metadata["assistant_help_status"] = "queued"
+            changes.append("Noah help")
+
+        if not changes:
+            message = "Please say what to update on the task."
+            print(message)
+            return message
+
+        response = self.tools.update_task(
+            task_id=task_id,
+            notes=notes,
+            metadata=metadata,
+            task_list_id=task_list_id,
+        )
+        if response["status"] != "ok":
+            message = response["message"]
+            print(message)
+            return message
+
+        updated = response.get("data", {}).get("task", {})
+        if updated:
+            merged_task = dict(task)
+            merged_task.update(updated)
+            self.last_created_task = merged_task
+        self.undo_stack.append(
+            {
+                "action": "restore_task",
+                "task": dict(task),
+                "task_list_id": task_list_id,
+            },
+        )
+        title = updated.get("title") or task.get("title") or "task"
+        message = f"Updated task ({', '.join(changes)}): {title}."
+        print(message)
+        return message
+
     def _run_noah_assistant_help_for_task(
         self,
         task: dict[str, Any],
@@ -323,7 +554,7 @@ class FamilyTasksClaw:
 
         task_id = str(task.get("id") or "").strip()
         title = _assistant_task_title(task)
-        notes, metadata = read_metadata_from_notes(task.get("notes"))
+        notes, metadata = _task_notes_and_metadata(task)
         if not task_id:
             return f"Noah could not complete assistant help for {title}: missing Google Tasks id."
 
@@ -444,7 +675,7 @@ class FamilyTasksClaw:
         for task in selected_tasks:
             task_id = str(task.get("id") or "").strip()
             title = _assistant_task_title(task)
-            notes, metadata = read_metadata_from_notes(task.get("notes"))
+            notes, metadata = _task_notes_and_metadata(task)
             if not task_id:
                 failed.append(f"{title}: missing Google Tasks id")
                 continue
@@ -623,18 +854,94 @@ class FamilyTasksClaw:
                 task_list_id=pending.task_list_id,
                 confirmed=True,
             )
+            if result["status"] == "ok":
+                self.undo_stack.append(
+                    {
+                        "action": "restore_task",
+                        "task": dict(task),
+                        "task_list_id": pending.task_list_id,
+                    },
+                )
         elif pending.action == "delete":
             result = self.tools.delete_task(
                 task_id=task_id,
                 task_list_id=pending.task_list_id,
                 confirmed=True,
             )
+            if result["status"] == "ok":
+                self.undo_stack.append(
+                    {
+                        "action": "recreate_task",
+                        "task": dict(task),
+                        "task_list_id": pending.task_list_id,
+                    },
+                )
         else:
             result = {"status": "error", "message": "Unknown pending task action."}
 
         self.pending_action = None
         print(result["message"])
         return True
+
+    def undo_last_action(self) -> str:
+        if not self.undo_stack:
+            message = "Nothing to undo for Family Tasks."
+            print(message)
+            return message
+
+        undo = self.undo_stack.pop()
+        task = undo.get("task", {})
+        task_id = task.get("id")
+        task_list_id = undo.get("task_list_id", DEFAULT_TASK_LIST_ID)
+        if undo.get("action") == "delete_task":
+            response = self.tools.delete_task(
+                task_id=task_id,
+                task_list_id=task_list_id,
+                confirmed=True,
+            )
+            message = (
+                f"Undid task creation: deleted {_assistant_task_title(task)}."
+                if response["status"] == "ok"
+                else response["message"]
+            )
+            print(message)
+            return message
+
+        if undo.get("action") == "restore_task":
+            response = self.tools.update_task(
+                task_id=task_id,
+                title=task.get("title"),
+                notes=task.get("notes"),
+                due=task.get("due"),
+                status=task.get("status") or "needsAction",
+                task_list_id=task_list_id,
+            )
+            message = (
+                f"Undid task completion: restored {_assistant_task_title(task)}."
+                if response["status"] == "ok"
+                else response["message"]
+            )
+            print(message)
+            return message
+
+        if undo.get("action") == "recreate_task":
+            response = self.tools.create_task(
+                title=task.get("title"),
+                notes=task.get("notes"),
+                due=task.get("due"),
+                task_list_id=task_list_id,
+            )
+            message = (
+                f"Undid task deletion: recreated {_assistant_task_title(task)}."
+                if response["status"] == "ok"
+                else response["message"]
+            )
+            print(message)
+            return message
+
+        message = "I do not know how to undo that Family Tasks action."
+        print(message)
+        return message
 
 
 def handle_task_request(claw: FamilyTasksClaw, request: str) -> None:

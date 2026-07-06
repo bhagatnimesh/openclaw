@@ -137,6 +137,18 @@ describe("createCronToolSchema", () => {
     }
   });
 
+  it("describes at schedules as absolute times derived from concrete user text", () => {
+    const jobAt = propertyAt(schemaRecord, "job.schedule.at");
+    const patchAt = propertyAt(schemaRecord, "patch.schedule.at");
+
+    for (const prop of [jobAt, patchAt]) {
+      expect(prop?.description).toContain("Absolute ISO-8601 time");
+      expect(prop?.description).toContain("derive this from concrete dates/times");
+      expect(prop?.description).toContain("framed voice transcripts");
+      expect(prop?.description).toContain("ask only when no date/time is present");
+    }
+  });
+
   it("job.delivery exposes mode, channel, to, threadId, bestEffort, accountId, failureDestination", () => {
     expect(keysAt(schemaRecord, "job.delivery")).toEqual(
       [

@@ -123,6 +123,16 @@ decision is stay home and schedule two playdates
 
 This marks the latest open decision as decided when no id is included.
 
+You can also close a decision by the number shown in the pending decisions list:
+
+```text
+close decision 2 done
+```
+
+```text
+close the decision 2. Give me decision bried done
+```
+
 ## Review Open Decisions
 
 Use a review prompt when you want to see what still needs attention.
@@ -133,6 +143,10 @@ list open decisions
 
 ```text
 show pending decisions
+```
+
+```text
+tell me the pending decisions
 ```
 
 Open decisions are ordered so urgent, due, and recently updated items surface first.

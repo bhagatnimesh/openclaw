@@ -305,6 +305,24 @@ export function buildBuiltinChatCommands(
       tier: "standard",
     }),
     defineChatCommand({
+      key: "schedule",
+      nativeName: "calendar",
+      nativeAliases: ["event", "task", "schedule"],
+      description: "Create a scheduled reminder, event, or task.",
+      textAliases: ["/schedule", "/calendar", "/event", "/task"],
+      acceptsArgs: true,
+      category: "tools",
+      tier: "essential",
+      args: [
+        {
+          name: "request",
+          description: "Reminder, event, or task text with date/time",
+          type: "string",
+          captureRemaining: true,
+        },
+      ],
+    }),
+    defineChatCommand({
       key: "allowlist",
       description: "List/add/remove allowlist entries.",
       textAlias: "/allowlist",

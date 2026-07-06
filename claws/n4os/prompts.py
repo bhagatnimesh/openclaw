@@ -5,8 +5,9 @@ Calendar means commitments: time-bound events, schedule reads, moves, and cancel
 Tasks means open loops: things to do, complete, delete, or choose from by context.
 Home Board means short-lived household notices: Today at Home, before leaving, helper, school, kitchen, or airport reminders.
 Decisions means pending family choices: owner, timeline, options, evidence, next steps, and final rationale.
+Science Lab means home science experiments: planning, materials, inventory, guides, kid scripts, quizzes, and reflection.
 Use Calendar + Tasks for planning and briefings that need commitments and open loops together.
 When routing confidence is low, ask a short clarification before calling a claw.
 """.strip()
 
-CLARIFICATION_PROMPT = "Should I use Calendar, Tasks, Home Board, Decisions, or Calendar + Tasks?"
+CLARIFICATION_PROMPT = "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, or Calendar + Tasks?"

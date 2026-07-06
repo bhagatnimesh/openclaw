@@ -44,6 +44,7 @@ class GoogleCalendarProvider:
         description=None,
         location=None,
         recurrence=None,
+        private_extended_properties=None,
     ):
         event = {
             "summary": title,
@@ -65,6 +66,11 @@ class GoogleCalendarProvider:
 
         if recurrence:
             event["recurrence"] = recurrence
+
+        if private_extended_properties:
+            event["extendedProperties"] = {
+                "private": private_extended_properties,
+            }
 
         return (
             self.service.events()
@@ -102,6 +108,7 @@ class GoogleCalendarProvider:
         timezone="America/Los_Angeles",
         description=None,
         location=None,
+        private_extended_properties=None,
     ):
         event = {
             "summary": title,
@@ -120,6 +127,11 @@ class GoogleCalendarProvider:
 
         if location:
             event["location"] = location
+
+        if private_extended_properties:
+            event["extendedProperties"] = {
+                "private": private_extended_properties,
+            }
 
         return (
             self.service.events()

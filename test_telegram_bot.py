@@ -30,6 +30,7 @@ from telegram_bot import (
     VOICE_TRANSCRIPTION_STARTED_MESSAGE,
     VOICE_TRANSCRIPTION_TIMEOUT_MESSAGE,
     VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE,
+    build_application,
     load_config,
 )
 
@@ -77,6 +78,44 @@ class FakeClaw:
             "intent_summary": "Route to family-tasks.",
             "confidence": 0.9,
         }
+
+
+class FakeFilters:
+    ALL = object()
+
+    class CommandFilter:
+        def __invert__(self):
+            raise AssertionError("message handler must not exclude Telegram commands")
+
+    COMMAND = CommandFilter()
+
+
+class FakeApplicationBuilder:
+    def __init__(self) -> None:
+        self.token_value: str | None = None
+
+    def token(self, value: str) -> "FakeApplicationBuilder":
+        self.token_value = value
+        return self
+
+    def build(self) -> "FakeApplication":
+        return FakeApplication(self.token_value)
+
+
+class FakeApplication:
+    latest: "FakeApplication | None" = None
+
+    def __init__(self, token: str | None) -> None:
+        self.token = token
+        self.handlers: list[Any] = []
+        FakeApplication.latest = self
+
+    @classmethod
+    def builder(cls) -> FakeApplicationBuilder:
+        return FakeApplicationBuilder()
+
+    def add_handler(self, handler: Any) -> None:
+        self.handlers.append(handler)
 
 
 class FailingClaw:
@@ -206,6 +245,26 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(claw.requests, ["Add task buy milk"])
         self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
+
+    async def test_authorized_slash_calendar_routes_to_n4os_as_text(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/calendar add for Tuesday 8 PM to cancel fox 1")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(
+            claw.requests,
+            ["add event for Tuesday 8 PM to cancel fox 1"],
+        )
+        self.assertEqual(
+            message.replies,
+            ["router replied to: add event for Tuesday 8 PM to cancel fox 1"],
+        )
 
     async def test_authorized_message_improves_voice_typed_text_before_routing(self):
         claw = FakeClaw()
@@ -588,6 +647,29 @@ class TelegramConfigTest(unittest.TestCase):
             config = load_config(env_path=env_path)
 
         self.assertEqual(config.allowed_user_id, None)
+
+
+class TelegramApplicationTest(unittest.TestCase):
+    def test_message_handler_accepts_unknown_slash_commands(self):
+        def fake_command_handler(command: str, callback: Any) -> tuple[str, str, Any]:
+            return ("command", command, callback)
+
+        def fake_message_handler(filter_value: Any, callback: Any) -> tuple[str, Any, Any]:
+            return ("message", filter_value, callback)
+
+        with (
+            patch("telegram_bot.Application", FakeApplication),
+            patch("telegram_bot.CommandHandler", fake_command_handler),
+            patch("telegram_bot.MessageHandler", fake_message_handler),
+            patch("telegram_bot.filters", FakeFilters),
+        ):
+            application = build_application(TelegramConfig(token="token", allowed_user_id=12345))
+
+        self.assertIs(application, FakeApplication.latest)
+        self.assertEqual(application.handlers[0][0:2], ("command", "start"))
+        self.assertEqual(application.handlers[1][0:2], ("command", "help"))
+        self.assertEqual(application.handlers[2][0], "message")
+        self.assertIs(application.handlers[2][1], FakeFilters.ALL)
 
 
 if __name__ == "__main__":

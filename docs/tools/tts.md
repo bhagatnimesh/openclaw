@@ -26,8 +26,10 @@ assistant voice response.
     for the full list.
   </Step>
   <Step title="Set the API key">
-    Export the env var for your provider (for example `OPENAI_API_KEY`,
+    Export the env var for your provider (for example `OPENAI_TTS_API_KEY`,
     `ELEVENLABS_API_KEY`). Microsoft and Local CLI need no key.
+    Do not paste literal API-key values into tracked config; reference the env
+    var from the provider block instead.
   </Step>
   <Step title="Enable in config">
     Set `messages.tts.auto: "always"` and `messages.tts.provider`:
@@ -71,7 +73,7 @@ speech.
 | **Local CLI**     | none                                                                                                             | Runs a configured local TTS command.                                                        |
 | **Microsoft**     | none                                                                                                             | Public Edge neural TTS via `node-edge-tts`. Best-effort, no SLA.                            |
 | **MiniMax**       | `MINIMAX_API_KEY` (or Token Plan: `MINIMAX_OAUTH_TOKEN`, `MINIMAX_CODE_PLAN_KEY`, `MINIMAX_CODING_API_KEY`)      | T2A v2 API. Defaults to `speech-2.8-hd`.                                                    |
-| **OpenAI**        | `OPENAI_API_KEY`                                                                                                 | Also used for auto-summary; supports persona `instructions`.                                |
+| **OpenAI**        | `messages.tts.providers.openai.apiKey: "${OPENAI_TTS_API_KEY}"`                                                  | Keeps the OpenAI Platform key scoped to TTS config; supports persona `instructions`.         |
 | **OpenRouter**    | `OPENROUTER_API_KEY` (can reuse `models.providers.openrouter.apiKey`)                                            | Default model `hexgrad/kokoro-82m`.                                                         |
 | **Volcengine**    | `VOLCENGINE_TTS_API_KEY` or `BYTEPLUS_SEED_SPEECH_API_KEY` (legacy AppID/token: `VOLCENGINE_TTS_APPID`/`_TOKEN`) | BytePlus Seed Speech HTTP API.                                                              |
 | **Vydra**         | `VYDRA_API_KEY`                                                                                                  | Shared image, video, and speech provider.                                                   |
@@ -269,13 +271,13 @@ preset and adapt the provider block:
     tts: {
       auto: "always",
       provider: "openai",
-      summaryModel: "openai/gpt-4.1-mini",
       modelOverrides: { enabled: true },
       providers: {
         openai: {
-          apiKey: "${OPENAI_API_KEY}",
+          apiKey: "${OPENAI_TTS_API_KEY}",
           model: "gpt-4o-mini-tts",
-          speakerVoice: "alloy",
+          speakerVoice: "marin",
+          instructions: "Speak naturally, warmly, and clearly.",
         },
         elevenlabs: {
           apiKey: "${ELEVENLABS_API_KEY}",
@@ -432,7 +434,7 @@ or auto mode:
     tts: {
       provider: "openai",
       providers: {
-        openai: { apiKey: "${OPENAI_API_KEY}", model: "gpt-4o-mini-tts" },
+        openai: { apiKey: "${OPENAI_TTS_API_KEY}", model: "gpt-4o-mini-tts" },
       },
     },
   },
@@ -909,9 +911,12 @@ OpenAI and ElevenLabs output formats are fixed per channel as listed above.
   </Accordion>
 
   <Accordion title="OpenAI">
-    <ParamField path="apiKey" type="string">Falls back to `OPENAI_API_KEY`.</ParamField>
+    <ParamField path="apiKey" type="string">
+      Set this to an env secret ref such as `"${OPENAI_TTS_API_KEY}"` to keep the
+      key scoped to TTS config. If unset, OpenAI TTS falls back to `OPENAI_API_KEY`.
+    </ParamField>
     <ParamField path="model" type="string">OpenAI TTS model id (e.g. `gpt-4o-mini-tts`).</ParamField>
-    <ParamField path="speakerVoice" type="string">Voice name (e.g. `alloy`, `cedar`). Legacy alias: `voice`.</ParamField>
+    <ParamField path="speakerVoice" type="string">Voice name (e.g. `marin`, `cedar`, `alloy`). Legacy alias: `voice`.</ParamField>
     <ParamField path="instructions" type="string">Explicit OpenAI `instructions` field. When set, persona prompt fields are **not** auto-mapped.</ParamField>
     <ParamField path="extraBody / extra_body" type="Record<string, unknown>">Extra JSON fields merged into `/audio/speech` request bodies after generated OpenAI TTS fields. Use this for OpenAI-compatible endpoints such as Kokoro that require provider-specific keys like `lang`; unsafe prototype keys are ignored.</ParamField>
     <ParamField path="baseUrl" type="string">

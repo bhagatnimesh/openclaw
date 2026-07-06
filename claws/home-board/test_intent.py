@@ -23,6 +23,16 @@ class HomeBoardIntentTest(unittest.TestCase):
         self.assertEqual(intent["trigger"], "leave_home")
         self.assertEqual(intent["priority"], "medium")
 
+    def test_before_leaving_alias_notice(self):
+        intent = extract_intent(
+            "Next Wednesday before Big N leaves remind us to take the payment envelope",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(intent["intent"], "add_item")
+        self.assertEqual(intent["person_or_group"], "Nysha")
+        self.assertEqual(intent["message"], "Take the payment envelope")
+
     def test_helper_kitchen_notice_defaults_to_today(self):
         intent = extract_intent(
             "Helper should put the food in the fridge today",
@@ -44,6 +54,17 @@ class HomeBoardIntentTest(unittest.TestCase):
         self.assertEqual(intent["message"], "Carry passports")
         self.assertEqual(intent["context"], "airport")
         self.assertEqual(intent["trigger"], "airport")
+
+    def test_thought_like_home_board_item_uses_clean_message(self):
+        intent = extract_intent(
+            "Add home board item tomorrow to put passports by the door",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(intent["intent"], "add_item")
+        self.assertEqual(intent["person_or_group"], "Family")
+        self.assertEqual(intent["message"], "Put passports by the door")
+        self.assertEqual(intent["date"], "2026-07-04")
 
     def test_list_today_at_home_intent(self):
         intent = extract_intent("What's on Today at Home?", now=REFERENCE_TIME)
@@ -91,6 +112,22 @@ class HomeBoardIntentTest(unittest.TestCase):
         self.assertEqual(intent["intent"], "add_items")
         self.assertEqual(len(intent["items"]), 3)
         self.assertEqual(intent["items"][1]["context"], "kitchen")
+
+    def test_comma_separated_bulk_notice_with_aliases(self):
+        intent = extract_intent(
+            "Nisha take journal, Naavya bring shoes, Namesh take passport today",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(intent["intent"], "add_items")
+        self.assertEqual(
+            [(item["person_or_group"], item["message"]) for item in intent["items"]],
+            [
+                ("Nysha", "Take journal"),
+                ("Navya", "Bring shoes"),
+                ("Dad", "Take passport"),
+            ],
+        )
 
     def test_shared_future_date_bulk_notice(self):
         intent = extract_intent(

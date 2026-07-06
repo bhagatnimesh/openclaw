@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from copy import deepcopy
 from datetime import datetime, timedelta
 import re
@@ -8,10 +8,14 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from intent import (
+    METADATA_EXTENDED_PROPERTY,
     METADATA_MARKER,
+    OWNER_ALIAS_PATTERN,
+    OWNER_NAME_ALIASES,
     extract_intent,
-    read_metadata_from_description,
-    write_metadata_to_description,
+    read_metadata_from_event,
+    write_human_description,
+    write_metadata_to_private_extended_properties,
 )
 from prompts import SYSTEM_PROMPT, TOOL_GUIDANCE
 from tools import DEFAULT_TIMEZONE, CalendarProvider, CalendarTools, build_default_tools
@@ -51,6 +55,31 @@ CHECKLIST_PREP_CATEGORIES = {
     "appointment",
 }
 CHILD_NAMES = {"nysha", "navya", "kids", "children"}
+ASSIGN_OWNER_RE = re.compile(
+    rf"^\s*(?:assign|set|make|change|update|put)\s+"
+    rf"(?P<target>.+?)\s+"
+    rf"(?:to|for|owner\s+to|owner\s+as|as\s+owner)\s+"
+    rf"(?P<owner>{OWNER_ALIAS_PATTERN})\b\.?\s*$",
+    re.IGNORECASE,
+)
+OWNER_ONLY_RE = re.compile(
+    rf"\b(?:owner|owned\s+by|assign(?:ed)?\s+to|belongs\s+to|for)\s*"
+    rf"(?:is|:|to|as)?\s*(?P<owner>{OWNER_ALIAS_PATTERN})\b",
+    re.IGNORECASE,
+)
+OWNER_AS_RE = re.compile(
+    rf"\b(?P<owner>{OWNER_ALIAS_PATTERN})\s+as\s+(?:the\s+)?owner\b",
+    re.IGNORECASE,
+)
+PRONOUN_TARGETS = {
+    "it",
+    "this",
+    "that",
+    "this event",
+    "that event",
+    "the event",
+    "calendar event",
+}
 
 
 def _parse_event_time(value: str | None) -> datetime | None:
@@ -112,7 +141,7 @@ def _event_match_text(event: dict[str, Any]) -> str:
 
 
 def _preparation_match_text(event: dict[str, Any]) -> str:
-    notes, metadata = read_metadata_from_description(event.get("description"))
+    notes, metadata = read_metadata_from_event(event)
     metadata_text = " ".join(
         str(value)
         for key, value in metadata.items()
@@ -138,7 +167,7 @@ def _event_matches_metadata_filter(
     if not metadata_filter:
         return True
 
-    _, metadata = read_metadata_from_description(event.get("description"))
+    _, metadata = read_metadata_from_event(event)
     owner = metadata_filter.get("owner")
     if owner is not None:
         event_owner = metadata.get("owner")
@@ -246,8 +275,29 @@ def _event_end(event: dict[str, Any]) -> datetime:
     return parsed_date or datetime.max
 
 
-def _has_metadata(description: str | None) -> bool:
-    return bool(description and METADATA_MARKER in description)
+def _has_metadata(event: dict[str, Any]) -> bool:
+    description = event.get("description")
+    if description and METADATA_MARKER in description:
+        return True
+
+    extended_properties = event.get("extendedProperties")
+    if not isinstance(extended_properties, dict):
+        return False
+    private_properties = extended_properties.get("private")
+    return (
+        isinstance(private_properties, dict)
+        and METADATA_EXTENDED_PROPERTY in private_properties
+    )
+
+
+def _private_extended_properties_for_event(
+    event: dict[str, Any],
+) -> dict[str, str] | None:
+    if not _has_metadata(event):
+        return None
+
+    _, metadata = read_metadata_from_event(event)
+    return write_metadata_to_private_extended_properties(metadata)
 
 
 def _owner_label(owner: str) -> str:
@@ -255,16 +305,44 @@ def _owner_label(owner: str) -> str:
         "dad": "dad",
         "mom": "mom",
         "both": "both",
+        "grandmom": "grandmom",
         "unknown": "unassigned",
     }
     return labels.get(owner, "unassigned")
+
+
+def _owner_from_alias(value: str) -> str:
+    return OWNER_NAME_ALIASES.get(" ".join(value.lower().split()), "unknown")
+
+
+def _assignment_parts(request: str) -> tuple[str | None, str | None]:
+    match = ASSIGN_OWNER_RE.search(request)
+    if match is None:
+        for pattern in (OWNER_ONLY_RE, OWNER_AS_RE):
+            owner_match = pattern.search(request)
+            if owner_match is not None:
+                return _owner_from_alias(owner_match.group("owner")), None
+        return None, None
+
+    target = " ".join(match.group("target").lower().split())
+    owner = _owner_from_alias(match.group("owner"))
+    if target in PRONOUN_TARGETS:
+        return owner, None
+
+    cleaned_target = re.sub(
+        r"\b(?:calendar|event|appointment)\b",
+        "",
+        match.group("target"),
+        flags=re.IGNORECASE,
+    ).strip(" .")
+    return owner, cleaned_target or None
 
 
 def _format_briefing_event(event: dict[str, Any]) -> str:
     title = event.get("summary") or "Untitled event"
     start_label = _format_event_time(event.get("start", {}))
     end_label = _format_event_time(event.get("end", {}))
-    _, metadata = read_metadata_from_description(event.get("description"))
+    _, metadata = read_metadata_from_event(event)
     owner = _owner_label(str(metadata.get("owner") or "unknown"))
     person = metadata.get("person")
     person_suffix = f", {person}" if person and person != "family" else ""
@@ -405,8 +483,7 @@ def _format_briefing(
     clarify_candidates: list[tuple[int, str, str]] = []
     for event in sorted_events:
         title = event.get("summary") or "Untitled event"
-        description = event.get("description")
-        _, metadata = read_metadata_from_description(description)
+        _, metadata = read_metadata_from_event(event)
         category = _briefing_category(event, metadata)
         if metadata.get("preparation_needed"):
             prep_note = metadata.get("preparation_notes") or "needs preparation"
@@ -415,7 +492,7 @@ def _format_briefing(
             unassigned_events.setdefault(_briefing_event_key(event), f"- {title}")
             owner_score = _clarification_score(event, metadata)
             clarify_candidates.append((owner_score, f"owner:{title}", f"- Who owns {title}?"))
-        if not _has_metadata(description) and category in PREP_RELEVANT_CATEGORIES:
+        if not _has_metadata(event) and category in PREP_RELEVANT_CATEGORIES:
             clarify_candidates.append(
                 (
                     _clarification_score(event, metadata) - 1,
@@ -808,7 +885,7 @@ def _dedupe_actions(actions: list[str]) -> list[str]:
 
 
 def _preparation_checklist_for_event(event: dict[str, Any]) -> list[str]:
-    notes, metadata = read_metadata_from_description(event.get("description"))
+    notes, metadata = read_metadata_from_event(event)
     categories = _preparation_categories(event, metadata)
     actions = []
     preparation_notes = str(metadata.get("preparation_notes") or notes)
@@ -822,7 +899,7 @@ def _preparation_checklist_for_event(event: dict[str, Any]) -> list[str]:
 
 
 def _preparation_reason(event: dict[str, Any]) -> str:
-    notes, metadata = read_metadata_from_description(event.get("description"))
+    notes, metadata = read_metadata_from_event(event)
     reasons = []
     if metadata.get("preparation_notes") or notes:
         reasons.append("prep notes")
@@ -860,7 +937,7 @@ def _is_urgent_preparation(event: dict[str, Any], now: datetime) -> bool:
 
 
 def _event_needs_preparation(event: dict[str, Any]) -> bool:
-    _, metadata = read_metadata_from_description(event.get("description"))
+    _, metadata = read_metadata_from_event(event)
     if metadata.get("preparation_needed"):
         return True
 
@@ -912,7 +989,7 @@ def _format_preparation_checklist(
 
     lines = ["Preparation checklist:"]
     for event in selected:
-        _, metadata = read_metadata_from_description(event.get("description"))
+        _, metadata = read_metadata_from_event(event)
         urgency = " (urgent)" if _is_urgent_preparation(event, now) else ""
         lines.append(f"{_format_preparation_header(event)}{urgency}")
         owner = str(metadata.get("owner") or "unknown")
@@ -948,6 +1025,7 @@ class FamilyCalendarClaw:
     tool_guidance: str = TOOL_GUIDANCE
     pending_action: PendingAction | None = None
     last_created_event: dict[str, Any] | None = None
+    undo_stack: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_provider(cls, provider: CalendarProvider) -> "FamilyCalendarClaw":
@@ -965,6 +1043,7 @@ class FamilyCalendarClaw:
             "list_calendar_events": self.tools.list_calendar_events,
             "delete_calendar_event": self.tools.delete_calendar_event,
             "update_calendar_event": self.tools.update_calendar_event,
+            "undo_calendar_action": self.undo_last_action,
         }
 
     def create_event_from_request(
@@ -1019,12 +1098,12 @@ class FamilyCalendarClaw:
             start_time=start.isoformat(),
             end_time=end.isoformat(),
             timezone=timezone,
-            description=write_metadata_to_description(
-                intent.get("description"),
-                intent.get("metadata"),
-            ),
+            description=write_human_description(intent.get("description")),
             location=intent.get("location"),
             recurrence=intent.get("recurrence"),
+            private_extended_properties=write_metadata_to_private_extended_properties(
+                intent.get("metadata"),
+            ),
         )
         if response["status"] != "ok":
             message = response["message"]
@@ -1033,6 +1112,8 @@ class FamilyCalendarClaw:
 
         event = response.get("data", {}).get("event", {})
         self.last_created_event = event
+        if event.get("id"):
+            self.undo_stack.append({"action": "delete_event", "event": deepcopy(event)})
         event_title = event.get("summary", intent["title"])
         event_link = event.get("htmlLink")
         event_id = event.get("id")
@@ -1062,12 +1143,11 @@ class FamilyCalendarClaw:
         if not event_id or not start_time or not end_time:
             return "I could not update the previous event because it is missing Google Calendar details."
 
-        notes, metadata = read_metadata_from_description(event.get("description"))
+        notes, metadata = read_metadata_from_event(event)
         metadata["preparation_needed"] = True
         metadata["preparation_notes"] = preparation_note
-        description = write_metadata_to_description(
+        description = write_human_description(
             _append_preparation_note(notes, preparation_note),
-            metadata,
         )
         response = self.tools.update_calendar_event(
             event_id=event_id,
@@ -1077,6 +1157,9 @@ class FamilyCalendarClaw:
             timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
             description=description,
             location=event.get("location"),
+            private_extended_properties=write_metadata_to_private_extended_properties(
+                metadata,
+            ),
         )
         if response["status"] != "ok":
             return response["message"]
@@ -1084,7 +1167,11 @@ class FamilyCalendarClaw:
         updated = deepcopy(event)
         updated.update(response.get("data", {}).get("event", {}))
         updated["description"] = description
+        updated["extendedProperties"] = {
+            "private": write_metadata_to_private_extended_properties(metadata),
+        }
         self.last_created_event = updated
+        self.undo_stack.append({"action": "restore_event", "event": deepcopy(event)})
         return f"Added preparation notes to {updated.get('summary') or 'the previous event'}."
 
     def _add_context_to_event(
@@ -1100,11 +1187,8 @@ class FamilyCalendarClaw:
         if not event_id or not start_time or not end_time:
             return "I could not update the previous event because it is missing Google Calendar details."
 
-        notes, metadata = read_metadata_from_description(event.get("description"))
-        description = write_metadata_to_description(
-            _append_context_note(notes, context_note),
-            metadata,
-        )
+        notes, metadata = read_metadata_from_event(event)
+        description = write_human_description(_append_context_note(notes, context_note))
         response = self.tools.update_calendar_event(
             event_id=event_id,
             title=event.get("summary") or "Untitled event",
@@ -1113,6 +1197,9 @@ class FamilyCalendarClaw:
             timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
             description=description,
             location=event.get("location"),
+            private_extended_properties=write_metadata_to_private_extended_properties(
+                metadata,
+            ),
         )
         if response["status"] != "ok":
             return response["message"]
@@ -1120,8 +1207,105 @@ class FamilyCalendarClaw:
         updated = deepcopy(event)
         updated.update(response.get("data", {}).get("event", {}))
         updated["description"] = description
+        updated["extendedProperties"] = {
+            "private": write_metadata_to_private_extended_properties(metadata),
+        }
         self.last_created_event = updated
+        self.undo_stack.append({"action": "restore_event", "event": deepcopy(event)})
         return f"Added note to {updated.get('summary') or 'the previous event'}."
+
+    def assign_owner_from_request(
+        self,
+        request: str,
+        reference_time: datetime | None = None,
+    ) -> str:
+        owner, target = _assignment_parts(request)
+        if owner is None or owner == "unknown":
+            message = "Please say who should own the event."
+            print(message)
+            return message
+
+        if target is None:
+            event = self.last_created_event
+            if event is None:
+                message = "I do not know which event to update."
+                print(message)
+                return message
+            message = self._assign_owner_to_event(event, owner)
+            print(message)
+            return message
+
+        reference = reference_time or datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+        response = self.tools.list_calendar_events(
+            time_min=reference.isoformat(),
+            time_max=(reference + timedelta(days=30)).isoformat(),
+            max_results=50,
+        )
+        if response["status"] != "ok":
+            message = response["message"]
+            print(message)
+            return message
+
+        events = sorted(response.get("data", {}).get("events", []), key=_event_start)
+        matches = [
+            item["event"]
+            for item in (
+                ranked for ranked in match_events(target, events)
+                if ranked["score"] >= MIN_CONFIDENT_SCORE
+            )
+        ]
+        if not matches:
+            message = "I couldn't find a matching event. Try including the event name or date."
+            print(message)
+            return message
+        if len(matches) > 1:
+            lines = ["Multiple matching events found. Which one should I assign?"]
+            for index, event in enumerate(matches, start=1):
+                lines.append(f"{index}. {_format_event_choice(event)}")
+            message = "\n".join(lines)
+            print(message)
+            return message
+
+        message = self._assign_owner_to_event(matches[0], owner)
+        print(message)
+        return message
+
+    def _assign_owner_to_event(self, event: dict[str, Any], owner: str) -> str:
+        event_id = event.get("id")
+        start = event.get("start", {})
+        end = event.get("end", {})
+        start_time = start.get("dateTime")
+        end_time = end.get("dateTime")
+        if not event_id or not start_time or not end_time:
+            return "I could not update the event because it is missing Google Calendar details."
+
+        notes, metadata = read_metadata_from_event(event)
+        metadata["owner"] = owner
+        description = write_human_description(notes)
+        response = self.tools.update_calendar_event(
+            event_id=event_id,
+            title=event.get("summary") or "Untitled event",
+            start_time=start_time,
+            end_time=end_time,
+            timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
+            description=description,
+            location=event.get("location"),
+            private_extended_properties=write_metadata_to_private_extended_properties(
+                metadata,
+            ),
+        )
+        if response["status"] != "ok":
+            return response["message"]
+
+        updated = deepcopy(event)
+        updated.update(response.get("data", {}).get("event", {}))
+        updated["description"] = description
+        updated["extendedProperties"] = {
+            "private": write_metadata_to_private_extended_properties(metadata),
+        }
+        self.last_created_event = updated
+        self.undo_stack.append({"action": "restore_event", "event": deepcopy(event)})
+        return f"Assigned event to {owner}: {updated.get('summary') or 'the event'}."
 
     def list_events_from_request(
         self,
@@ -1175,7 +1359,7 @@ class FamilyCalendarClaw:
             location_suffix = f" at {location}" if location else ""
             metadata_suffix = ""
             if metadata_filter.get("preparation_needed") is True:
-                _, metadata = read_metadata_from_description(event.get("description"))
+                _, metadata = read_metadata_from_event(event)
                 preparation_notes = metadata.get("preparation_notes")
                 if preparation_notes:
                     metadata_suffix = f" (prep: {preparation_notes})"
@@ -1417,14 +1601,18 @@ class FamilyCalendarClaw:
             start_time=updated["start"]["dateTime"],
             end_time=updated["end"]["dateTime"],
             timezone=updated["start"].get("timeZone") or DEFAULT_TIMEZONE,
-            description=updated.get("description"),
+            description=write_human_description(updated.get("description")),
             location=updated.get("location"),
+            private_extended_properties=_private_extended_properties_for_event(
+                updated,
+            ),
         )
         if response["status"] != "ok":
             message = response["message"]
             print(message)
             return message
 
+        self.undo_stack.append({"action": "restore_event", "event": deepcopy(event)})
         message = f"Moved calendar event: {_format_event_choice(updated)}."
         print(message)
         return message
@@ -1442,9 +1630,97 @@ class FamilyCalendarClaw:
             print(message)
             return message
 
+        self.undo_stack.append({"action": "recreate_event", "event": deepcopy(event)})
         message = f"Deleted calendar event: {_format_event_choice(event)}."
         print(message)
         return message
+
+    def undo_last_action(self) -> str:
+        if not self.undo_stack:
+            message = "Nothing to undo for Family Calendar."
+            print(message)
+            return message
+
+        undo = self.undo_stack.pop()
+        event = undo.get("event", {})
+        action = undo.get("action")
+        if action == "delete_event":
+            response = self.tools.delete_calendar_event(event.get("id"))
+            message = (
+                f"Undid calendar event creation: deleted {_format_event_choice(event)}."
+                if response["status"] == "ok"
+                else response["message"]
+            )
+            print(message)
+            return message
+
+        if action == "restore_event":
+            response = self._restore_calendar_event(event)
+            message = (
+                f"Undid calendar event update: restored {_format_event_choice(event)}."
+                if response["status"] == "ok"
+                else response["message"]
+            )
+            print(message)
+            return message
+
+        if action == "recreate_event":
+            response = self._recreate_calendar_event(event)
+            if response["status"] == "ok":
+                recreated = response.get("data", {}).get("event", event)
+                self.last_created_event = recreated
+                message = f"Undid calendar event deletion: recreated {_format_event_choice(recreated)}."
+            else:
+                message = response["message"]
+            print(message)
+            return message
+
+        message = "I do not know how to undo that Family Calendar action."
+        print(message)
+        return message
+
+    def _restore_calendar_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        event_id = event.get("id")
+        start = event.get("start", {})
+        end = event.get("end", {})
+        start_time = start.get("dateTime")
+        end_time = end.get("dateTime")
+        if not event_id or not start_time or not end_time:
+            return {
+                "status": "error",
+                "message": "I could not undo that calendar change because the event details are incomplete.",
+            }
+        return self.tools.update_calendar_event(
+            event_id=event_id,
+            title=event.get("summary") or "Untitled event",
+            start_time=start_time,
+            end_time=end_time,
+            timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
+            description=write_human_description(event.get("description")),
+            location=event.get("location"),
+            private_extended_properties=_private_extended_properties_for_event(event),
+        )
+
+    def _recreate_calendar_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        start = event.get("start", {})
+        end = event.get("end", {})
+        start_time = start.get("dateTime")
+        end_time = end.get("dateTime")
+        if not start_time or not end_time:
+            return {
+                "status": "error",
+                "message": "I could not recreate that calendar event because the event time is incomplete.",
+            }
+        return self.tools.create_calendar_event(
+            title=event.get("summary") or "Untitled event",
+            start_time=start_time,
+            end_time=end_time,
+            timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
+            description=write_human_description(event.get("description")),
+            location=event.get("location"),
+            recurrence=event.get("recurrence"),
+            private_extended_properties=_private_extended_properties_for_event(event),
+        )
 
     def handle_pending_response(self, response: str) -> bool:
         command = response.strip().lower()

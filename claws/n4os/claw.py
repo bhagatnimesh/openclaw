@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
+import re
 import sys
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -12,7 +13,10 @@ try:
         DECISIONS_ROOT,
         HOME_BOARD_ROOT,
         LOW_CONFIDENCE_THRESHOLD,
+        N4OSIntentFrame,
+        SCIENCE_LAB_ROOT,
         TASKS_ROOT,
+        interpret_request,
         load_scoped_module,
         module_scope,
         route_request,
@@ -25,7 +29,10 @@ except ImportError:
         DECISIONS_ROOT,
         HOME_BOARD_ROOT,
         LOW_CONFIDENCE_THRESHOLD,
+        N4OSIntentFrame,
+        SCIENCE_LAB_ROOT,
         TASKS_ROOT,
+        interpret_request,
         load_scoped_module,
         module_scope,
         route_request,
@@ -67,6 +74,10 @@ def _decisions_module() -> Any:
     return load_scoped_module("_n4os_family_decisions_claw", DECISIONS_ROOT, "claw.py")
 
 
+def _science_lab_module() -> Any:
+    return load_scoped_module("_n4os_science_lab_claw", SCIENCE_LAB_ROOT, "claw.py")
+
+
 def _is_day_briefing_request(request: str) -> bool:
     lowered = request.lower()
     return (
@@ -103,7 +114,7 @@ def _format_event_line(event: dict[str, Any], calendar_module: Any) -> str:
 
 def _prep_line(event: dict[str, Any], calendar_module: Any) -> str:
     title = event.get("summary") or "Untitled event"
-    _, metadata = calendar_module.read_metadata_from_description(event.get("description"))
+    _, metadata = calendar_module.read_metadata_from_event(event)
     notes = metadata.get("preparation_notes") or "prep needed"
     return f"- {title}: {notes}"
 
@@ -242,6 +253,28 @@ class PendingRouteClarification:
     reference_time: datetime | None
 
 
+@dataclass
+class RouteContext:
+    last_route: str | None = None
+    last_action: str | None = None
+    last_request: str | None = None
+    last_mutation_route: str | None = None
+    mutation_route_stack: list[str] = field(default_factory=list)
+    recent_decision_indexes: dict[int, str] = field(default_factory=dict)
+    last_artifact: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self, pending_owner: str | None = None) -> dict[str, Any]:
+        return {
+            "last_route": self.last_route,
+            "last_action": self.last_action,
+            "last_request": self.last_request,
+            "last_mutation_route": self.last_mutation_route,
+            "pending_owner": pending_owner,
+            "recent_decision_indexes": dict(self.recent_decision_indexes),
+            "last_artifact": dict(self.last_artifact),
+        }
+
+
 def _clarified_route(request: str) -> str | None:
     normalized = request.lower().strip(" .!?")
     if normalized in ("calendar", "cal", "use calendar"):
@@ -252,6 +285,8 @@ def _clarified_route(request: str) -> str | None:
         return "home_board"
     if normalized in ("decision", "decisions", "family decisions", "use decisions"):
         return "decisions"
+    if normalized in ("science lab", "science", "experiments", "use science lab"):
+        return "science_lab"
     if normalized in ("both", "calendar and tasks", "tasks and calendar"):
         return "both"
     return None
@@ -266,11 +301,43 @@ def _clear_pending_action(claw: Any | None) -> None:
         setattr(claw, "pending_action", None)
 
 
-def _pending_owner(calendar: Any | None, tasks: Any | None) -> str | None:
+def _is_undo_request(request: str) -> bool:
+    normalized = " ".join(request.lower().strip(" .!?").split())
+    return normalized in {
+        "undo",
+        "undo that",
+        "undo last",
+        "undo the last thing",
+        "revert",
+        "revert that",
+        "revert last",
+        "cancel",
+        "cancel that",
+        "cancel last",
+        "nevermind",
+        "never mind",
+    }
+
+
+def _undo_depth(claw: Any | None) -> int:
+    stack = getattr(claw, "undo_stack", None)
+    return len(stack) if isinstance(stack, list) else 0
+
+
+def _pending_owner(
+    calendar: Any | None,
+    tasks: Any | None,
+    home_board: Any | None = None,
+    decisions: Any | None = None,
+) -> str | None:
     if _has_pending_action(calendar):
         return "calendar"
     if _has_pending_action(tasks):
         return "tasks"
+    if _has_pending_action(home_board):
+        return "home_board"
+    if _has_pending_action(decisions):
+        return "decisions"
     return None
 
 
@@ -278,25 +345,113 @@ def _is_confident_new_route(decision: dict[str, Any], pending_owner: str) -> boo
     route = decision.get("route")
     confidence = float(decision.get("confidence") or 0)
     return (
-        route in ("calendar", "tasks", "home_board", "decisions", "both")
+        route in ("calendar", "tasks", "home_board", "decisions", "science_lab", "both")
         and route != pending_owner
         and confidence >= LOW_CONFIDENCE_THRESHOLD
     )
 
 
+def _clarified_route_action(
+    route: str,
+    request: str,
+    reference_time: datetime | None,
+) -> str:
+    if route == "calendar":
+        return str(_calendar_module().extract_intent(request, now=reference_time)["intent"])
+    if route == "tasks":
+        task_intent = _tasks_module().extract_intent(request, now=reference_time)
+        if task_intent.get("intent") != "recommend_tasks":
+            return str(task_intent["intent"])
+        create_intent = _tasks_module().extract_intent(
+            f"add task {request}",
+            now=reference_time,
+        )
+        if create_intent.get("intent") == "create_task":
+            return "create_task"
+        return str(task_intent["intent"])
+    if route == "home_board":
+        return str(_home_board_module().extract_intent(request, now=reference_time)["intent"])
+    if route == "decisions":
+        return str(_decisions_module().extract_intent(request, now=reference_time)["intent"])
+    if route == "science_lab":
+        return "science_lab"
+    if route == "both":
+        return "calendar_and_tasks"
+    return "unknown"
+
+
+def _clarified_dispatch_request(
+    route: str,
+    action: str,
+    request: str,
+    reference_time: datetime | None,
+) -> str:
+    if route == "tasks" and action == "create_task":
+        task_intent = _tasks_module().extract_intent(request, now=reference_time)
+        if task_intent.get("intent") == "recommend_tasks":
+            return f"add task {request}"
+    return request
+
+
 @dataclass
 class N4OSClaw:
-    """Top-level N4OS router over family calendar, tasks, decisions, and Home Board claws."""
+    """Top-level N4OS router over family operations and Science Lab requests."""
 
     calendar_claw: Any | None = None
     tasks_claw: Any | None = None
     home_board_claw: Any | None = None
     decisions_claw: Any | None = None
+    science_lab_claw: Any | None = None
     system_prompt: str = SYSTEM_PROMPT
+    intent_interpreter: Any | None = None
     pending_route_clarification: PendingRouteClarification | None = None
+    route_context: RouteContext = field(default_factory=RouteContext)
 
     def route(self, request: str, reference_time: datetime | None = None) -> dict[str, Any]:
-        return route_request(improve_entered_text(request), now=reference_time)
+        request = improve_entered_text(request)
+        return route_request(
+            request,
+            now=reference_time,
+            context=self._context_payload(),
+            interpreter=self.intent_interpreter,
+        )
+
+    def interpret(
+        self,
+        request: str,
+        reference_time: datetime | None = None,
+    ) -> N4OSIntentFrame:
+        request = improve_entered_text(request)
+        return interpret_request(
+            request,
+            now=reference_time,
+            context=self._context_payload(),
+            interpreter=self.intent_interpreter,
+        )
+
+    def _context_payload(self) -> dict[str, Any]:
+        return self.route_context.to_dict(
+            pending_owner=_pending_owner(
+                self.calendar_claw,
+                self.tasks_claw,
+                self.home_board_claw,
+                self.decisions_claw,
+            ),
+        )
+
+    def _remember_route(
+        self,
+        request: str,
+        frame: N4OSIntentFrame,
+    ) -> None:
+        self.route_context.last_route = frame.route
+        self.route_context.last_action = frame.action
+        self.route_context.last_request = request
+        self.route_context.last_artifact = {
+            "followup_kind": frame.followup_kind,
+            "target": dict(frame.target),
+            "slots": dict(frame.slots),
+        }
 
     def handle_request(
         self,
@@ -306,17 +461,31 @@ class N4OSClaw:
         request = improve_entered_text(request)
         calendar = self.calendar_claw
         tasks = self.tasks_claw
-        pending_owner = _pending_owner(calendar, tasks)
+        home_board = self.home_board_claw
+        decisions = self.decisions_claw
+        pending_owner = _pending_owner(calendar, tasks, home_board, decisions)
         if pending_owner is not None:
-            decision = self.route(request, reference_time=reference_time)
+            frame = self.interpret(request, reference_time=reference_time)
+            decision = frame.to_route_decision()
             if _is_confident_new_route(decision, pending_owner):
                 _clear_pending_action(calendar)
                 _clear_pending_action(tasks)
+                _clear_pending_action(home_board)
+                _clear_pending_action(decisions)
                 self.pending_route_clarification = None
-                self._dispatch_decision(request, decision, reference_time)
+                self._dispatch_decision(request, decision, reference_time, frame=frame)
+                self._remember_route(request, frame)
                 return decision
 
         if calendar is not None and calendar.handle_pending_response(request):
+            frame = N4OSIntentFrame(
+                route="calendar",
+                action="pending_response",
+                confidence=1.0,
+                followup_kind="pending_response",
+                normalized_request=request,
+            )
+            self._remember_route(request, frame)
             return {
                 "route": "calendar",
                 "intent_summary": "Handled pending family-calendar response.",
@@ -324,29 +493,57 @@ class N4OSClaw:
             }
 
         if tasks is not None and tasks.handle_pending_response(request):
+            frame = N4OSIntentFrame(
+                route="tasks",
+                action="pending_response",
+                confidence=1.0,
+                followup_kind="pending_response",
+                normalized_request=request,
+            )
+            self._remember_route(request, frame)
             return {
                 "route": "tasks",
                 "intent_summary": "Handled pending family-tasks response.",
                 "confidence": 1.0,
             }
 
+        if _is_undo_request(request):
+            return self._undo_last_action(request)
+
         clarified_route = _clarified_route(request)
         pending_route = self.pending_route_clarification
         if clarified_route is not None and pending_route is not None:
             self.pending_route_clarification = None
-            decision = {
-                "route": clarified_route,
-                "intent_summary": f"Clarified route to {clarified_route}.",
-                "confidence": 1.0,
-            }
-            self._dispatch_decision(
+            clarified_action = _clarified_route_action(
+                clarified_route,
                 pending_route.request,
-                decision,
                 pending_route.reference_time,
             )
+            dispatch_request = _clarified_dispatch_request(
+                clarified_route,
+                clarified_action,
+                pending_route.request,
+                pending_route.reference_time,
+            )
+            frame = N4OSIntentFrame(
+                route=clarified_route,
+                action=clarified_action,
+                confidence=1.0,
+                followup_kind="clarification",
+                normalized_request=dispatch_request,
+            )
+            decision = frame.to_route_decision()
+            self._dispatch_decision(
+                dispatch_request,
+                decision,
+                pending_route.reference_time,
+                frame=frame,
+            )
+            self._remember_route(dispatch_request, frame)
             return decision
 
-        decision = self.route(request, reference_time=reference_time)
+        frame = self.interpret(request, reference_time=reference_time)
+        decision = frame.to_route_decision()
         if (
             decision["route"] == "unknown"
             or decision["confidence"] < LOW_CONFIDENCE_THRESHOLD
@@ -355,11 +552,12 @@ class N4OSClaw:
                 request=request,
                 reference_time=reference_time,
             )
-            print(CLARIFICATION_PROMPT)
+            print(frame.clarification_question or CLARIFICATION_PROMPT)
             return decision
 
         self.pending_route_clarification = None
-        self._dispatch_decision(request, decision, reference_time)
+        self._dispatch_decision(request, decision, reference_time, frame=frame)
+        self._remember_route(request, frame)
         return decision
 
     def _dispatch_decision(
@@ -367,19 +565,78 @@ class N4OSClaw:
         request: str,
         decision: dict[str, Any],
         reference_time: datetime | None,
+        frame: N4OSIntentFrame | None = None,
     ) -> None:
-        if decision["route"] == "both" and _is_day_briefing_request(request):
-            self._handle_day_briefing(request, reference_time)
+        dispatch_request = (frame.normalized_request if frame else request) or request
+        action = frame.action if frame else None
+        if decision["route"] == "both" and _is_day_briefing_request(dispatch_request):
+            self._handle_day_briefing(dispatch_request, reference_time)
             return
 
         if decision["route"] in ("calendar", "both"):
-            self._handle_calendar_request(request, reference_time)
+            before = _undo_depth(self.calendar_claw)
+            self._handle_calendar_request(dispatch_request, reference_time, action=action)
+            self._remember_mutation_route("calendar", before, self.calendar_claw)
         if decision["route"] in ("tasks", "both"):
-            self._handle_tasks_request(request, reference_time)
+            before = _undo_depth(self.tasks_claw)
+            self._handle_tasks_request(dispatch_request, reference_time, action=action)
+            self._remember_mutation_route("tasks", before, self.tasks_claw)
         if decision["route"] == "home_board":
-            self._handle_home_board_request(request, reference_time)
+            before = _undo_depth(self.home_board_claw)
+            self._handle_home_board_request(dispatch_request, reference_time, action=action)
+            self._remember_mutation_route("home_board", before, self.home_board_claw)
         if decision["route"] == "decisions":
-            self._handle_decision_request(request, reference_time)
+            before = _undo_depth(self.decisions_claw)
+            self._handle_decision_request(dispatch_request, reference_time, action=action)
+            self._remember_mutation_route("decisions", before, self.decisions_claw)
+        if decision["route"] == "science_lab":
+            self._handle_science_lab_request(dispatch_request)
+
+    def _remember_mutation_route(
+        self,
+        route: str,
+        before_depth: int,
+        claw: Any | None,
+    ) -> None:
+        if _undo_depth(claw) > before_depth:
+            self.route_context.last_mutation_route = route
+            self.route_context.mutation_route_stack.append(route)
+
+    def _undo_last_action(self, request: str) -> dict[str, Any]:
+        route = self.route_context.mutation_route_stack[-1] if self.route_context.mutation_route_stack else None
+        claw_by_route = {
+            "calendar": self.calendar_claw,
+            "tasks": self.tasks_claw,
+            "home_board": self.home_board_claw,
+            "decisions": self.decisions_claw,
+        }
+        claw = claw_by_route.get(route)
+        if claw is None or not hasattr(claw, "undo_last_action"):
+            message = "Nothing to undo."
+            print(message)
+            return {"route": "unknown", "intent_summary": message, "confidence": 1.0}
+
+        message = claw.undo_last_action()
+        if self.route_context.mutation_route_stack:
+            self.route_context.mutation_route_stack.pop()
+        self.route_context.last_mutation_route = (
+            self.route_context.mutation_route_stack[-1]
+            if self.route_context.mutation_route_stack
+            else None
+        )
+        frame = N4OSIntentFrame(
+            route=route or "unknown",
+            action="undo",
+            confidence=1.0,
+            followup_kind="followup",
+            normalized_request=request,
+        )
+        self._remember_route(request, frame)
+        return {
+            "route": route or "unknown",
+            "intent_summary": message,
+            "confidence": 1.0,
+        }
 
     def _calendar(self) -> Any:
         if self.calendar_claw is None:
@@ -417,26 +674,48 @@ class N4OSClaw:
                 self.decisions_claw = _decisions_module().FamilyDecisionsClaw.default()
         return self.decisions_claw
 
+    def _science_lab(self) -> Any:
+        if self.science_lab_claw is None:
+            with module_scope(SCIENCE_LAB_ROOT):
+                self.science_lab_claw = _science_lab_module().ScienceLabClaw.default()
+        return self.science_lab_claw
+
     def _handle_calendar_request(
         self,
         request: str,
         reference_time: datetime | None,
+        action: str | None = None,
     ) -> None:
         module = _calendar_module()
         claw = self._calendar()
         if claw is None:
             return
         intent = module.extract_intent(request, now=reference_time)
-        if intent["intent"] == "preparation_checklist":
+        action = action or intent["intent"]
+        if action == "preparation_checklist":
             claw.preparation_from_request(request, reference_time=reference_time)
-        elif intent["intent"] == "family_briefing":
+        elif action == "family_briefing":
             claw.briefing_from_request(request, reference_time=reference_time)
-        elif intent["intent"] == "list_events":
+        elif action == "list_events":
             claw.list_events_from_request(request, reference_time=reference_time)
-        elif intent["intent"] == "delete_event":
+        elif action == "delete_event":
             claw.delete_event_from_request(request, reference_time=reference_time)
-        elif intent["intent"] == "update_event":
-            claw.update_event_from_request(request, reference_time=reference_time)
+        elif action == "update_event":
+            if hasattr(claw, "assign_owner_from_request") and re.search(
+                r"\b(?:assign|assigned|owner|owned|belongs)\b|"
+                r"\b(?:set|make|change|update|put)\b.*\b(?:owner|as\s+owner)\b",
+                request,
+                flags=re.IGNORECASE,
+            ):
+                claw.assign_owner_from_request(request, reference_time=reference_time)
+            elif re.search(
+                r"^\s*(?:add|append|set|update|put)?\s*(?:a\s+)?(?:note|notes|description|context|fyi)\b",
+                request,
+                flags=re.IGNORECASE,
+            ):
+                claw.create_event_from_request(request, reference_time=reference_time)
+            else:
+                claw.update_event_from_request(request, reference_time=reference_time)
         else:
             claw.create_event_from_request(request, reference_time=reference_time)
 
@@ -444,19 +723,26 @@ class N4OSClaw:
         self,
         request: str,
         reference_time: datetime | None,
+        action: str | None = None,
     ) -> None:
         module = _tasks_module()
         claw = self._tasks()
         if claw is None:
             return
         intent = module.extract_intent(request, now=reference_time)
-        if intent["intent"] == "create_task":
+        action = action or intent["intent"]
+        if action == "create_task":
             claw.add_task_from_request(request, reference_time=reference_time)
-        elif intent["intent"] == "complete_task":
+        elif action == "update_task":
+            if hasattr(claw, "update_task_from_request"):
+                claw.update_task_from_request(request)
+            else:
+                claw.assign_owner_from_request(request)
+        elif action == "complete_task":
             claw.complete_task_from_request(request)
-        elif intent["intent"] == "delete_task":
+        elif action == "delete_task":
             claw.delete_task_from_request(request)
-        elif intent["intent"] == "run_assistant_help":
+        elif action == "run_assistant_help":
             claw.run_noah_assistant_help_from_request(
                 request,
                 reference_time=reference_time,
@@ -468,13 +754,15 @@ class N4OSClaw:
         self,
         request: str,
         reference_time: datetime | None,
+        action: str | None = None,
     ) -> None:
         module = _home_board_module()
         claw = self._home_board()
         intent = module.extract_intent(request, now=reference_time)
-        if intent["intent"] == "list_items":
+        action = action or intent["intent"]
+        if action == "list_items":
             claw.list_items_from_request(request, reference_time=reference_time)
-        elif intent["intent"] == "mark_done":
+        elif action == "mark_done":
             claw.mark_done_from_request(request)
         else:
             claw.add_item_from_request(request, reference_time=reference_time)
@@ -483,8 +771,26 @@ class N4OSClaw:
         self,
         request: str,
         reference_time: datetime | None,
+        action: str | None = None,
     ) -> None:
-        self._decisions().handle_request(request, reference_time=reference_time)
+        claw = self._decisions()
+        if action == "list_decisions":
+            claw.list_decisions_from_request(request)
+        elif action == "decision_brief":
+            claw.decision_brief_from_request(request)
+        elif action == "add_option":
+            claw.add_option_from_request(request, reference_time=reference_time)
+        elif action == "add_evidence":
+            claw.add_evidence_from_request(request, reference_time=reference_time)
+        elif action == "add_next_step":
+            claw.add_next_step_from_request(request, reference_time=reference_time)
+        elif action == "record_decision":
+            claw.record_decision_from_request(request, reference_time=reference_time)
+        else:
+            claw.handle_request(request, reference_time=reference_time)
+
+    def _handle_science_lab_request(self, request: str) -> None:
+        self._science_lab().plan_from_request(request)
 
     def _handle_day_briefing(
         self,

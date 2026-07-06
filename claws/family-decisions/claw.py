@@ -1,21 +1,55 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import sys
 from typing import Any
 
 from intent import extract_intent
-from tools import FamilyDecisionProvider, FamilyDecisionTools, build_decision_brief, build_default_tools
+from tools import (
+    FamilyDecisionProvider,
+    FamilyDecisionTools,
+    build_decision_brief,
+    build_default_tools,
+    decision_gaps,
+)
 
 
-def _format_decision_line(decision: dict[str, Any]) -> str:
-    due = decision.get("due") or "no due date"
+def _looks_like_accidental_command_capture(decision: dict[str, Any]) -> bool:
+    title = str(decision.get("title") or "").strip().lower()
+    return title.startswith(
+        (
+            "tell me ",
+            "give me ",
+            "show ",
+            "list ",
+            "what are ",
+            "what is ",
+        ),
+    ) and "decision" in title
+
+
+def _format_decision_line(index: int, decision: dict[str, Any]) -> str:
+    due = decision.get("due") or "not set"
     owner = decision.get("owner") or "unknown"
-    return (
-        f"{decision.get('id', '')[:8]} {decision.get('status')} "
-        f"{decision.get('urgency')} owner={owner} due={due}: {decision.get('title')}"
-    )
+    owner_label = "unassigned" if owner == "unknown" else owner
+    gaps = decision_gaps(decision)
+    next_steps = [
+        step for step in decision.get("next_steps", [])
+        if step.get("status") == "open"
+    ]
+    next_step = next_steps[0].get("text") if next_steps else "Assign one clear next step"
+    lines = [
+        f"{index}. {decision.get('title')}",
+        f"   Owner: {owner_label} | Due: {due} | Status: {decision.get('status')}",
+    ]
+    if gaps:
+        lines.append("   Missing: " + ", ".join(gaps))
+    lines.append(f"   Next: {next_step}")
+    if _looks_like_accidental_command_capture(decision):
+        lines.append("   Note: this looks like an accidental command capture.")
+    lines.append(f"   Ref: {decision.get('id', '')[:8]}")
+    return "\n".join(lines)
 
 
 def _format_created_decision(decision: dict[str, Any], gaps: list[str]) -> str:
@@ -41,11 +75,19 @@ def _detail_count_line(options: list[str], evidence: list[str]) -> str | None:
     return "Captured details: " + ", ".join(parts) + "."
 
 
+def _bulk_close_message() -> str:
+    return (
+        "I can close one decision at a time. Use the displayed number or ref, "
+        "for example: close decision 2 done."
+    )
+
+
 @dataclass
 class FamilyDecisionsClaw:
     """Entry point for N4OS family decision tracking."""
 
     tools: FamilyDecisionTools
+    undo_stack: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_provider(cls, provider: FamilyDecisionProvider) -> "FamilyDecisionsClaw":
@@ -65,6 +107,8 @@ class FamilyDecisionsClaw:
             "add_family_decision_next_step": self.tools.add_next_step,
             "record_family_decision": self.tools.decide,
             "family_decision_brief": self.tools.decision_brief,
+            "delete_family_decision": self.tools.delete_decision,
+            "undo_family_decision_action": self.undo_last_action,
         }
 
     def handle_request(
@@ -84,6 +128,10 @@ class FamilyDecisionsClaw:
             return self.add_evidence_from_request(request, reference_time=reference_time)
         if action == "add_next_step":
             return self.add_next_step_from_request(request, reference_time=reference_time)
+        if action == "bulk_record_decisions":
+            message = _bulk_close_message()
+            print(message)
+            return message
         if action == "record_decision":
             return self.record_decision_from_request(request, reference_time=reference_time)
         return self.capture_decision_from_request(request, reference_time=reference_time)
@@ -124,6 +172,8 @@ class FamilyDecisionsClaw:
             gaps = refreshed.get("data", {}).get("gaps", [])
         else:
             gaps = response.get("data", {}).get("gaps", [])
+        if decision.get("id"):
+            self.undo_stack.append({"action": "delete_decision", "decision": dict(decision)})
         message = _format_created_decision(decision, gaps)
         detail_line = _detail_count_line(initial_options, initial_evidence)
         if detail_line:
@@ -144,8 +194,18 @@ class FamilyDecisionsClaw:
             message = "No open family decisions."
             print(message)
             return message
-        lines = ["Open family decisions:"]
-        lines.extend(f"- {_format_decision_line(decision)}" for decision in decisions)
+        detailed_decisions = []
+        for decision in decisions:
+            detail_response = self.tools.read_decision(decision.get("id"))
+            if detail_response["status"] == "ok":
+                detailed_decisions.append(detail_response.get("data", {}).get("decision", decision))
+            else:
+                detailed_decisions.append(decision)
+        lines = [f"Pending family decisions ({len(detailed_decisions)}):"]
+        lines.extend(
+            _format_decision_line(index, decision)
+            for index, decision in enumerate(detailed_decisions, start=1)
+        )
         message = "\n".join(lines)
         print(message)
         return message
@@ -163,31 +223,94 @@ class FamilyDecisionsClaw:
     def add_option_from_request(self, request: str, reference_time: datetime | None = None) -> str:
         intent = extract_intent(request, now=reference_time)
         texts = intent.get("texts") or [intent.get("text")]
+        before = self._snapshot_for_undo(intent.get("decision_id"))
         response = self._add_many_options(intent.get("decision_id"), texts)
+        self._remember_restore_undo(before, response)
         prefix = "Added options." if len([text for text in texts if text]) > 1 else "Added option."
         return self._format_mutation_response(response, prefix)
 
     def add_evidence_from_request(self, request: str, reference_time: datetime | None = None) -> str:
         intent = extract_intent(request, now=reference_time)
         texts = intent.get("texts") or [intent.get("text")]
+        before = self._snapshot_for_undo(intent.get("decision_id"))
         response = self._add_many_evidence(intent.get("decision_id"), texts)
+        self._remember_restore_undo(before, response)
         prefix = "Added evidence." if len([text for text in texts if text]) == 1 else "Added evidence notes."
         return self._format_mutation_response(response, prefix)
 
     def add_next_step_from_request(self, request: str, reference_time: datetime | None = None) -> str:
         intent = extract_intent(request, now=reference_time)
+        before = self._snapshot_for_undo(intent.get("decision_id"))
         response = self.tools.add_next_step(
             intent.get("decision_id"),
             intent.get("text"),
             owner=intent.get("owner", "unknown"),
             due=intent.get("due"),
         )
+        self._remember_restore_undo(before, response)
         return self._format_mutation_response(response, "Added next step.")
 
     def record_decision_from_request(self, request: str, reference_time: datetime | None = None) -> str:
         intent = extract_intent(request, now=reference_time)
-        response = self.tools.decide(intent.get("decision_id"), intent.get("outcome"))
+        if intent.get("intent") == "bulk_record_decisions":
+            message = _bulk_close_message()
+            print(message)
+            return message
+        decision_id = intent.get("decision_id")
+        if decision_id is None and intent.get("decision_index") is not None:
+            response = self._decision_id_from_list_index(intent.get("decision_index"))
+            if response["status"] != "ok":
+                return self._format_mutation_response(response, "Recorded decision.")
+            decision_id = response.get("data", {}).get("decision_id")
+        before = self._snapshot_for_undo(decision_id)
+        response = self.tools.decide(decision_id, intent.get("outcome"))
+        self._remember_restore_undo(before, response)
         return self._format_mutation_response(response, "Recorded decision.")
+
+    def _snapshot_for_undo(self, decision_id: str | None) -> dict[str, Any] | None:
+        response = self.tools.read_decision(decision_id)
+        if response["status"] != "ok":
+            return None
+        return dict(response.get("data", {}).get("decision", {}))
+
+    def _remember_restore_undo(
+        self,
+        before: dict[str, Any] | None,
+        response: dict[str, Any],
+    ) -> None:
+        if before and before.get("id") and response["status"] == "ok":
+            self.undo_stack.append({"action": "restore_decision", "decision": before})
+
+    def undo_last_action(self) -> str:
+        if not self.undo_stack:
+            message = "Nothing to undo for Family Decisions."
+            print(message)
+            return message
+
+        undo = self.undo_stack.pop()
+        decision = undo.get("decision", {})
+        if undo.get("action") == "delete_decision":
+            response = self.tools.delete_decision(decision.get("id"))
+            if response["status"] == "ok":
+                message = f"Undid decision capture: removed {decision.get('title') or 'Untitled decision'}."
+            else:
+                message = response["message"]
+            print(message)
+            return message
+
+        if undo.get("action") == "restore_decision":
+            response = self.tools.restore_decision(decision)
+            if response["status"] == "ok":
+                restored = response.get("data", {}).get("decision", decision)
+                message = f"Undid decision update: restored {restored.get('title') or 'Untitled decision'}."
+            else:
+                message = response["message"]
+            print(message)
+            return message
+
+        message = "I do not know how to undo that Family Decisions action."
+        print(message)
+        return message
 
     def _format_mutation_response(self, response: dict[str, Any], prefix: str) -> str:
         if response["status"] != "ok":
@@ -216,6 +339,26 @@ class FamilyDecisionsClaw:
                 return response
             decision_id = response.get("data", {}).get("decision", {}).get("id")
         return response or self.tools.add_evidence(decision_id, None)
+
+    def _decision_id_from_list_index(self, decision_index: int) -> dict[str, Any]:
+        response = self.tools.list_decisions()
+        if response["status"] != "ok":
+            return response
+        decisions = response.get("data", {}).get("decisions", [])
+        if decision_index < 1 or decision_index > len(decisions):
+            return {
+                "status": "needs_information",
+                "message": (
+                    f"Decision {decision_index} is not in the pending list. "
+                    "Ask for pending decisions, then use the displayed number or ref."
+                ),
+                "data": {"missing_fields": ["decision"]},
+            }
+        return {
+            "status": "ok",
+            "message": "Decision selected.",
+            "data": {"decision_id": decisions[decision_index - 1].get("id")},
+        }
 
 
 def run_cli(argv: list[str] | None = None) -> None:

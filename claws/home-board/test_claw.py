@@ -69,6 +69,59 @@ class HomeBoardClawTest(unittest.TestCase):
         self.assertIn("Today at Home:", message)
         self.assertIn("Nysha: Take your journal", message)
 
+    def test_done_followup_marks_last_item_done(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claw = HomeBoardClaw.from_provider(
+                SQLiteHomeBoardProvider(Path(tmpdir) / "n4os.db"),
+            )
+
+            with redirect_stdout(StringIO()):
+                claw.add_item_from_request(
+                    "Nysha, take your journal today",
+                    reference_time=REFERENCE_TIME,
+                )
+                message = claw.mark_done_from_request("done")
+            pending = claw.tools.list_items(date="2026-07-03", now=REFERENCE_TIME)
+
+        self.assertIn("marked done", message)
+        self.assertEqual(pending["data"]["items"], [])
+
+    def test_undo_reverts_last_added_notice(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claw = HomeBoardClaw.from_provider(
+                SQLiteHomeBoardProvider(Path(tmpdir) / "n4os.db"),
+            )
+
+            with redirect_stdout(StringIO()):
+                claw.add_item_from_request(
+                    "Nysha, take your journal today",
+                    reference_time=REFERENCE_TIME,
+                )
+                message = claw.undo_last_action()
+            pending = claw.tools.list_items(date="2026-07-03", now=REFERENCE_TIME)
+
+        self.assertIn("Undid Home Board add", message)
+        self.assertEqual(pending["data"]["items"], [])
+
+    def test_undo_reverts_done_followup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            claw = HomeBoardClaw.from_provider(
+                SQLiteHomeBoardProvider(Path(tmpdir) / "n4os.db"),
+            )
+
+            with redirect_stdout(StringIO()):
+                claw.add_item_from_request(
+                    "Nysha, take your journal today",
+                    reference_time=REFERENCE_TIME,
+                )
+                claw.mark_done_from_request("done")
+                message = claw.undo_last_action()
+            pending = claw.tools.list_items(date="2026-07-03", now=REFERENCE_TIME)
+
+        self.assertIn("Undid Home Board done", message)
+        self.assertEqual(len(pending["data"]["items"]), 1)
+        self.assertEqual(pending["data"]["items"][0]["status"], "pending")
+
 
 if __name__ == "__main__":
     unittest.main()

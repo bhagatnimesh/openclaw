@@ -1266,6 +1266,7 @@
                   "plugins/llama-cpp",
                   "plugins/memory-lancedb",
                   "plugins/oc-path",
+                  "plugins/science-lab",
                   "plugins/zalouser"
                 ]
               },

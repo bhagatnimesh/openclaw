@@ -297,9 +297,7 @@ def build_application(config: TelegramConfig) -> Any:
     application = Application.builder().token(config.token).build()
     application.add_handler(CommandHandler("start", bot.handle_help))
     application.add_handler(CommandHandler("help", bot.handle_help))
-    application.add_handler(
-        MessageHandler(filters.ALL & ~filters.COMMAND, bot.handle_message),
-    )
+    application.add_handler(MessageHandler(filters.ALL, bot.handle_message))
     return application
 
 
