@@ -288,6 +288,26 @@ class FakeScienceLabClaw:
         return "Science Lab plan:\n1. Ice Cream in a Bag"
 
 
+class FakeLibraryClaw:
+    def __init__(self):
+        self.calls = []
+
+    def record_from_request(self, request, reference_time=None):
+        self.calls.append(("record", request, reference_time))
+        print("Saved. Nysha's Reading Garden grew a new leaf.")
+        return "Saved. Nysha's Reading Garden grew a new leaf."
+
+    def status_from_request(self, request="", reference_time=None):
+        self.calls.append(("status", request, reference_time))
+        print("I read myself today. This week: 1 reading moments, 8 pages, 0 minutes.")
+        return "I read myself today. This week: 1 reading moments, 8 pages, 0 minutes."
+
+    def checkout_from_request(self, request, reference_time=None):
+        self.calls.append(("checkout", request, reference_time))
+        print("Saved this library bag with 2 books at home.")
+        return "Saved this library bag with 2 books at home."
+
+
 class FakeIntentInterpreter:
     def __init__(self, *frames):
         self.frames = list(frames)
@@ -1560,7 +1580,7 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(decision["route"], "unknown")
         self.assertIn(
-            "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, or Calendar + Tasks?",
+            "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?",
             output.getvalue(),
         )
         self.assertEqual(calendar.calls, [])
@@ -1607,6 +1627,102 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(tasks.calls, [])
         self.assertEqual(home_board.calls, [])
         self.assertEqual(decisions.calls, [])
+
+    def test_routes_library_reading_event_without_family_clarification(self):
+        decision = route_request(
+            "Nysha read 8 pages of Mercy Watson by herself.",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "library")
+        self.assertEqual(decision["intent_summary"], "Route to library for record_reading.")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_library_checkout_email_to_library(self):
+        request = "\n".join(
+            [
+                "Library checkout receipt",
+                "Due date: July 24, 2026",
+                "- Mercy Watson",
+                "- Frog and Toad",
+            ],
+        )
+
+        decision = route_request(request, now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "library")
+        self.assertEqual(decision["intent_summary"], "Route to library for record_checkout.")
+
+    def test_dispatches_library_reading_event_to_library_claw(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        home_board = FakeHomeBoardClaw()
+        decisions = FakeDecisionsClaw()
+        science_lab = FakeScienceLabClaw()
+        library = FakeLibraryClaw()
+        claw = N4OSClaw(
+            calendar_claw=calendar,
+            tasks_claw=tasks,
+            home_board_claw=home_board,
+            decisions_claw=decisions,
+            science_lab_claw=science_lab,
+            library_claw=library,
+        )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            decision = claw.handle_request(
+                "Nysha read 8 pages of Mercy Watson by herself.",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "library")
+        self.assertIn("Reading Garden grew", output.getvalue())
+        self.assertEqual(
+            library.calls,
+            [("record", "Nysha read 8 pages of Mercy Watson by herself.", REFERENCE_TIME)],
+        )
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [])
+        self.assertEqual(home_board.calls, [])
+        self.assertEqual(decisions.calls, [])
+        self.assertEqual(science_lab.calls, [])
+
+    def test_dispatches_library_checkout_email_to_library_claw(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        home_board = FakeHomeBoardClaw()
+        decisions = FakeDecisionsClaw()
+        science_lab = FakeScienceLabClaw()
+        library = FakeLibraryClaw()
+        claw = N4OSClaw(
+            calendar_claw=calendar,
+            tasks_claw=tasks,
+            home_board_claw=home_board,
+            decisions_claw=decisions,
+            science_lab_claw=science_lab,
+            library_claw=library,
+        )
+        request = "\n".join(
+            [
+                "Library checkout receipt",
+                "- Mercy Watson",
+                "- Frog and Toad",
+            ],
+        )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "library")
+        self.assertIn("library bag", output.getvalue())
+        self.assertEqual(library.calls, [("checkout", request, REFERENCE_TIME)])
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [])
+        self.assertEqual(home_board.calls, [])
+        self.assertEqual(decisions.calls, [])
+        self.assertEqual(science_lab.calls, [])
 
     def test_route_clarification_dispatches_original_request(self):
         calendar = FakeCalendarClaw()

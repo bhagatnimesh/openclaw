@@ -159,7 +159,39 @@ class FakeDecisionTools:
         }
 
 
-def sources(events=None, tasks=None, home_board_items=None, decisions=None):
+class FakeReadingGardenTools:
+    def __init__(self, summary=None):
+        self.summary = summary or {
+            "title": "Nysha’s Reading Garden: I Read It Myself",
+            "child": "Nysha",
+            "today": {"read": False, "label": "Not yet today"},
+            "current_book": "unknown book",
+            "week": {"reading_moments": 0, "pages": 0, "minutes": 0},
+            "finished": {"count": 0, "recent_books": []},
+            "favorite_reaction": "",
+            "recent_photos": [],
+            "garden": {"sprouts": 0, "leaves": 0, "flowers": 0, "butterflies": 0},
+            "recent_events": [],
+            "library_visit": {
+                "has_visit": False,
+                "last_visit_date": "",
+                "days_since_visit": None,
+                "state": "empty",
+                "label": "Paste a library checkout email to start your library bag.",
+                "due_date": "",
+            },
+            "current_bag": {"count": 0, "titles": [], "due_date": ""},
+        }
+
+    def status(self, now=None):
+        return {
+            "status": "ok",
+            "message": "Reading Garden returned.",
+            "data": {"summary": self.summary},
+        }
+
+
+def sources(events=None, tasks=None, home_board_items=None, decisions=None, reading_garden=None):
     return DashboardSources(
         calendar_tools=FakeCalendarTools(events or []),
         task_tools=FakeTaskTools(tasks or []),
@@ -168,6 +200,7 @@ def sources(events=None, tasks=None, home_board_items=None, decisions=None):
         recommend_task_matches=fallback_recommend_task_matches,
         home_board_tools=FakeHomeBoardTools(home_board_items),
         decision_tools=FakeDecisionTools(decisions),
+        reading_garden_tools=FakeReadingGardenTools(reading_garden),
     )
 
 
@@ -348,6 +381,46 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data["tasks"]["pending"], [])
         self.assertEqual(data["planning"]["items"], [])
         self.assertEqual(data["best_next_action"]["source"], "empty")
+
+    def test_dashboard_includes_reading_garden_summary(self):
+        data = build_dashboard_data(
+            sources(
+                reading_garden={
+                    "title": "Nysha’s Reading Garden: I Read It Myself",
+                    "child": "Nysha",
+                    "today": {"read": True, "label": "I read myself today"},
+                    "current_book": "Mercy Watson",
+                    "week": {"reading_moments": 2, "pages": 8, "minutes": 12},
+                    "finished": {"count": 1, "recent_books": ["Elephant and Piggie"]},
+                    "favorite_reaction": "She liked the funny pig.",
+                    "recent_photos": [{"path": "uploads/reading/cover.jpg", "book": "Mercy Watson"}],
+                    "garden": {"sprouts": 1, "leaves": 1, "flowers": 1, "butterflies": 1},
+                    "recent_events": [],
+                    "library_visit": {
+                        "has_visit": True,
+                        "last_visit_date": "2026-07-01",
+                        "days_since_visit": 2,
+                        "state": "enjoy",
+                        "label": "Enjoy this library bag.",
+                        "due_date": "2026-07-22",
+                    },
+                    "current_bag": {
+                        "count": 2,
+                        "titles": ["Mercy Watson", "Frog and Toad"],
+                        "due_date": "2026-07-22",
+                    },
+                },
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        garden = data["reading_garden"]
+        self.assertEqual(garden["today"]["label"], "I read myself today")
+        self.assertEqual(garden["current_book"], "Mercy Watson")
+        self.assertEqual(garden["week"]["pages"], 8)
+        self.assertEqual(garden["finished"]["recent_books"], ["Elephant and Piggie"])
+        self.assertEqual(garden["library_visit"]["label"], "Enjoy this library bag.")
+        self.assertEqual(garden["current_bag"]["count"], 2)
 
     def test_complete_dashboard_task_updates_google_task_source(self):
         task_tools = FakeTaskTools(
@@ -627,8 +700,14 @@ class DashboardServerRouteTest(unittest.TestCase):
                     self.assertIn("N4OS Family Chief of Staff", body)
                     self.assertNotIn("{{ACTION_TOKEN}}", body)
                     self.assertIn('href="#decisions"', body)
+                    self.assertIn('href="#library"', body)
+                    self.assertIn('id="library"', body)
+                    self.assertIn('id="library-visit-label"', body)
+                    self.assertIn('id="library-bag-list"', body)
                     self.assertIn('id="decision-items"', body)
                     self.assertIn('id="pending-task-items"', body)
+                    self.assertLess(body.index('id="tasks"'), body.index('id="library"'))
+                    self.assertLess(body.index('id="library"'), body.index('id="family"'))
                     self.assertIn('id="screen-status"', body)
                     self.assertIn('id="screen-wake-button"', body)
         finally:

@@ -10,4 +10,4 @@ Use Calendar + Tasks for planning and briefings that need commitments and open l
 When routing confidence is low, ask a short clarification before calling a claw.
 """.strip()
 
-CLARIFICATION_PROMPT = "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, or Calendar + Tasks?"
+CLARIFICATION_PROMPT = "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?"

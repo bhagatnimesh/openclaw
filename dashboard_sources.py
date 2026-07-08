@@ -35,6 +35,7 @@ class DashboardSources:
     recommend_task_matches: TaskRecommender
     home_board_tools: Any | None = None
     decision_tools: Any | None = None
+    reading_garden_tools: Any | None = None
 
 
 _DEFAULT_SOURCES: DashboardSources | None = None
@@ -76,6 +77,11 @@ class _UnavailableHomeBoardTools(_UnavailableSourceTools):
 
 class _UnavailableDecisionTools(_UnavailableSourceTools):
     def list_decisions(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+
+class _UnavailableLibraryTools(_UnavailableSourceTools):
+    def status(self, **_kwargs: Any) -> dict[str, Any]:
         return self._response()
 
 
@@ -142,6 +148,11 @@ def build_default_sources() -> DashboardSources:
     except Exception as error:
         decision_tools = _UnavailableDecisionTools("Decisions", error)
 
+    try:
+        reading_garden_tools = build_default_library_tools()
+    except Exception as error:
+        reading_garden_tools = _UnavailableLibraryTools("Reading Garden", error)
+
     return DashboardSources(
         calendar_tools=calendar_tools,
         task_tools=task_tools,
@@ -150,6 +161,7 @@ def build_default_sources() -> DashboardSources:
         recommend_task_matches=recommend_task_matches,
         home_board_tools=home_board_tools,
         decision_tools=decision_tools,
+        reading_garden_tools=reading_garden_tools,
     )
 
 
@@ -173,6 +185,16 @@ def build_default_decision_tools() -> Any:
         )
 
 
+def build_default_library_tools() -> Any:
+    library_dir = ROOT / "claws" / "library"
+    with _isolated_claw_import(library_dir):
+        library_tools_module = importlib.import_module("tools")
+        library_provider_module = importlib.import_module("provider")
+        return library_tools_module.LibraryTools(
+            library_provider_module.SQLiteLibraryProvider(),
+        )
+
+
 def default_sources() -> DashboardSources:
     global _DEFAULT_SOURCES
     with _DEFAULT_SOURCES_LOCK:
@@ -192,6 +214,7 @@ def _has_unavailable_source(sources: DashboardSources) -> bool:
             sources.task_tools,
             sources.home_board_tools,
             sources.decision_tools,
+            sources.reading_garden_tools,
         )
     )
 

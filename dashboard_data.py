@@ -783,6 +783,7 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
         "planning": {"items": []},
         "home_board": {"today": []},
         "decisions": {"open": [], "attention": []},
+        "reading_garden": _empty_reading_garden(now.date()),
         "family": {
             "members": [],
             "responsibilities": [],
@@ -791,6 +792,54 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "prep_gaps": [],
         },
     }
+
+
+def _empty_reading_garden(today: date) -> dict[str, Any]:
+    del today
+    return {
+        "title": "Nysha’s Reading Garden: I Read It Myself",
+        "child": "Nysha",
+        "today": {"read": False, "label": "Not yet today"},
+        "current_book": "unknown book",
+        "week": {"reading_moments": 0, "pages": 0, "minutes": 0},
+        "finished": {"count": 0, "recent_books": []},
+        "favorite_reaction": "",
+        "recent_photos": [],
+        "garden": {"sprouts": 0, "leaves": 0, "flowers": 0, "butterflies": 0},
+        "recent_events": [],
+        "library_visit": {
+            "has_visit": False,
+            "last_visit_date": "",
+            "days_since_visit": None,
+            "state": "empty",
+            "label": "Paste a library checkout email to start your library bag.",
+            "due_date": "",
+        },
+        "current_bag": {"count": 0, "titles": [], "due_date": ""},
+    }
+
+
+def _reading_garden_summary(
+    sources: DashboardSources,
+    local_now: datetime,
+) -> tuple[dict[str, Any], list[str]]:
+    tools = sources.reading_garden_tools
+    if tools is None:
+        return _empty_reading_garden(local_now.date()), []
+    try:
+        response = tools.status(now=local_now)
+    except Exception as error:
+        response = _source_error_response("Reading Garden", error)
+
+    if response.get("status") != "ok":
+        return (
+            _empty_reading_garden(local_now.date()),
+            [response.get("message", "Reading Garden source unavailable.")],
+        )
+    summary = response.get("data", {}).get("summary")
+    if not isinstance(summary, dict):
+        return _empty_reading_garden(local_now.date()), []
+    return summary, []
 
 
 def build_dashboard_data(
@@ -831,6 +880,8 @@ def build_dashboard_data(
         local_now.date(),
     )
     source_warnings.extend(decision_warnings)
+    reading_garden, reading_warnings = _reading_garden_summary(sources, local_now)
+    source_warnings.extend(reading_warnings)
 
     if calendar_response.get("status") != "ok":
         calendar_unavailable = True
@@ -980,6 +1031,7 @@ def build_dashboard_data(
             "open": open_decisions[:12],
             "attention": attention_decisions,
         },
+        "reading_garden": reading_garden,
         "family": {
             "members": family["members"],
             "responsibilities": family["responsibilities"],
@@ -1007,6 +1059,7 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
                 recommend_task_matches=lambda tasks, filters, limit: [],
                 home_board_tools=build_default_home_board_tools(),
                 decision_tools=None,
+                reading_garden_tools=None,
             )
             items, warnings = _home_board_today(
                 home_board_sources,

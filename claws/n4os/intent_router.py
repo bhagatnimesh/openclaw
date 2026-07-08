@@ -17,6 +17,7 @@ Route = Literal[
     "home_board",
     "decisions",
     "science_lab",
+    "library",
     "both",
     "unknown",
 ]
@@ -38,6 +39,7 @@ VALID_ROUTES = {
     "home_board",
     "decisions",
     "science_lab",
+    "library",
     "both",
     "unknown",
 }
@@ -91,6 +93,13 @@ DECISION_UPDATE_INTENTS = {
     "add_next_step",
     "record_decision",
 }
+LIBRARY_INTENTS = {
+    "record_reading",
+    "record_checkout",
+    "status",
+    "clarify",
+    "not_counted",
+}
 
 LOCAL_MODULES = (
     "constants",
@@ -109,6 +118,7 @@ TASKS_ROOT = CLAW_ROOT / "family-tasks"
 HOME_BOARD_ROOT = CLAW_ROOT / "home-board"
 DECISIONS_ROOT = CLAW_ROOT / "family-decisions"
 SCIENCE_LAB_ROOT = CLAW_ROOT / "science-lab"
+LIBRARY_ROOT = CLAW_ROOT / "library"
 TASK_CUE_RE = re.compile(r"\b(tasks?|todos?|to-dos?|open loops?)\b")
 EXPLICIT_CLOCK_TIME_RE = re.compile(
     r"\b(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|"
@@ -262,15 +272,20 @@ def _decisions_intent_module() -> ModuleType:
     return load_scoped_module("_n4os_family_decisions_intent", DECISIONS_ROOT, "intent.py")
 
 
+def _library_intent_module() -> ModuleType:
+    return load_scoped_module("_n4os_library_intent", LIBRARY_ROOT, "intent.py")
+
+
 def _extract_intents(
     request: str,
     now: datetime | None,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     calendar_intent = _calendar_intent_module().extract_intent(request, now=now)
     task_intent = _tasks_intent_module().extract_intent(request, now=now)
     home_board_intent = _home_board_intent_module().extract_intent(request, now=now)
     decision_intent = _decisions_intent_module().extract_intent(request, now=now)
-    return calendar_intent, task_intent, home_board_intent, decision_intent
+    library_intent = _library_intent_module().extract_intent(request, now=now)
+    return calendar_intent, task_intent, home_board_intent, decision_intent, library_intent
 
 
 def _has_time_anchor(text: str) -> bool:
@@ -491,6 +506,31 @@ def _score_science_lab(text: str) -> float:
     return max(0.0, min(score, 1.0))
 
 
+def _score_library(text: str, library_intent: dict[str, Any]) -> float:
+    score = 0.0
+    intent = library_intent.get("intent")
+    if intent in LIBRARY_INTENTS:
+        score += 0.5
+    if re.search(r"\b(reading garden|read it myself|library claw|reading status)\b", text):
+        score += 0.45
+    if re.search(r"\b(library bag|library checkout|checked out|checkout receipt|library receipt|due date|due by)\b", text):
+        score += 0.5
+    if intent == "record_checkout":
+        score += 0.25
+    if re.search(r"\bnysha\b", text) and re.search(r"\b(read|finished|pages?|minutes?|book)\b", text):
+        score += 0.45
+    if re.search(r"\b(by herself|herself|independently|i read it myself)\b", text):
+        score += 0.25
+    if re.search(r"\b(dad|mom|adult)\s+read\b.*\bto\s+nysha\b", text):
+        score += 0.35
+    if re.search(
+        r"\b(tasks?|todos?|calendar|event|appointment|home board|today at home|decisions?|science lab)\b",
+        text,
+    ):
+        score -= 0.25
+    return max(0.0, min(score, 1.0))
+
+
 def _is_explicit_decision_request(text: str, decision_intent: dict[str, Any]) -> bool:
     intent = decision_intent.get("intent")
     if intent not in DECISION_INTENTS:
@@ -530,6 +570,7 @@ def _summary(
     calendar_intent: dict[str, Any],
     task_intent: dict[str, Any],
     decision_intent: dict[str, Any] | None = None,
+    library_intent: dict[str, Any] | None = None,
 ) -> str:
     if route == "calendar":
         return f"Route to family-calendar for {calendar_intent.get('intent', 'calendar request')}."
@@ -542,11 +583,14 @@ def _summary(
         return f"Route to family-decisions for {intent}."
     if route == "science_lab":
         return "Route to science-lab for experiment planning."
+    if route == "library":
+        intent = (library_intent or {}).get("intent", "reading request")
+        return f"Route to library for {intent}."
     if route == "both":
         return (
             "Route to family-calendar and family-tasks for combined planning or briefing."
         )
-    return "Could not confidently choose Calendar, Tasks, Home Board, Decisions, or Calendar + Tasks."
+    return "Could not confidently choose Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
 
 
 def _action_for_route(
@@ -555,6 +599,7 @@ def _action_for_route(
     task_intent: dict[str, Any],
     home_board_intent: dict[str, Any],
     decision_intent: dict[str, Any],
+    library_intent: dict[str, Any],
 ) -> str:
     if route == "calendar":
         return str(calendar_intent.get("intent") or "calendar_request")
@@ -566,6 +611,8 @@ def _action_for_route(
         return str(decision_intent.get("intent") or "decision_request")
     if route == "science_lab":
         return "plan_experiments"
+    if route == "library":
+        return str(library_intent.get("intent") or "library_request")
     if route == "both":
         return "combined_planning"
     return "unknown"
@@ -582,9 +629,11 @@ def _frame_summary(frame: N4OSIntentFrame) -> str:
         return f"Route to family-decisions for {frame.action}."
     if frame.route == "science_lab":
         return f"Route to science-lab for {frame.action}."
+    if frame.route == "library":
+        return f"Route to library for {frame.action}."
     if frame.route == "both":
         return "Route to family-calendar and family-tasks for combined planning or briefing."
-    return frame.clarification_question or "Could not confidently choose Calendar, Tasks, Home Board, Decisions, or Calendar + Tasks."
+    return frame.clarification_question or "Could not confidently choose Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
 
 
 def _round_confidence(value: Any) -> float:
@@ -754,10 +803,13 @@ def _rule_intent_frame(
     now: datetime | None = None,
     context: dict[str, Any] | None = None,
 ) -> N4OSIntentFrame:
-    calendar_intent, task_intent, home_board_intent, decision_intent = _extract_intents(
-        request,
-        now,
-    )
+    (
+        calendar_intent,
+        task_intent,
+        home_board_intent,
+        decision_intent,
+        library_intent,
+    ) = _extract_intents(request, now)
     text = _routing_text(request)
     if not text:
         return N4OSIntentFrame(
@@ -787,6 +839,7 @@ def _rule_intent_frame(
                 task_intent,
                 home_board_intent,
                 decision_intent,
+                library_intent,
             ),
             confidence=0.95,
             normalized_request=request,
@@ -831,6 +884,22 @@ def _rule_intent_frame(
             normalized_request=request,
         )
 
+    library_score = _score_library(text, library_intent)
+    if library_score >= LOW_CONFIDENCE_THRESHOLD:
+        return N4OSIntentFrame(
+            route="library",
+            action=_action_for_route(
+                "library",
+                calendar_intent,
+                task_intent,
+                home_board_intent,
+                decision_intent,
+                library_intent,
+            ),
+            confidence=round(library_score, 2),
+            normalized_request=request,
+        )
+
     if (
         task_intent.get("intent") == "create_task"
         and _has_assistant_help_metadata(task_intent)
@@ -843,6 +912,7 @@ def _rule_intent_frame(
                 task_intent,
                 home_board_intent,
                 decision_intent,
+                library_intent,
             ),
             confidence=0.95,
             normalized_request=request,
@@ -853,6 +923,7 @@ def _rule_intent_frame(
     home_board_score = _score_home_board(text, home_board_intent)
     decision_score = _score_decisions(text, decision_intent)
     science_lab_score = _score_science_lab(text)
+    library_score = _score_library(text, library_intent)
 
     scores: dict[Route, float] = {
         "calendar": calendar_score,
@@ -860,6 +931,7 @@ def _rule_intent_frame(
         "home_board": home_board_score,
         "decisions": decision_score,
         "science_lab": science_lab_score,
+        "library": library_score,
     }
     best_route = max(scores, key=scores.get)
     confidence = scores[best_route]
@@ -884,11 +956,12 @@ def _rule_intent_frame(
             task_intent,
             home_board_intent,
             decision_intent,
+            library_intent,
         ),
         confidence=round(confidence, 2),
         normalized_request=request,
         clarification_question=(
-            "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, or Calendar + Tasks?"
+            "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?"
             if route == "unknown"
             else None
         ),

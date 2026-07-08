@@ -19,6 +19,7 @@
           <a href="#planning">Planning</a>
           <a href="#decisions">Decisions</a>
           <a href="#tasks">Tasks</a>
+          <a href="#library">Library</a>
           <a href="#family">Family</a>
         </nav>
         <section class="status-panel" aria-live="polite">
@@ -159,6 +160,112 @@
             <h3>Context Lanes</h3>
           </div>
           <div id="task-groups" class="task-grid"></div>
+        </section>
+
+        <section id="library" class="section">
+          <div class="section-title">
+            <h2>Library</h2>
+            <span></span>
+          </div>
+          <div class="library-page">
+            <article class="reading-hero">
+              <div class="reading-hero-copy">
+                <p class="eyebrow">I Read It Myself</p>
+                <h2 id="reading-garden-title">Nysha’s Reading Garden: I Read It Myself</h2>
+                <p id="reading-hero-message" class="reading-hero-message">Every reading moment helps the garden grow.</p>
+                <div class="reading-hero-actions">
+                  <span id="reading-today-label">Not yet today</span>
+                  <span id="reading-hero-week">0 moments this week</span>
+                </div>
+              </div>
+              <div class="reading-garden-visual" aria-label="Reading Garden visual">
+                <div id="reading-garden-plot" class="reading-garden-plot"></div>
+              </div>
+            </article>
+
+            <div class="reading-library-grid">
+              <div class="reading-library-main">
+                <article class="reading-current-card">
+                  <div class="reading-book-cover" aria-hidden="true">
+                    <span>Read</span>
+                  </div>
+                  <div>
+                    <p class="reading-current-label">Current adventure</p>
+                    <h3 id="reading-current-book">unknown book</h3>
+                    <p id="reading-favorite-reaction" class="reading-reaction"></p>
+                    <div class="reading-current-progress">
+                      <span id="reading-current-detail">Latest independent reading book</span>
+                      <div class="reading-progress-bar" aria-hidden="true"><div id="reading-progress-fill"></div></div>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="panel reading-growth-panel">
+                  <div class="panel-header">
+                    <h3>Weekly Growth</h3>
+                    <span>This week</span>
+                  </div>
+                  <div class="reading-metrics" aria-label="Reading Garden weekly summary">
+                    <div><strong id="reading-week-moments">0</strong><span>Reading moments</span></div>
+                    <div><strong id="reading-week-pages">0</strong><span>Pages explored</span></div>
+                    <div><strong id="reading-week-minutes">0</strong><span>Happy minutes</span></div>
+                    <div><strong id="reading-finished-count">0</strong><span>Books finished</span></div>
+                  </div>
+                </article>
+
+                <article class="panel reading-moments-panel">
+                  <div class="panel-header">
+                    <h3>Recent Reading Moments</h3>
+                    <span id="reading-moment-count">0 moments</span>
+                  </div>
+                  <div id="reading-recent-events" class="reading-event-list"></div>
+                </article>
+              </div>
+
+              <aside class="reading-library-side">
+                <article class="panel reading-visit-panel">
+                  <div class="panel-header">
+                    <h3>Library Visit</h3>
+                    <span id="library-visit-days">Not started</span>
+                  </div>
+                  <p id="library-visit-label" class="library-visit-message">Paste a library checkout email to start your library bag.</p>
+                  <p id="library-due-date" class="library-due-date"></p>
+                </article>
+
+                <article class="panel reading-bag-panel">
+                  <div class="panel-header">
+                    <h3>Current Library Bag</h3>
+                    <span id="library-bag-count">0 books</span>
+                  </div>
+                  <div id="library-bag-list" class="library-bag-list"></div>
+                </article>
+
+                <article class="panel reading-bloomed-panel">
+                  <div class="panel-header">
+                    <h3>Recently Bloomed</h3>
+                    <span id="reading-bloomed-count">0</span>
+                  </div>
+                  <div id="reading-finished-books" class="reading-mini-list"></div>
+                </article>
+
+                <article class="panel reading-photos-panel">
+                  <div class="panel-header">
+                    <h3>Book Snaps</h3>
+                    <span id="reading-photo-count">0</span>
+                  </div>
+                  <div id="reading-photo-list" class="reading-photo-grid"></div>
+                </article>
+              </aside>
+            </div>
+
+            <article class="panel reading-collection-panel">
+              <div class="panel-header">
+                <h3>My Book Collection</h3>
+                <span id="reading-collection-count">0 books</span>
+              </div>
+              <div id="reading-book-collection" class="reading-book-collection"></div>
+            </article>
+          </div>
         </section>
 
         <section id="family" class="section">

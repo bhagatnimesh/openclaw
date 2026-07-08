@@ -12,6 +12,7 @@ try:
         CALENDAR_ROOT,
         DECISIONS_ROOT,
         HOME_BOARD_ROOT,
+        LIBRARY_ROOT,
         LOW_CONFIDENCE_THRESHOLD,
         N4OSIntentFrame,
         SCIENCE_LAB_ROOT,
@@ -28,6 +29,7 @@ except ImportError:
         CALENDAR_ROOT,
         DECISIONS_ROOT,
         HOME_BOARD_ROOT,
+        LIBRARY_ROOT,
         LOW_CONFIDENCE_THRESHOLD,
         N4OSIntentFrame,
         SCIENCE_LAB_ROOT,
@@ -76,6 +78,10 @@ def _decisions_module() -> Any:
 
 def _science_lab_module() -> Any:
     return load_scoped_module("_n4os_science_lab_claw", SCIENCE_LAB_ROOT, "claw.py")
+
+
+def _library_module() -> Any:
+    return load_scoped_module("_n4os_library_claw", LIBRARY_ROOT, "claw.py")
 
 
 def _is_day_briefing_request(request: str) -> bool:
@@ -287,6 +293,8 @@ def _clarified_route(request: str) -> str | None:
         return "decisions"
     if normalized in ("science lab", "science", "experiments", "use science lab"):
         return "science_lab"
+    if normalized in ("library", "reading garden", "use library"):
+        return "library"
     if normalized in ("both", "calendar and tasks", "tasks and calendar"):
         return "both"
     return None
@@ -345,7 +353,7 @@ def _is_confident_new_route(decision: dict[str, Any], pending_owner: str) -> boo
     route = decision.get("route")
     confidence = float(decision.get("confidence") or 0)
     return (
-        route in ("calendar", "tasks", "home_board", "decisions", "science_lab", "both")
+        route in ("calendar", "tasks", "home_board", "decisions", "science_lab", "library", "both")
         and route != pending_owner
         and confidence >= LOW_CONFIDENCE_THRESHOLD
     )
@@ -375,6 +383,8 @@ def _clarified_route_action(
         return str(_decisions_module().extract_intent(request, now=reference_time)["intent"])
     if route == "science_lab":
         return "science_lab"
+    if route == "library":
+        return str(_library_module().extract_intent(request, now=reference_time)["intent"])
     if route == "both":
         return "calendar_and_tasks"
     return "unknown"
@@ -402,6 +412,7 @@ class N4OSClaw:
     home_board_claw: Any | None = None
     decisions_claw: Any | None = None
     science_lab_claw: Any | None = None
+    library_claw: Any | None = None
     system_prompt: str = SYSTEM_PROMPT
     intent_interpreter: Any | None = None
     pending_route_clarification: PendingRouteClarification | None = None
@@ -591,6 +602,8 @@ class N4OSClaw:
             self._remember_mutation_route("decisions", before, self.decisions_claw)
         if decision["route"] == "science_lab":
             self._handle_science_lab_request(dispatch_request)
+        if decision["route"] == "library":
+            self._handle_library_request(dispatch_request, reference_time, action=action)
 
     def _remember_mutation_route(
         self,
@@ -679,6 +692,12 @@ class N4OSClaw:
             with module_scope(SCIENCE_LAB_ROOT):
                 self.science_lab_claw = _science_lab_module().ScienceLabClaw.default()
         return self.science_lab_claw
+
+    def _library(self) -> Any:
+        if self.library_claw is None:
+            with module_scope(LIBRARY_ROOT):
+                self.library_claw = _library_module().LibraryClaw.default()
+        return self.library_claw
 
     def _handle_calendar_request(
         self,
@@ -791,6 +810,20 @@ class N4OSClaw:
 
     def _handle_science_lab_request(self, request: str) -> None:
         self._science_lab().plan_from_request(request)
+
+    def _handle_library_request(
+        self,
+        request: str,
+        reference_time: datetime | None,
+        action: str | None = None,
+    ) -> None:
+        claw = self._library()
+        if action == "status":
+            claw.status_from_request(request, reference_time=reference_time)
+        elif action == "record_checkout":
+            claw.checkout_from_request(request, reference_time=reference_time)
+        else:
+            claw.record_from_request(request, reference_time=reference_time)
 
     def _handle_day_briefing(
         self,

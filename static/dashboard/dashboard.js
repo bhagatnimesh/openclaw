@@ -99,6 +99,13 @@
     return hour12 + ":" + String(minute).padStart(2, "0") + " " + period;
   }
 
+  function formatPlainDate(value) {
+    if (!value) return "";
+    var date = new Date(value + "T00:00:00");
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+
   function parseWakeLockPolicy() {
     var raw = text(getQueryParam("wake"), defaultWakeLockWindow).trim().toLowerCase();
     if (raw === "off" || raw === "false" || raw === "0") {
@@ -362,6 +369,219 @@
         "</div></section>"
       );
     }).join("");
+  }
+
+  function gardenToken(className, label) {
+    return '<span class="garden-token ' + escapeHtml(className) + '" aria-label="' + escapeHtml(label) + '"></span>';
+  }
+
+  function gardenTokens(count, className, label, maxCount) {
+    var total = Math.max(0, Math.min(Number(count || 0), maxCount));
+    var html = "";
+    for (var index = 0; index < total; index += 1) {
+      html += gardenToken(className, label);
+    }
+    return html;
+  }
+
+  function readingEventDetail(event) {
+    var parts = [];
+    if (event.pages) parts.push(event.pages + " pages");
+    if (event.minutes) parts.push(event.minutes + " minutes");
+    if (event.status === "completed") parts.push("finished");
+    if (!parts.length) parts.push("reading moment");
+    return parts.join(" | ");
+  }
+
+  function readingCollectionBooks(data) {
+    var finished = data.finished || {};
+    var books = [];
+    var seen = {};
+    function addBook(title, status) {
+      var cleaned = text(title).trim();
+      var key = cleaned.toLowerCase();
+      if (!cleaned || cleaned === "unknown book" || seen[key]) return;
+      seen[key] = true;
+      books.push({ title: cleaned, status: status });
+    }
+    addBook(data.current_book, "Current");
+    (finished.recent_books || []).forEach(function (book) {
+      addBook(book, "Finished");
+    });
+    (data.recent_events || []).forEach(function (event) {
+      addBook(event.book, event.status === "completed" ? "Finished" : "Reading");
+    });
+    return books;
+  }
+
+  function renderBookCollection(data) {
+    var node = byId("reading-book-collection");
+    var countNode = byId("reading-collection-count");
+    if (!node) return;
+    var books = readingCollectionBooks(data);
+    if (countNode) {
+      countNode.textContent = books.length + (books.length === 1 ? " book" : " books");
+    }
+    if (!books.length) {
+      node.innerHTML = empty("No books in the garden yet.");
+      return;
+    }
+    node.innerHTML = books.slice(0, 10).map(function (book, index) {
+      var initial = book.title.slice(0, 1).toUpperCase();
+      var tone = index % 3 === 0 ? "is-primary" : index % 3 === 1 ? "is-secondary" : "is-tertiary";
+      return (
+        '<div class="reading-book-tile"><div class="reading-book-mini-cover ' +
+        tone +
+        '"><span>' +
+        escapeHtml(initial) +
+        '</span></div><strong>' +
+        escapeHtml(book.title) +
+        '</strong><span>' +
+        escapeHtml(book.status) +
+        "</span></div>"
+      );
+    }).join("");
+  }
+
+  function renderReadingGarden(data) {
+    data = data || {};
+    var today = data.today || {};
+    var week = data.week || {};
+    var finished = data.finished || {};
+    var garden = data.garden || {};
+    var recentEvents = data.recent_events || [];
+    var currentBook = data.current_book || "unknown book";
+    var momentCount = Number(week.reading_moments || 0);
+    var pageCount = Number(week.pages || 0);
+    var minuteCount = Number(week.minutes || 0);
+    setText("reading-garden-title", data.title || "Nysha’s Reading Garden: I Read It Myself");
+    setText("reading-today-label", today.label || "Not yet today");
+    setText("reading-hero-week", momentCount + (momentCount === 1 ? " moment this week" : " moments this week"));
+    setText(
+      "reading-hero-message",
+      today.read
+        ? "Your garden grew today. Every page counts."
+        : "A reading moment can grow the garden today."
+    );
+    setText("reading-current-book", currentBook);
+    setText("reading-current-detail", currentBook === "unknown book" ? "Waiting for the next independent read" : "Latest independent reading book");
+    setText("reading-week-moments", momentCount);
+    setText("reading-week-pages", pageCount);
+    setText("reading-week-minutes", minuteCount);
+    setText("reading-finished-count", finished.count || 0);
+    setText("reading-moment-count", recentEvents.length + (recentEvents.length === 1 ? " moment" : " moments"));
+    setText("reading-bloomed-count", finished.count || 0);
+    var progress = Math.max(8, Math.min(100, (momentCount * 18) + (pageCount > 0 ? 18 : 0) + (minuteCount > 0 ? 14 : 0)));
+    var progressFill = byId("reading-progress-fill");
+    if (progressFill) {
+      progressFill.style.width = progress + "%";
+    }
+
+    var reactionNode = byId("reading-favorite-reaction");
+    if (reactionNode) {
+      reactionNode.textContent = data.favorite_reaction ? "Favorite discovery: " + data.favorite_reaction : "";
+      reactionNode.hidden = !data.favorite_reaction;
+    }
+
+    var plot = byId("reading-garden-plot");
+    if (plot) {
+      var plotHtml = [
+        gardenTokens(garden.sprouts, "is-sprout", "reading day sprout", 8),
+        gardenTokens(garden.leaves, "is-leaf", "five page leaf", 10),
+        gardenTokens(garden.flowers, "is-flower", "finished book flower", 8),
+        gardenTokens(garden.butterflies, "is-butterfly", "favorite discovery butterfly", 6),
+      ].join("");
+      plot.innerHTML = plotHtml || '<span class="garden-token is-soil" aria-label="garden soil"></span>';
+    }
+
+    var finishedNode = byId("reading-finished-books");
+    var recentBooks = finished.recent_books || [];
+    if (finishedNode) {
+      finishedNode.innerHTML = recentBooks.length
+        ? recentBooks.slice(0, 4).map(function (book) {
+            return (
+              '<div class="reading-bloomed-item"><span class="garden-token is-flower" aria-hidden="true"></span><div><strong>' +
+              escapeHtml(book) +
+              '</strong><span>I read it myself</span></div></div>'
+            );
+          }).join("")
+        : empty("No finished books yet.");
+    }
+
+    var photoNode = byId("reading-photo-list");
+    var photos = data.recent_photos || [];
+    setText("reading-photo-count", photos.length);
+    if (photoNode) {
+      photoNode.innerHTML = photos.length
+        ? photos.slice(0, 6).map(function (photo) {
+            var book = photo.book || "Book photo";
+            if (photo.path) {
+              return (
+                '<div class="reading-photo-item"><img src="' +
+                escapeHtml(photo.path) +
+                '" alt="' +
+                escapeHtml(book) +
+                '"><span>' +
+                escapeHtml(book) +
+                "</span></div>"
+              );
+            }
+            return listItem(book, "");
+          }).join("")
+        : empty("No book photos yet.");
+    }
+
+    var eventsNode = byId("reading-recent-events");
+    if (eventsNode) {
+      eventsNode.innerHTML = recentEvents.length
+        ? recentEvents.slice(0, 6).map(function (event) {
+            var title = event.book && event.book !== "unknown book" ? event.book : "Reading moment";
+            return (
+              '<div class="reading-event-item"><span class="garden-token is-sprout" aria-hidden="true"></span><div><strong>' +
+              escapeHtml(title) +
+              '</strong><span>' +
+              escapeHtml(readingEventDetail(event)) +
+              "</span></div></div>"
+            );
+          }).join("")
+        : empty("No recent reading moments yet.");
+    }
+
+    renderLibraryBag(data.library_visit || {}, data.current_bag || {});
+    renderBookCollection(data);
+  }
+
+  function renderLibraryBag(visit, bag) {
+    visit = visit || {};
+    bag = bag || {};
+    var count = Number(bag.count || 0);
+    var days = visit.days_since_visit;
+    var daysLabel = visit.has_visit
+      ? (days === 0 ? "Today" : days + (days === 1 ? " day ago" : " days ago"))
+      : "Not started";
+    setText("library-visit-days", daysLabel);
+    setText("library-visit-label", visit.label || "Paste a library checkout email to start your library bag.");
+    setText("library-bag-count", count + (count === 1 ? " book" : " books"));
+
+    var dueNode = byId("library-due-date");
+    var dueDate = bag.due_date || visit.due_date || "";
+    if (dueNode) {
+      dueNode.textContent = dueDate ? "Due " + formatPlainDate(dueDate) : "";
+      dueNode.hidden = !dueDate;
+    }
+
+    var listNode = byId("library-bag-list");
+    var titles = bag.titles || [];
+    if (!listNode) return;
+    listNode.innerHTML = titles.length
+      ? titles.slice(0, 12).map(function (title) {
+          return (
+            '<div class="library-bag-item"><span class="garden-token is-leaf" aria-hidden="true"></span><strong>' +
+            escapeHtml(title) +
+            "</strong></div>"
+          );
+        }).join("")
+      : empty("No library books saved yet.");
   }
 
   function renderSummary(data) {
@@ -754,6 +974,7 @@
     var calendar = data.calendar || {};
     setText("busy-day-label", calendar.busy_day ? calendar.busy_day.label : "");
     renderTimeline(calendar.today || []);
+    renderReadingGarden(data.reading_garden || {});
     renderHomeBoard(data.home_board ? data.home_board.today : []);
     renderPrep(calendar.prep_needed || []);
     renderWarnings(data.warnings || []);
