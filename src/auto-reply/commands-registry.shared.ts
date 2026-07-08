@@ -323,6 +323,24 @@ export function buildBuiltinChatCommands(
       ],
     }),
     defineChatCommand({
+      key: "decisions",
+      nativeName: "decisions",
+      nativeAliases: ["decision"],
+      description: "List or update pending decisions.",
+      textAliases: ["/decisions", "/decision"],
+      acceptsArgs: true,
+      category: "tools",
+      tier: "essential",
+      args: [
+        {
+          name: "request",
+          description: "Decision request text",
+          type: "string",
+          captureRemaining: true,
+        },
+      ],
+    }),
+    defineChatCommand({
       key: "allowlist",
       description: "List/add/remove allowlist entries.",
       textAlias: "/allowlist",

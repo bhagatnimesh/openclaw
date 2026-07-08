@@ -127,8 +127,21 @@ OBJECT_UPDATE_RE = re.compile(
     r"\b(?:assign|add|append|modify|edit|update|set|make|change|put)\b"
     r".*\b(?:owner|owned|for|note|notes|description|context|"
     r"noah|novah|assistant|help)\b|"
-    r"\b(?:owner|owned\s+by|notes?|description|context)\s*(?:is|are|:)\b|"
+    r"\b(?:owner|owned\s+by|notes?|description|context)\s*"
+    r"(?:(?:is|are)\b|:)|"
     r"\b(?:assign(?:ed)?\s+to|belongs\s+to)\b",
+    re.IGNORECASE,
+)
+TAG_UPDATE_TEXT_RE = re.compile(
+    r"^\s*(?:(?:add|append|set|update|put)\s+#[A-Za-z][A-Za-z0-9_-]*\b|"
+    r"(?:tags?|labels?)\s*:)",
+    re.IGNORECASE,
+)
+EXPLICIT_TASK_CREATE_TEXT_RE = re.compile(
+    r"^\s*(?:/task\s+|(?:please\s+)?"
+    r"(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
+    r"(?:add|create|capture|remember)\s+(?:an?\s+)?"
+    r"(?:task|todo|to-do|open loop)\b)",
     re.IGNORECASE,
 )
 
@@ -306,6 +319,10 @@ def _is_object_update_request(text: str) -> bool:
     return OBJECT_UPDATE_RE.search(text) is not None
 
 
+def _is_tag_update_request(text: str) -> bool:
+    return TAG_UPDATE_TEXT_RE.search(text) is not None
+
+
 def _is_create_task_request(task_intent: dict[str, Any]) -> bool:
     return task_intent.get("intent") == "create_task" and not task_intent.get(
         "missing_fields",
@@ -316,6 +333,10 @@ def _is_create_calendar_request(calendar_intent: dict[str, Any]) -> bool:
     return calendar_intent.get("intent") == "create_event" and not calendar_intent.get(
         "missing_fields",
     )
+
+
+def _is_explicit_task_create_text(text: str) -> bool:
+    return EXPLICIT_TASK_CREATE_TEXT_RE.search(text) is not None
 
 
 def _score_calendar(text: str, calendar_intent: dict[str, Any]) -> float:
@@ -377,6 +398,8 @@ def _score_tasks(text: str, task_intent: dict[str, Any]) -> float:
         score += 0.2
         if task_intent.get("filters"):
             score += 0.2
+    if intent == "recommend_tasks" and task_intent.get("filters", {}).get("tags"):
+        score += 0.25 if score > 0 else 0.65
 
     if _has_task_cue(text):
         score += 0.45
@@ -625,13 +648,38 @@ def _call_interpreter(
 def _contextual_followup_frame(
     request: str,
     context: dict[str, Any] | None,
+    *,
+    calendar_intent: dict[str, Any] | None = None,
+    task_intent: dict[str, Any] | None = None,
 ) -> N4OSIntentFrame | None:
     if not context:
         return None
 
     text = request.lower().strip(" .!?")
     last_route = str(context.get("last_route") or "")
+    if _is_tag_update_request(text) and last_route == "tasks":
+        return N4OSIntentFrame(
+            route="tasks",
+            action="update_task",
+            confidence=0.92,
+            followup_kind="modify_previous",
+            normalized_request=request,
+        )
+
     if _is_object_update_request(text) and last_route in {"calendar", "tasks"}:
+        if (
+            last_route == "tasks"
+            and task_intent is not None
+            and _is_create_task_request(task_intent)
+            and _is_explicit_task_create_text(text)
+        ):
+            return None
+        if (
+            last_route == "calendar"
+            and calendar_intent is not None
+            and _is_create_calendar_request(calendar_intent)
+        ):
+            return None
         return N4OSIntentFrame(
             route=cast(Route, last_route),
             action="update_event" if last_route == "calendar" else "update_task",
@@ -702,7 +750,12 @@ def _rule_intent_frame(
             clarification_question="Empty request.",
         )
 
-    context_frame = _contextual_followup_frame(request, context)
+    context_frame = _contextual_followup_frame(
+        request,
+        context,
+        calendar_intent=calendar_intent,
+        task_intent=task_intent,
+    )
     if context_frame is not None:
         return context_frame
 

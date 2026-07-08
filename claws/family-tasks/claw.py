@@ -7,7 +7,14 @@ import sys
 from typing import Any
 
 from constants import DEFAULT_TASK_LIST_ID
-from intent import OWNER_ALIAS_PATTERN, OWNER_ALIASES, extract_intent, read_metadata_from_notes
+from intent import (
+    OWNER_ALIAS_PATTERN,
+    OWNER_ALIASES,
+    extract_intent,
+    extract_tags,
+    normalize_tags,
+    read_metadata_from_notes,
+)
 from matcher import match_tasks
 from noah_assistant import (
     NoahResearchClient,
@@ -263,6 +270,12 @@ NOTE_UPDATE_RE = re.compile(
     r"(?:is|are|to|:)?\s+(?P<note>.+?)\s*$",
     re.IGNORECASE,
 )
+TAG_UPDATE_RE = re.compile(
+    r"^\s*(?:tags?|labels?)\s*:\s*"
+    r"(?P<tags>#?[A-Za-z][A-Za-z0-9_-]*"
+    r"(?:\s*,\s*#?[A-Za-z][A-Za-z0-9_-]*)*)\s*$",
+    re.IGNORECASE,
+)
 ASSISTANT_UPDATE_RE = re.compile(
     r"\b(?:add|ask|have|queue|put|set\s+up)?\s*"
     r"(?P<assistant>noah|novah|ai\s+assistant|assistant)\b"
@@ -277,6 +290,7 @@ PRONOUN_TARGETS = {"it", "this", "that", "this task", "that task", "the task"}
 class TaskUpdateRequest:
     owner: str | None = None
     note: str | None = None
+    tags: list[str] = field(default_factory=list)
     assistant_help_request: str | None = None
     target: str | None = None
 
@@ -311,6 +325,15 @@ def _note_from_request(request: str) -> str | None:
     return note or None
 
 
+def _tags_from_request(request: str) -> list[str]:
+    tags = extract_tags(request)
+    match = TAG_UPDATE_RE.search(request)
+    if match is not None:
+        candidates = re.split(r"[\s,]+", match.group("tags"))
+        tags = normalize_tags([*tags, *candidates])
+    return tags
+
+
 def _assistant_help_from_request(request: str) -> str | None:
     match = ASSISTANT_UPDATE_RE.search(request)
     if match is None:
@@ -329,12 +352,14 @@ def _assistant_help_from_request(request: str) -> str | None:
 def _task_update_from_request(request: str) -> TaskUpdateRequest | None:
     owner, target = _owner_from_request(request)
     note = _note_from_request(request)
+    tags = _tags_from_request(request)
     assistant_help = _assistant_help_from_request(request)
-    if owner is None and note is None and assistant_help is None:
+    if owner is None and note is None and not tags and assistant_help is None:
         return None
     return TaskUpdateRequest(
         owner=owner if owner != "unknown" else None,
         note=note,
+        tags=tags,
         assistant_help_request=assistant_help,
         target=target,
     )
@@ -344,6 +369,51 @@ def _append_human_note(notes: str, note: str) -> str:
     if not notes.strip():
         return note
     return f"{notes.strip()}\n\n{note}"
+
+
+def _format_tags(tags: list[str]) -> str:
+    return " ".join(f"#{tag}" for tag in normalize_tags(tags))
+
+
+def _set_note_tags(notes: str | None, tags: list[str]) -> str | None:
+    merged_tags = normalize_tags(tags)
+    if not notes and not merged_tags:
+        return None
+
+    kept_lines = []
+    existing_tags = []
+    for line in str(notes or "").splitlines():
+        line_tags = extract_tags(line)
+        if line.strip().lower().startswith("tags:") and line_tags:
+            existing_tags.extend(line_tags)
+            continue
+        kept_lines.append(line)
+
+    merged_tags = normalize_tags([*existing_tags, *merged_tags])
+    body = "\n".join(kept_lines).strip()
+    if not merged_tags:
+        return body or None
+
+    tag_line = f"Tags: {_format_tags(merged_tags)}"
+    if body:
+        return f"{body}\n\n{tag_line}"
+    return tag_line
+
+
+def _merge_task_tags(
+    task: dict[str, Any],
+    notes: str,
+    metadata: dict[str, Any],
+    new_tags: list[str],
+) -> list[str]:
+    return normalize_tags(
+        [
+            *list(metadata.get("tags") or []),
+            *extract_tags(task.get("title")),
+            *extract_tags(notes),
+            *new_tags,
+        ],
+    )
 
 
 @dataclass
@@ -396,11 +466,13 @@ class FamilyTasksClaw:
             print(message)
             return message
 
+        metadata = intent.get("metadata") or {}
+        notes = _set_note_tags(intent.get("notes"), metadata.get("tags") or [])
         response = self.tools.create_task(
             title=intent["title"],
-            notes=intent.get("notes"),
+            notes=notes,
             due=intent.get("due"),
-            metadata=intent.get("metadata"),
+            metadata=metadata,
         )
         if response["status"] != "ok":
             message = response["message"]
@@ -501,6 +573,11 @@ class FamilyTasksClaw:
         if update.note is not None:
             notes = _append_human_note(notes, update.note)
             changes.append("note")
+        if update.tags:
+            tags = _merge_task_tags(task, notes, metadata, update.tags)
+            metadata["tags"] = tags
+            notes = _set_note_tags(notes, tags) or ""
+            changes.append(f"tags={_format_tags(update.tags)}")
         if update.assistant_help_request is not None:
             metadata["assistant_help_needed"] = True
             metadata["assistant_name"] = "Noah"

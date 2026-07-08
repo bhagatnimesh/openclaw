@@ -29,6 +29,61 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["metadata"]["location"], "home")
         self.assertEqual(intent["metadata"]["owner"], "unknown")
 
+    def test_next_weekday_task_uses_next_calendar_week(self):
+        now = datetime(2026, 7, 7, 9, 31, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add task buy new water filter for next Wednesday",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Buy new water filter")
+        self.assertEqual(intent["due"], "2026-07-15")
+
+    def test_leading_next_weekday_task_keeps_action_title(self):
+        now = datetime(2026, 7, 7, 9, 31, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add task for next Wednesday to buy new water filter",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Buy new water filter")
+        self.assertEqual(intent["due"], "2026-07-15")
+
+    def test_create_task_extracts_dynamic_hashtag_tags(self):
+        now = datetime(2026, 7, 7, 9, 31, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add task buy new water filter #Shopping #home #shopping",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Buy new water filter")
+        self.assertEqual(intent["metadata"]["tags"], ["shopping", "home"])
+
+    def test_numeric_hash_in_title_is_not_a_tag(self):
+        now = datetime(2026, 7, 7, 9, 31, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Add task buy #2 pencils #kids", now=now)
+
+        self.assertEqual(intent["title"], "Buy #2 pencils")
+        self.assertEqual(intent["metadata"]["tags"], ["kids"])
+
+    def test_url_fragment_in_title_is_not_a_tag(self):
+        now = datetime(2026, 7, 7, 9, 31, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add task read https://docs.example.com/#install #research",
+            now=now,
+        )
+
+        self.assertEqual(intent["title"], "Read https://docs.example.com/#install")
+        self.assertEqual(intent["metadata"]["tags"], ["research"])
+
     def test_bare_packing_list_creates_due_task(self):
         now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
@@ -561,6 +616,38 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["filters"]["context"], ["home"])
         self.assertEqual(intent["filters"]["available_context"], ["home"])
         self.assertEqual(intent["filters"]["location"], "home")
+
+    def test_hashtag_recommendation_intent(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Show me #finance #home tasks", now=now)
+
+        self.assertEqual(intent["intent"], "recommend_tasks")
+        self.assertEqual(intent["filters"]["tags"], ["finance", "home"])
+
+    def test_tag_phrase_recommendation_intent(self):
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("List all tasks with tag finance", now=now)
+
+        self.assertEqual(intent["intent"], "recommend_tasks")
+        self.assertEqual(intent["filters"], {"tags": ["finance"]})
+
+    def test_tag_colon_recommendation_intent(self):
+        now = datetime(2026, 7, 7, 12, 3, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("List tasks for tag:drive", now=now)
+
+        self.assertEqual(intent["intent"], "recommend_tasks")
+        self.assertEqual(intent["filters"], {"tags": ["drive"]})
+
+    def test_list_tasks_for_word_uses_tag_filter(self):
+        now = datetime(2026, 7, 7, 12, 1, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("List all tasks for drive", now=now)
+
+        self.assertEqual(intent["intent"], "recommend_tasks")
+        self.assertEqual(intent["filters"], {"tags": ["drive"]})
 
     def test_home_physical_situation_filter_names(self):
         now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))

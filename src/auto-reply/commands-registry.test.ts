@@ -218,6 +218,8 @@ describe("commands registry", () => {
       "stop",
       "skill",
       "tasks",
+      "decisions",
+      "decision",
       "calendar",
       "event",
       "task",
@@ -281,6 +283,25 @@ describe("commands registry", () => {
     expect(requireNativeCommand("event", "telegram").key).toBe("schedule");
     expect(requireNativeCommand("task", "telegram").key).toBe("schedule");
     expect(requireNativeCommand("schedule", "telegram").key).toBe("schedule");
+  });
+
+  it("exposes decisions slash aliases for native and text command surfaces", () => {
+    const decisions = requireChatCommand("decisions");
+    expect(decisions.nativeName).toBe("decisions");
+    expect(decisions.nativeAliases).toEqual(["decision"]);
+    expect(decisions.textAliases).toEqual(["/decisions", "/decision"]);
+    expect(decisions.acceptsArgs).toBe(true);
+    expect(decisions.category).toBe("tools");
+
+    expect(normalizeCommandBody("/decision give list of pending decisions")).toBe(
+      "/decisions give list of pending decisions",
+    );
+    expect(resolveTextCommand("/decisions give list of pending decisions")).toMatchObject({
+      command: expect.objectContaining({ key: "decisions" }),
+      args: "give list of pending decisions",
+    });
+    expect(requireNativeCommand("decisions", "telegram").key).toBe("decisions");
+    expect(requireNativeCommand("decision", "telegram").key).toBe("decisions");
   });
 
   it("matches text command names case-insensitively without changing args", () => {

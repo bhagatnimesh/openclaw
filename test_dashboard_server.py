@@ -253,6 +253,7 @@ class DashboardDataTest(unittest.TestCase):
                             "requires": ["computer", "paperwork"],
                         },
                     ),
+                    task("Clean garage shelf"),
                 ],
             ),
             now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
@@ -266,6 +267,11 @@ class DashboardDataTest(unittest.TestCase):
             for recommendation in data["tasks"]["recommended"]
         ]
         self.assertIn("Call school office", recommended_titles)
+        pending_titles = [task["title"] for task in data["tasks"]["pending"]]
+        self.assertEqual(
+            pending_titles,
+            ["Call school office", "Upload passport form", "Clean garage shelf"],
+        )
 
     def test_planning_view_links_important_event_to_action_item(self):
         data = build_dashboard_data(
@@ -314,6 +320,7 @@ class DashboardDataTest(unittest.TestCase):
 
         self.assertEqual(data["calendar"]["today"], [])
         self.assertEqual(data["tasks"]["open_loops"], [])
+        self.assertEqual(data["tasks"]["pending"], [])
         self.assertEqual(data["planning"]["items"], [])
         self.assertEqual(data["best_next_action"]["source"], "empty")
 
@@ -564,6 +571,7 @@ class DashboardServerRouteTest(unittest.TestCase):
                     self.assertIn("N4OS Family Chief of Staff", body)
                     self.assertIn('href="#decisions"', body)
                     self.assertIn('id="decision-items"', body)
+                    self.assertIn('id="pending-task-items"', body)
                     self.assertIn('id="screen-status"', body)
                     self.assertIn('id="screen-wake-button"', body)
         finally:

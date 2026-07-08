@@ -593,6 +593,205 @@ class IntentRouterTest(unittest.TestCase):
             ("update", "add Noah to help me find the right phone screen", None),
         )
 
+    def test_explicit_task_create_after_task_context_does_not_update_previous_task(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "Add task replace furnace filter tomorrow",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "/task buy new water filter for next wedenssday",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "tasks")
+        self.assertEqual(second["route"], "tasks")
+        self.assertEqual(second["intent_summary"], "Route to family-tasks for create_task.")
+        self.assertEqual(
+            tasks.calls,
+            [
+                (
+                    "create",
+                    "Add task replace furnace filter tomorrow",
+                    REFERENCE_TIME,
+                ),
+                (
+                    "create",
+                    "add task buy new water filter for next wednesday",
+                    REFERENCE_TIME,
+                ),
+            ],
+        )
+
+    def test_hashtag_followup_updates_previous_task(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "Add task buy new water filter",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "add #cleanup",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "tasks")
+        self.assertEqual(second["route"], "tasks")
+        self.assertEqual(second["intent_summary"], "Route to family-tasks for update_task.")
+        self.assertEqual(
+            tasks.calls,
+            [
+                ("create", "Add task buy new water filter", REFERENCE_TIME),
+                ("update", "add #cleanup", None),
+            ],
+        )
+
+    def test_tag_colon_followup_updates_previous_task(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "Add task buy new water filter",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "tags: #home",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "tasks")
+        self.assertEqual(second["route"], "tasks")
+        self.assertEqual(second["intent_summary"], "Route to family-tasks for update_task.")
+        self.assertEqual(
+            tasks.calls,
+            [
+                ("create", "Add task buy new water filter", REFERENCE_TIME),
+                ("update", "tags: #home", None),
+            ],
+        )
+
+    def test_label_phrase_followup_does_not_update_previous_task(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "Add task buy new water filter",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "add labels to containers",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "tasks")
+        self.assertNotEqual(second["intent_summary"], "Route to family-tasks for update_task.")
+        self.assertEqual(tasks.calls, [("create", "Add task buy new water filter", REFERENCE_TIME)])
+
+    def test_hashtag_followup_query_recommends_tasks(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "Add task buy new water filter",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "#shopping",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "tasks")
+        self.assertEqual(second["route"], "tasks")
+        self.assertEqual(second["intent_summary"], "Route to family-tasks for recommend_tasks.")
+        self.assertEqual(
+            tasks.calls,
+            [
+                ("create", "Add task buy new water filter", REFERENCE_TIME),
+                ("recommend", "#shopping", REFERENCE_TIME),
+            ],
+        )
+
+    def test_hashtag_show_query_without_task_word_recommends_tasks(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            result = claw.handle_request(
+                "show me #shopping",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(result["route"], "tasks")
+        self.assertEqual(result["intent_summary"], "Route to family-tasks for recommend_tasks.")
+        self.assertEqual(tasks.calls, [("recommend", "show me #shopping", REFERENCE_TIME)])
+
+    def test_tasks_slash_tag_phrase_recommends_tasks(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            result = claw.handle_request(
+                "/tasks list all with tag finance",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(result["route"], "tasks")
+        self.assertEqual(result["intent_summary"], "Route to family-tasks for recommend_tasks.")
+        self.assertEqual(
+            tasks.calls,
+            [("recommend", "list tasks all with tag finance", REFERENCE_TIME)],
+        )
+
+    def test_tasks_slash_tag_colon_recommends_tasks(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            result = claw.handle_request(
+                "/tasks list for tag:drive",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(result["route"], "tasks")
+        self.assertEqual(result["intent_summary"], "Route to family-tasks for recommend_tasks.")
+        self.assertEqual(
+            tasks.calls,
+            [("recommend", "list tasks for tag:drive", REFERENCE_TIME)],
+        )
+
+    def test_update_like_create_parse_still_updates_previous_task(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "Add task buy new water filter",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "change this task to mom",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "tasks")
+        self.assertEqual(second["route"], "tasks")
+        self.assertEqual(second["intent_summary"], "Route to family-tasks for update_task.")
+        self.assertEqual(
+            tasks.calls,
+            [
+                ("create", "Add task buy new water filter", REFERENCE_TIME),
+                ("update", "change this task to mom", None),
+            ],
+        )
+
     def test_task_clarification_resumes_original_request_as_create_task(self):
         tasks = FakeTasksClaw()
         claw = N4OSClaw(
@@ -650,6 +849,52 @@ class IntentRouterTest(unittest.TestCase):
         )
         self.assertEqual(home_board.calls, [])
 
+    def test_hashtag_after_calendar_context_does_not_update_calendar(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "Add calendar event for Tuesday 8 PM to cancel Fox 1",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "add #cleanup",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "calendar")
+        self.assertEqual(second["route"], "tasks")
+        self.assertEqual(
+            calendar.calls,
+            [("create", "Add calendar event for Tuesday 8 PM to cancel Fox 1", REFERENCE_TIME)],
+        )
+        self.assertEqual(tasks.calls, [("recommend", "add #cleanup", REFERENCE_TIME)])
+
+    def test_tag_colon_after_calendar_context_does_not_update_calendar(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "Add calendar event for Tuesday 8 PM to cancel Fox 1",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "tags: #home",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "calendar")
+        self.assertEqual(second["route"], "tasks")
+        self.assertEqual(
+            calendar.calls,
+            [("create", "Add calendar event for Tuesday 8 PM to cancel Fox 1", REFERENCE_TIME)],
+        )
+        self.assertEqual(tasks.calls, [("recommend", "tags: #home", REFERENCE_TIME)])
+
     def test_explicit_task_assignment_routes_without_context(self):
         tasks = FakeTasksClaw()
         claw = N4OSClaw(tasks_claw=tasks, home_board_claw=FakeHomeBoardClaw())
@@ -705,6 +950,22 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(
             improve_entered_text("/calendar add for Tusday 8 PM to cancel fox 1"),
             "add event for Tuesday 8 PM to cancel fox 1",
+        )
+
+    def test_input_improvement_normalizes_tasks_list_slash_command(self):
+        self.assertEqual(
+            improve_entered_text("/tasks list all with tag finance"),
+            "list tasks all with tag finance",
+        )
+
+    def test_input_improvement_normalizes_decisions_slash_command(self):
+        self.assertEqual(
+            improve_entered_text("/decisions give list of pending decisions"),
+            "decisions give list of pending decisions",
+        )
+        self.assertEqual(
+            improve_entered_text("/decision give list of pending decisions"),
+            "decision give list of pending decisions",
         )
 
     def test_input_improvement_repairs_household_name_dictation(self):
@@ -901,6 +1162,17 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(decision["route"], "decisions")
         self.assertIn("list_decisions", decision["intent_summary"])
+
+    def test_routes_decisions_slash_command_to_decision_list(self):
+        for request in (
+            "/decisions give list of pending decisions",
+            "/decision give list of pending decisions",
+        ):
+            with self.subTest(request=request):
+                decision = route_request(improve_entered_text(request), now=REFERENCE_TIME)
+
+                self.assertEqual(decision["route"], "decisions")
+                self.assertIn("list_decisions", decision["intent_summary"])
 
     def test_routes_close_decision_number_to_record_decision(self):
         decision = route_request(

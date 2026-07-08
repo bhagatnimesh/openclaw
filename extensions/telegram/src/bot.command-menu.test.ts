@@ -144,6 +144,14 @@ describe("createTelegramBot command menu", () => {
       { command: "custom_backup", description: "Git backup" },
       { command: "custom_generate", description: "Create an image" },
     ]);
+    expect(registered).toContainEqual({
+      command: "decisions",
+      description: "List or update pending decisions.",
+    });
+    expect(registered).toContainEqual({
+      command: "decision",
+      description: "List or update pending decisions.",
+    });
   });
 
   it("ignores custom commands that collide with native commands", async () => {

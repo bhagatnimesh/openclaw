@@ -292,6 +292,28 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertEqual(metadata["effort_type"], "communication")
         self.assertEqual(metadata["requires"], ["phone"])
 
+    def test_add_task_from_request_persists_visible_tags(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 7, 9, 31, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "Add task buy new water filter #shopping #home",
+                reference_time=now,
+            )
+
+        self.assertEqual(
+            message,
+            "Created task: Buy new water filter (task id: task-123).",
+        )
+        created = provider.created[0]
+        self.assertEqual(created["title"], "Buy new water filter")
+        self.assertEqual(created["notes"], "Tags: #shopping #home")
+        self.assertNotIn("N4OS_METADATA", created["notes"])
+        _, metadata = _task_notes_and_metadata(created)
+        self.assertEqual(metadata["tags"], ["shopping", "home"])
+
     def test_add_task_from_voice_chatter_creates_clean_google_task(self):
         provider = FakeProvider()
         claw = FamilyTasksClaw.from_provider(provider)
@@ -662,6 +684,108 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertNotIn("Research summer camps", message)
         self.assertIn("can do while driving", message)
 
+    def test_recommend_tasks_from_request_filters_by_visible_tag(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            {
+                "id": "task-1",
+                "title": "Buy water filter",
+                "notes": "Tags: #shopping #home",
+                "status": "needsAction",
+            },
+            {
+                "id": "task-2",
+                "title": "Pay utility bill",
+                "notes": "Tags: #finance #home",
+                "status": "needsAction",
+            },
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.recommend_tasks_from_request(
+                "Show me #shopping tasks",
+                reference_time=now,
+            )
+
+        self.assertIn("Buy water filter", message)
+        self.assertIn("tagged shopping", message)
+        self.assertNotIn("Pay utility bill", message)
+
+    def test_recommend_tasks_from_request_filters_by_tag_phrase(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            {
+                "id": "task-1",
+                "title": "Look at diversification on jul 21st",
+                "notes": "Tags: #finance",
+                "status": "needsAction",
+            },
+            {
+                "id": "task-2",
+                "title": "Buy water filter",
+                "notes": "Tags: #shopping",
+                "status": "needsAction",
+            },
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 7, 11, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.recommend_tasks_from_request(
+                "list all tasks with tag finance",
+                reference_time=now,
+            )
+
+        self.assertIn("Look at diversification on jul 21st", message)
+        self.assertIn("tagged finance", message)
+        self.assertNotIn("Buy water filter", message)
+
+    def test_recommend_tasks_for_drive_filters_visible_drive_tag(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            {
+                "id": "task-1",
+                "title": "Return library book",
+                "notes": "Tags: #drive",
+                "status": "needsAction",
+            },
+            {
+                "id": "task-2",
+                "title": "Return amazon",
+                "notes": "Tags: #drive",
+                "status": "needsAction",
+            },
+            {
+                "id": "task-3",
+                "title": "Call home warranty",
+                "notes": write_metadata_to_notes(
+                    None,
+                    {
+                        "context": ["phone"],
+                        "can_do_while": ["driving"],
+                        "effort_type": "communication",
+                        "requires": ["phone"],
+                    },
+                ),
+                "status": "needsAction",
+            },
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 7, 12, 1, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.recommend_tasks_from_request(
+                "list all tasks for drive",
+                reference_time=now,
+            )
+
+        self.assertIn("Return library book", message)
+        self.assertIn("Return amazon", message)
+        self.assertIn("tagged drive", message)
+        self.assertNotIn("Call home warranty", message)
+
     def test_task_list_request_uses_matching_heading(self):
         provider = FakeProvider()
         provider.tasks = [
@@ -824,6 +948,20 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertIn("Updated task (note)", message)
         notes, _ = read_metadata_from_notes(provider.updated[-1]["notes"])
         self.assertIn("warranty expires next week", notes)
+
+    def test_update_task_followup_adds_dynamic_tag_to_last_created_task(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.add_task_from_request("Add task buy new water filter #home")
+            message = claw.update_task_from_request("add #cleanup")
+
+        self.assertIn("Updated task (tags=#cleanup)", message)
+        updated = provider.updated[-1]
+        self.assertEqual(updated["notes"], "Tags: #home #cleanup")
+        _, metadata = _task_notes_and_metadata(updated)
+        self.assertEqual(metadata["tags"], ["home", "cleanup"])
 
     def test_update_task_followup_queues_noah_help_on_last_created_task(self):
         provider = FakeProvider()

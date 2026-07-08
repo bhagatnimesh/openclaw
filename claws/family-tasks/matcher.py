@@ -4,7 +4,7 @@ from datetime import date, datetime
 import re
 from typing import Any
 
-from intent import read_metadata_from_notes
+from intent import extract_tags, normalize_tags, read_metadata_from_notes
 
 
 ENERGY_RANK = {
@@ -74,6 +74,26 @@ def _parse_filter_date(value: str | None) -> date | None:
         return date.fromisoformat(value[:10])
     except ValueError:
         return None
+
+
+def _task_notes_and_metadata(task: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    notes, legacy_metadata = read_metadata_from_notes(task.get("notes"))
+    metadata = task.get("_n4os_metadata")
+    if isinstance(metadata, dict):
+        return notes, metadata
+    return notes, legacy_metadata
+
+
+def _task_tags(task: dict[str, Any], metadata: dict[str, Any]) -> set[str]:
+    return set(
+        normalize_tags(
+            [
+                *list(metadata.get("tags") or []),
+                *extract_tags(task.get("title")),
+                *extract_tags(task.get("notes")),
+            ],
+        ),
+    )
 
 
 def _task_context_values(metadata: dict[str, Any]) -> set[str]:
@@ -201,6 +221,21 @@ def _matches_location(metadata: dict[str, Any], location: str | None) -> bool:
     return task_location in (location, "anywhere", "unknown")
 
 
+def _matches_tags(
+    task: dict[str, Any],
+    metadata: dict[str, Any],
+    desired_tags: list[str] | None,
+) -> bool:
+    if not desired_tags:
+        return True
+
+    desired = set(normalize_tags(desired_tags))
+    if not desired:
+        return True
+
+    return desired <= _task_tags(task, metadata)
+
+
 def task_matches_filters(
     task: dict[str, Any],
     filters: dict[str, Any],
@@ -209,9 +244,10 @@ def task_matches_filters(
     if task.get("status") == "completed":
         return False
 
-    _, metadata = read_metadata_from_notes(task.get("notes"))
+    _, metadata = _task_notes_and_metadata(task)
     return (
-        _matches_context(metadata, filters.get("context"))
+        _matches_tags(task, metadata, filters.get("tags"))
+        and _matches_context(metadata, filters.get("context"))
         and _matches_energy(metadata, filters.get("energy"))
         and _matches_max_level(metadata, "energy", filters.get("max_energy"))
         and _matches_max_level(
@@ -240,8 +276,11 @@ def task_matches_filters(
 
 def _task_match_score(task: dict[str, Any], filters: dict[str, Any]) -> int:
     filters = normalize_recommendation_filters(filters)
-    _, metadata = read_metadata_from_notes(task.get("notes"))
+    _, metadata = _task_notes_and_metadata(task)
     score = 0
+    tag_filter = set(normalize_tags(filters.get("tags") or []))
+    score += 5 * len(tag_filter & _task_tags(task, metadata))
+
     context_filter = set(filters.get("context") or [])
     score += 3 * len(context_filter & _task_context_values(metadata))
 
@@ -271,7 +310,7 @@ def _task_match_score(task: dict[str, Any], filters: dict[str, Any]) -> int:
 
 def _recommendation_key(task: dict[str, Any], filters: dict[str, Any]) -> tuple[int, int, date, int, str]:
     filters = normalize_recommendation_filters(filters)
-    _, metadata = read_metadata_from_notes(task.get("notes"))
+    _, metadata = _task_notes_and_metadata(task)
     urgency = str(metadata.get("urgency") or "unknown")
     due = _parse_due_date(task.get("due")) or date.max
     duration = metadata.get("duration_minutes")
@@ -292,8 +331,13 @@ def _join_values(values: set[str]) -> str:
 
 def _task_fit_reasons(task: dict[str, Any], filters: dict[str, Any]) -> list[str]:
     filters = normalize_recommendation_filters(filters)
-    _, metadata = read_metadata_from_notes(task.get("notes"))
+    _, metadata = _task_notes_and_metadata(task)
     reasons: list[str] = []
+
+    tag_filter = set(normalize_tags(filters.get("tags") or []))
+    tag_matches = tag_filter & _task_tags(task, metadata)
+    if tag_matches:
+        reasons.append(f"tagged {_join_values(tag_matches)}")
 
     can_do_filter = set(filters.get("can_do_while") or [])
     task_can_do = set(metadata.get("can_do_while") or [])

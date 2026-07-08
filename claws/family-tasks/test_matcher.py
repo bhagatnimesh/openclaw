@@ -347,6 +347,37 @@ class TaskRecommendationTest(unittest.TestCase):
 
         self.assertEqual([task["title"] for task in recommended], ["Change water filter"])
 
+    def test_recommendation_by_dynamic_tags_requires_all_tags(self):
+        tasks = [
+            _task("Buy water filter", {"tags": ["shopping", "home"]}),
+            _task("Pay utility bill", {"tags": ["finance", "home"]}),
+            _task("Research bank offer", {"tags": ["finance"]}),
+        ]
+
+        recommended = recommend_tasks(tasks, {"tags": ["finance", "home"]})
+
+        self.assertEqual([task["title"] for task in recommended], ["Pay utility bill"])
+
+    def test_recommendation_finds_visible_hashtags_in_notes(self):
+        tasks = [
+            {
+                "id": "buy-water-filter",
+                "title": "Buy water filter",
+                "notes": "Tags: #shopping #home",
+                "status": "needsAction",
+            },
+            {
+                "id": "file-receipts",
+                "title": "File receipts",
+                "notes": "Tags: #finance",
+                "status": "needsAction",
+            },
+        ]
+
+        recommended = recommend_tasks(tasks, {"tags": ["shopping"]})
+
+        self.assertEqual([task["title"] for task in recommended], ["Buy water filter"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -451,6 +451,7 @@ main > .section:first-of-type {
 .panel,
 .signal-card,
 .planning-card,
+.pending-task,
 .task-card {
   min-width: 0;
   border: 1px solid rgba(226, 191, 176, 0.42);
@@ -906,6 +907,152 @@ main > .section:first-of-type {
   gap: 18px;
 }
 
+.tasks-overview {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(250px, 0.45fr);
+  gap: 18px;
+  align-items: start;
+  margin-bottom: 18px;
+}
+
+.pending-tasks-panel {
+  background: var(--card);
+}
+
+.task-triage-panel {
+  background: var(--secondary-pale);
+}
+
+.pending-task-list {
+  display: grid;
+  gap: 10px;
+}
+
+.pending-task {
+  display: grid;
+  min-height: 82px;
+  align-items: center;
+  padding: 16px 18px;
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: none;
+}
+
+.pending-task.is-overdue {
+  border-left: 10px solid var(--error);
+}
+
+.pending-task.is-due-today {
+  border-left: 10px solid var(--primary-pop);
+}
+
+.pending-task.is-unassigned {
+  border-left: 10px solid var(--warning);
+}
+
+.pending-task.is-pending {
+  border-left: 10px solid var(--secondary);
+}
+
+.pending-task strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 19px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.pending-task-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 9px;
+}
+
+.task-badge {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: var(--surface-high);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.task-badge.alert {
+  background: var(--error-soft);
+  color: var(--error);
+}
+
+.task-badge.warm {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.task-badge.green {
+  background: var(--secondary-soft);
+  color: var(--secondary);
+}
+
+.task-metric-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.task-metric {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 76px;
+  padding: 14px;
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.task-metric strong {
+  display: grid;
+  width: 58px;
+  height: 58px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--secondary);
+  color: #fff;
+  font-size: 27px;
+  font-weight: 900;
+}
+
+.task-metric span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 16px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.task-metric.is-due strong {
+  background: var(--primary-pop);
+}
+
+.task-metric.is-unassigned strong {
+  background: var(--error);
+}
+
+.task-metric.is-unscheduled strong {
+  background: var(--tertiary);
+}
+
+.task-lanes-heading {
+  margin: 6px 0 12px;
+}
+
+.task-lanes-heading h3 {
+  color: var(--primary);
+}
+
 .task-card {
   min-height: 260px;
   padding: 22px;
@@ -1057,6 +1204,7 @@ main > .section:first-of-type {
   .planning-grid,
   .decisions-layout,
   .decision-grid,
+  .tasks-overview,
   .family-grid {
     grid-template-columns: 1fr;
   }
@@ -1128,6 +1276,7 @@ main > .section:first-of-type {
   .signal-card,
   .planning-card,
   .decision-card,
+  .pending-task,
   .task-card {
     padding: 20px;
     border-radius: 26px;
@@ -1139,6 +1288,7 @@ main > .section:first-of-type {
 
   .home-board-group-items,
   .decision-grid,
+  .tasks-overview,
   .task-grid {
     grid-template-columns: 1fr;
   }

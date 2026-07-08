@@ -460,6 +460,89 @@
     }).join("");
   }
 
+  function taskBadge(label, tone) {
+    if (!label) return "";
+    return '<span class="task-badge ' + escapeHtml(tone || "") + '">' + escapeHtml(label) + "</span>";
+  }
+
+  function taskTone(task) {
+    if (task.days_until_due !== null && task.days_until_due !== undefined && task.days_until_due < 0) {
+      return "is-overdue";
+    }
+    if (task.days_until_due === 0) {
+      return "is-due-today";
+    }
+    if (task.owner === "unknown") {
+      return "is-unassigned";
+    }
+    return "is-pending";
+  }
+
+  function taskContextLabel(task) {
+    var values = []
+      .concat(task.context || [])
+      .concat(task.requires || [])
+      .concat(task.can_do_while || []);
+    var seen = {};
+    var labels = values.filter(function (value) {
+      var key = text(value).toLowerCase();
+      if (!key || seen[key]) return false;
+      seen[key] = true;
+      return true;
+    });
+    if (labels.length) return labels.slice(0, 2).join(" | ");
+    if (task.effort_type && task.effort_type !== "unknown") return task.effort_type;
+    return "";
+  }
+
+  function renderPendingTasks(tasks) {
+    var node = byId("pending-task-items");
+    tasks = tasks || [];
+    setText("task-count-label", tasks.length + " pending");
+    setText("pending-task-count", tasks.length + " pending");
+    setText(
+      "task-due-count",
+      tasks.filter(function (task) {
+        return task.days_until_due !== null && task.days_until_due !== undefined && task.days_until_due <= 0;
+      }).length
+    );
+    setText(
+      "task-unassigned-count",
+      tasks.filter(function (task) {
+        return task.owner === "unknown";
+      }).length
+    );
+    setText(
+      "task-unscheduled-count",
+      tasks.filter(function (task) {
+        return task.days_until_due === null || task.days_until_due === undefined;
+      }).length
+    );
+    if (!node) return;
+    if (!tasks.length) {
+      node.innerHTML = empty("No pending Google Tasks found.");
+      return;
+    }
+    node.innerHTML = tasks.slice(0, 10).map(function (task) {
+      var context = taskContextLabel(task);
+      var badges = [
+        taskBadge(task.due_label || "No due date", task.days_until_due !== null && task.days_until_due !== undefined && task.days_until_due <= 0 ? "alert" : "warm"),
+        taskBadge(task.owner_label || "Unassigned", task.owner === "unknown" ? "alert" : "green"),
+        task.duration_minutes ? taskBadge(task.duration_minutes + " min", "") : "",
+        context ? taskBadge(context, "") : "",
+      ].join("");
+      return (
+        '<div class="pending-task ' +
+        escapeHtml(taskTone(task)) +
+        '"><div><strong>' +
+        escapeHtml(task.title) +
+        '</strong><div class="pending-task-badges">' +
+        badges +
+        '</div></div></div>'
+      );
+    }).join("");
+  }
+
   function renderTaskGroups(groups) {
     var node = byId("task-groups");
     if (!node) return;
@@ -619,6 +702,7 @@
     renderOpenLoops(tasks.open_loops || []);
     renderPlanning(data.planning ? data.planning.items : []);
     renderDecisions(data.decisions || {});
+    renderPendingTasks(tasks.pending || []);
     renderTaskGroups(tasks.groups || []);
     renderFamily(data.family || {});
     updateActiveNav();

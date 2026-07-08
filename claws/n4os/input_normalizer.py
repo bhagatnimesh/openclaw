@@ -73,8 +73,13 @@ REMEMBER_TO_RE = re.compile(
     re.IGNORECASE,
 )
 SLASH_COMMAND_RE = re.compile(
-    r"^\s*/(?P<command>calendar|calender|event|schedule|task)(?:@[A-Za-z0-9_]+)?"
+    r"^\s*/(?P<command>calendar|calender|event|schedule|tasks?|todos?|decisions?)"
+    r"(?:@[A-Za-z0-9_]+)?"
     r"(?:\s+|:\s*)?(?P<body>.*)$",
+    re.IGNORECASE,
+)
+TASK_LIST_BODY_RE = re.compile(
+    r"^\s*(?:list|show|find|search|lookup|look\s+up)\b",
     re.IGNORECASE,
 )
 LEADING_ACTION_RE = re.compile(
@@ -175,10 +180,29 @@ def _normalize_slash_command(text: str) -> str:
     if command in ("calendar", "calender", "event", "schedule"):
         suffix = body_without_action or body
         return f"add event {suffix}".strip()
-    if command == "task":
+    if command in ("task", "tasks", "todo", "todos"):
+        if TASK_LIST_BODY_RE.search(body):
+            return _normalize_task_list_body(body)
         suffix = body_without_action or body
         return f"add task {suffix}".strip()
+    if command in ("decision", "decisions"):
+        suffix = body or "list pending decisions"
+        return f"{command} {suffix}".strip()
     return text
+
+
+def _normalize_task_list_body(body: str) -> str:
+    cleaned = body.strip()
+    if re.search(r"\b(tasks?|todos?|to-dos?|open loops?)\b", cleaned, re.IGNORECASE):
+        return cleaned
+
+    return re.sub(
+        r"^\s*(list|show|find|search|lookup|look\s+up)\b",
+        lambda match: f"{match.group(1)} tasks",
+        cleaned,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
 
 
 def _repair_closed_vocabulary_typos(text: str) -> str:

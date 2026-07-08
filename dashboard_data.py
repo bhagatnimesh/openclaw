@@ -778,6 +778,7 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "recommended": [],
             "groups": [],
             "open_loops": [],
+            "pending": [],
         },
         "planning": {"items": []},
         "home_board": {"today": []},
@@ -904,6 +905,7 @@ def build_dashboard_data(
         if task["id"] not in {existing["id"] for existing in open_loops}
     )
     open_loops = open_loops[:8]
+    pending_tasks = tasks[:24]
 
     warnings = [
         {"level": "warning", "title": conflict["title"], "detail": conflict["detail"]}
@@ -960,6 +962,7 @@ def build_dashboard_data(
         "tasks": {
             "urgent": [_public_task(task) for task in urgent_tasks],
             "due_soon": [_public_task(task) for task in due_soon_tasks],
+            "pending": [_public_task(task) for task in pending_tasks],
             "recommended": [
                 {
                     "task": _public_task(recommendation["task"]),

@@ -120,8 +120,41 @@
 
         <section id="tasks" class="section">
           <div class="section-title">
-            <h2>Tasks Planning Engine</h2>
+            <h2>Tasks</h2>
             <span></span>
+            <strong id="task-count-label" class="section-count">0 pending</strong>
+          </div>
+          <div class="tasks-overview">
+            <article class="panel pending-tasks-panel">
+              <div class="panel-header">
+                <h3>Pending Queue</h3>
+                <span id="pending-task-count">0 pending</span>
+              </div>
+              <div id="pending-task-items" class="pending-task-list"></div>
+            </article>
+            <article class="panel task-triage-panel">
+              <div class="panel-header">
+                <h3>Quick Triage</h3>
+                <span>Today</span>
+              </div>
+              <div class="task-metric-grid">
+                <div class="task-metric is-due">
+                  <strong id="task-due-count">0</strong>
+                  <span>due now</span>
+                </div>
+                <div class="task-metric is-unassigned">
+                  <strong id="task-unassigned-count">0</strong>
+                  <span>unassigned</span>
+                </div>
+                <div class="task-metric is-unscheduled">
+                  <strong id="task-unscheduled-count">0</strong>
+                  <span>no date</span>
+                </div>
+              </div>
+            </article>
+          </div>
+          <div class="task-lanes-heading">
+            <h3>Context Lanes</h3>
           </div>
           <div id="task-groups" class="task-grid"></div>
         </section>

@@ -10,6 +10,18 @@ from zoneinfo import ZoneInfo
 
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 METADATA_MARKER = "N4OS_METADATA:"
+HASHTAG_RE = re.compile(r"(?<![\w/])#(?P<tag>[A-Za-z][A-Za-z0-9_-]*)")
+TAG_FILTER_CLAUSE_RE = re.compile(
+    r"\b(?:with\s+)?tags?\s*(?:(?:is|are|with)\s+|:\s*|\s+)"
+    r"(?P<tags>#?[A-Za-z][A-Za-z0-9_-]*"
+    r"(?:\s*,\s*#?[A-Za-z][A-Za-z0-9_-]*)*)",
+    re.IGNORECASE,
+)
+LIST_FOR_TAG_RE = re.compile(
+    r"\b(?P<head>(?:tasks?|todos?|to-dos?|open loops?)(?:\s+all)?)"
+    r"\s+for\s+(?P<tag>#?[A-Za-z][A-Za-z0-9_-]*)\b",
+    re.IGNORECASE,
+)
 
 VALID_LEVELS = {"low", "medium", "high", "unknown"}
 VALID_CONTEXTS = {"home", "car", "computer", "phone", "outside", "errand"}
@@ -143,6 +155,7 @@ MONTH_DAY_PATTERN = (
 )
 
 DEFAULT_METADATA = {
+    "tags": [],
     "context": [],
     "energy": "unknown",
     "duration_minutes": None,
@@ -250,7 +263,8 @@ CREATE_TASK_TRANSCRIPTION_RE = re.compile(
 LEADING_DUE_ACTION_RE = re.compile(
     rf"^\s*(?:for|on)\s+"
     r"(?:today|tomorrow|tonight|this\s+weekend|weekend|"
-    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+next\s+week)"
     r"(?:\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))?"
     rf"\s+to\s+(?=(?:{TASK_ACTION_PATTERN})\b)",
     re.IGNORECASE,
@@ -524,6 +538,57 @@ def _clean_list(values: Any, allowed: set[str] | None = None) -> list[str]:
     return cleaned
 
 
+def normalize_tags(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+
+    cleaned = []
+    seen = set()
+    for value in values:
+        normalized = str(value or "").strip().lower().lstrip("#")
+        normalized = re.sub(r"[^a-z0-9_-]+", "-", normalized).strip("-_")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+    return cleaned
+
+
+def extract_tags(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return normalize_tags([match.group("tag") for match in HASHTAG_RE.finditer(value)])
+
+
+def _extract_tag_filter_text(user_text: str) -> tuple[list[str], str]:
+    tags = extract_tags(user_text)
+    reserved_for_tag_words = {
+        "today",
+        "tomorrow",
+        "tonight",
+        "week",
+        "weekend",
+        *WEEKDAYS,
+    }
+
+    def strip_clause(match: re.Match[str]) -> str:
+        candidates = re.split(r"\s*,\s*", match.group("tags"))
+        tags.extend(candidates)
+        return " "
+
+    semantic_text = TAG_FILTER_CLAUSE_RE.sub(strip_clause, user_text)
+
+    def strip_list_for_tag(match: re.Match[str]) -> str:
+        tag = normalize_tags([match.group("tag")])
+        if not tag or tag[0] in reserved_for_tag_words:
+            return match.group(0)
+        tags.extend(tag)
+        return match.group("head")
+
+    semantic_text = LIST_FOR_TAG_RE.sub(strip_list_for_tag, semantic_text)
+    return normalize_tags(tags), semantic_text
+
+
 def _clean_level(value: Any) -> str:
     normalized = str(value or "unknown").strip().lower()
     return normalized if normalized in VALID_LEVELS else "unknown"
@@ -598,6 +663,7 @@ def normalize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
         )
 
     normalized["context"] = _clean_list(normalized.get("context"), VALID_CONTEXTS)
+    normalized["tags"] = normalize_tags(normalized.get("tags"))
     normalized["energy"] = _clean_level(normalized.get("energy"))
     normalized["duration_minutes"] = _clean_duration(
         normalized.get("duration_minutes"),
@@ -707,9 +773,13 @@ def _extract_due_date(user_text: str, reference: datetime) -> tuple[str | None, 
         return _current_or_next_weekday(reference, WEEKDAYS["saturday"]).isoformat(), "this weekend"
 
     for name, weekday in WEEKDAYS.items():
-        if re.search(rf"\b{name}\s+next week\b", lowered) or re.search(
+        if (
+            re.search(rf"\bnext\s+{name}\b", lowered)
+            or re.search(rf"\b{name}\s+next week\b", lowered)
+            or re.search(
             rf"\bnext week\s+{name}\b",
             lowered,
+            )
         ):
             return _weekday_in_next_calendar_week(reference, weekday).isoformat(), name
         if re.search(rf"\b(?:due\s+|on\s+)?{name}\b", lowered):
@@ -891,14 +961,16 @@ def _infer_metadata(
     due: str | None,
 ) -> dict[str, Any]:
     metadata = _default_metadata()
-    context, can_do_while, requirements, location = _extract_contexts(user_text)
-    effort_type = _infer_effort_type(user_text)
-    energy = _extract_level(user_text, "energy")
-    urgency = _extract_level(user_text, "urgency")
-    complexity = _extract_level(user_text, "complexity")
-    duration = _extract_duration_minutes(user_text)
+    tags = extract_tags(user_text)
+    semantic_text = HASHTAG_RE.sub("", user_text)
+    context, can_do_while, requirements, location = _extract_contexts(semantic_text)
+    effort_type = _infer_effort_type(semantic_text)
+    energy = _extract_level(semantic_text, "energy")
+    urgency = _extract_level(semantic_text, "urgency")
+    complexity = _extract_level(semantic_text, "complexity")
+    duration = _extract_duration_minutes(semantic_text)
 
-    lowered = user_text.lower()
+    lowered = semantic_text.lower()
     if urgency is None and re.search(r"\b(?:urgent|asap|soon)\b", lowered):
         urgency = "high"
 
@@ -969,6 +1041,7 @@ def _infer_metadata(
 
     metadata.update(
         {
+            "tags": tags,
             "context": context,
             "energy": energy or "unknown",
             "duration_minutes": duration,
@@ -1022,6 +1095,7 @@ def _strip_task_annotations(title: str) -> str:
     cleaned = TASK_OWNER_ANNOTATION_RE.sub("", cleaned)
     cleaned = TASK_OWNER_NOTE_RE.sub("", cleaned)
     cleaned = DUE_DATE_ANNOTATION_RE.sub("", cleaned)
+    cleaned = HASHTAG_RE.sub("", cleaned)
     cleaned = re.sub(
         r"\s*,?\s*(?:the\s+)?owner\s*(?:is|:)?\s*$",
         "",
@@ -1039,7 +1113,10 @@ def _strip_task_annotations(title: str) -> str:
     cleaned = re.sub(r"\s*,\s*(?:needs?|requires?).*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:this\s+weekend|today|tomorrow|tonight)\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(
-        r"\b(?:due\s+|on\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+next week)?\b.*$",
+        r"\b(?:due\s+|on\s+|for\s+)?"
+        r"(?:(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+        r"(?:\s+next week)?|next\s+"
+        r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b.*$",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -1107,10 +1184,14 @@ def _extract_recommendation_filters(
     user_text: str,
     reference: datetime,
 ) -> dict[str, Any]:
-    lowered = user_text.lower()
-    contexts, can_do_while, requirements, location = _extract_contexts(user_text)
+    tags, semantic_text = _extract_tag_filter_text(user_text)
+    semantic_text = HASHTAG_RE.sub("", semantic_text)
+    lowered = semantic_text.lower()
+    contexts, can_do_while, requirements, location = _extract_contexts(semantic_text)
     filters: dict[str, Any] = {}
 
+    if tags:
+        filters["tags"] = tags
     if contexts:
         filters["context"] = contexts
     if can_do_while:
@@ -1120,7 +1201,7 @@ def _extract_recommendation_filters(
     if location != "unknown":
         filters["location"] = location
 
-    energy = _extract_level(user_text, "energy")
+    energy = _extract_level(semantic_text, "energy")
     if energy is not None:
         filters["energy"] = energy
     elif "bored" in lowered:
@@ -1128,14 +1209,14 @@ def _extract_recommendation_filters(
         filters["max_complexity"] = "medium"
         filters["exclude_requires"] = ["focus"]
 
-    duration = _extract_duration_minutes(user_text)
+    duration = _extract_duration_minutes(semantic_text)
     if duration is not None:
         filters["duration_minutes"] = duration
 
     if re.search(r"\b(?:urgent|asap)\b", lowered):
         filters["urgency"] = "high"
 
-    effort_type = _infer_effort_type(user_text)
+    effort_type = _infer_effort_type(semantic_text)
     if effort_type != "unknown":
         filters["effort_type"] = effort_type
     elif re.search(r"\bcalls?\b", lowered):
