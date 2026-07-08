@@ -1,9 +1,9 @@
 # N4OS Portal+ Dashboard
 
-This is the read-only V1 family-room dashboard for Meta Portal+ and laptop
-development browsers. Google Calendar remains the source of truth for events,
-Google Tasks remains the source of truth for tasks, and N4OS metadata is read
-from calendar descriptions and task notes.
+This is the V1 family-room dashboard for Meta Portal+ and laptop development
+browsers. Google Calendar remains the source of truth for events, Google Tasks
+remains the source of truth for tasks, and N4OS metadata is read from calendar
+descriptions and task notes.
 
 ## Run Locally
 
@@ -47,16 +47,23 @@ serve the dashboard through trusted HTTPS.
 - `GET /api/dashboard` returns all dashboard JSON.
 - `GET /api/calendar/today` returns today's calendar timeline.
 - `GET /api/tasks/recommended` returns task recommendations.
+- `POST /api/tasks/complete` completes a Google Task by `task_id`.
 - `GET /api/planning` returns upcoming planning items.
 - `GET /api/home-board/today` returns today's pending Home Board notices.
 - `GET /api/decisions/open` returns pending family decisions.
 
 ## Scope
 
-V1 is intentionally read-only. It does not create, edit, complete, delete, move,
-or assign calendar events or tasks. It reuses the existing `family-calendar` and
-`family-tasks` provider/tool modules, reads N4OS-native Home Board notices from
-local SQLite, and only assembles dashboard-specific JSON.
+V1 is mostly read-only. The Tasks screen can complete existing Google Tasks
+through the existing `family-tasks` tool layer. It does not create, edit,
+delete, move, or assign calendar events or tasks. It reuses the existing
+`family-calendar` and `family-tasks` provider/tool modules, reads N4OS-native
+Home Board notices from local SQLite, and only assembles dashboard-specific
+JSON.
+
+Task completion requests must come from the served dashboard page with the
+page action token and a same-origin/private-host request. Restart the dashboard
+server after code changes so the token and API handlers are refreshed together.
 
 Home Board notices are short-lived household instructions for the `Today at Home`
 dashboard section. They are not Google Calendar events or Google Tasks.

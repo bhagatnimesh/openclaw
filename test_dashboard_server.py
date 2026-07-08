@@ -2,11 +2,13 @@ import unittest
 from datetime import datetime
 from http.server import ThreadingHTTPServer
 from threading import Thread
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import dashboard_sources
 from dashboard_data import (
     build_dashboard_data,
+    complete_dashboard_task,
 )
 from dashboard_server import DashboardRequestHandler
 from dashboard_sources import (
@@ -72,12 +74,35 @@ class FakeCalendarTools:
 class FakeTaskTools:
     def __init__(self, tasks):
         self.tasks = tasks
+        self.completed = []
 
     def list_tasks(self, show_completed=False):
         return {
             "status": "ok",
             "message": "ok",
             "data": {"tasks": self.tasks},
+        }
+
+    def complete_task(self, task_id=None, task_list_id="@default", confirmed=False):
+        if not confirmed:
+            return {
+                "status": "needs_confirmation",
+                "message": f"Confirm before I complete task {task_id}.",
+                "data": {"task_id": task_id, "action": "complete"},
+            }
+        self.completed.append((task_list_id, task_id))
+        for task in self.tasks:
+            if task.get("id") == task_id:
+                task["status"] = "completed"
+                return {
+                    "status": "ok",
+                    "message": "Task completed.",
+                    "data": {"task": task},
+                }
+        return {
+            "status": "error",
+            "message": "task not found",
+            "data": {"task_id": task_id},
         }
 
 
@@ -324,6 +349,37 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data["planning"]["items"], [])
         self.assertEqual(data["best_next_action"]["source"], "empty")
 
+    def test_complete_dashboard_task_updates_google_task_source(self):
+        task_tools = FakeTaskTools(
+            [
+                task(
+                    "Return library book",
+                    due="2026-07-03T00:00:00.000Z",
+                    metadata={"owner": "dad"},
+                    task_id="task-1",
+                ),
+            ],
+        )
+        dashboard_sources = DashboardSources(
+            calendar_tools=FakeCalendarTools([]),
+            task_tools=task_tools,
+            read_event_metadata=fallback_event_metadata,
+            read_task_metadata=fallback_task_metadata,
+            recommend_task_matches=fallback_recommend_task_matches,
+            home_board_tools=FakeHomeBoardTools(),
+            decision_tools=FakeDecisionTools(),
+        )
+
+        response = complete_dashboard_task(
+            "task-1",
+            sources=dashboard_sources,
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(task_tools.completed, [("@default", "task-1")])
+        self.assertEqual(response["data"]["task"]["status"], "completed")
+
     def test_dashboard_includes_today_home_board_items(self):
         data = build_dashboard_data(
             sources(
@@ -569,6 +625,7 @@ class DashboardServerRouteTest(unittest.TestCase):
                         body = response.read().decode("utf-8")
                     self.assertEqual(response.status, 200)
                     self.assertIn("N4OS Family Chief of Staff", body)
+                    self.assertNotIn("{{ACTION_TOKEN}}", body)
                     self.assertIn('href="#decisions"', body)
                     self.assertIn('id="decision-items"', body)
                     self.assertIn('id="pending-task-items"', body)
@@ -599,6 +656,108 @@ class DashboardServerRouteTest(unittest.TestCase):
             self.assertIn("Summer camp plan", body)
         finally:
             dashboard_server.get_dashboard_data = original_get_dashboard_data
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_tasks_complete_api_route_completes_task(self):
+        import dashboard_server
+
+        original_complete_dashboard_task = dashboard_server.complete_dashboard_task
+        calls = []
+
+        def fake_complete_dashboard_task(task_id=None, task_list_id=None):
+            calls.append({"task_id": task_id, "task_list_id": task_list_id})
+            return {
+                "status": "ok",
+                "message": "Task completed.",
+                "data": {"task": {"id": task_id, "status": "completed"}},
+            }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.complete_dashboard_task = fake_complete_dashboard_task
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            request = Request(
+                base_url + "/api/tasks/complete",
+                data=b'{"task_id":"task-1"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("Task completed", body)
+            self.assertEqual(calls, [{"task_id": "task-1", "task_list_id": None}])
+        finally:
+            dashboard_server.complete_dashboard_task = original_complete_dashboard_task
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_tasks_complete_api_route_accepts_https_same_origin(self):
+        import dashboard_server
+
+        original_complete_dashboard_task = dashboard_server.complete_dashboard_task
+        calls = []
+
+        def fake_complete_dashboard_task(task_id=None, task_list_id=None):
+            calls.append({"task_id": task_id, "task_list_id": task_list_id})
+            return {
+                "status": "ok",
+                "message": "Task completed.",
+                "data": {"task": {"id": task_id, "status": "completed"}},
+            }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.complete_dashboard_task = fake_complete_dashboard_task
+            thread.start()
+            host = f"127.0.0.1:{server.server_port}"
+            request = Request(
+                f"http://{host}/api/tasks/complete",
+                data=b'{"task_id":"task-1"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": f"https://{host}",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("Task completed", body)
+            self.assertEqual(calls, [{"task_id": "task-1", "task_list_id": None}])
+        finally:
+            dashboard_server.complete_dashboard_task = original_complete_dashboard_task
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_tasks_complete_api_route_rejects_missing_action_token(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            request = Request(
+                base_url + "/api/tasks/complete",
+                data=b'{"task_id":"task-1"}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as context:
+                urlopen(request, timeout=5)
+            self.assertEqual(context.exception.code, 403)
+            context.exception.close()
+        finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)

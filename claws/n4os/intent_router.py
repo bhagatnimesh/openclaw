@@ -144,6 +144,10 @@ EXPLICIT_TASK_CREATE_TEXT_RE = re.compile(
     r"(?:task|todo|to-do|open loop)\b)",
     re.IGNORECASE,
 )
+REFINABLE_CONTEXT_ACTIONS = {
+    "calendar": {"create_event", "update_event"},
+    "tasks": {"create_task", "update_task"},
+}
 
 
 @dataclass(frozen=True)
@@ -337,6 +341,13 @@ def _is_create_calendar_request(calendar_intent: dict[str, Any]) -> bool:
 
 def _is_explicit_task_create_text(text: str) -> bool:
     return EXPLICIT_TASK_CREATE_TEXT_RE.search(text) is not None
+
+
+def _can_refine_previous_object(context: dict[str, Any], route: str) -> bool:
+    # Only object mutations establish a safe implicit target for short follow-ups.
+    # List/recommend/status routes leave "it" ambiguous and must reroute normally.
+    action = str(context.get("last_action") or "")
+    return action in REFINABLE_CONTEXT_ACTIONS.get(route, set())
 
 
 def _score_calendar(text: str, calendar_intent: dict[str, Any]) -> float:
@@ -657,7 +668,11 @@ def _contextual_followup_frame(
 
     text = request.lower().strip(" .!?")
     last_route = str(context.get("last_route") or "")
-    if _is_tag_update_request(text) and last_route == "tasks":
+    if (
+        _is_tag_update_request(text)
+        and last_route == "tasks"
+        and _can_refine_previous_object(context, "tasks")
+    ):
         return N4OSIntentFrame(
             route="tasks",
             action="update_task",
@@ -666,7 +681,11 @@ def _contextual_followup_frame(
             normalized_request=request,
         )
 
-    if _is_object_update_request(text) and last_route in {"calendar", "tasks"}:
+    if (
+        _is_object_update_request(text)
+        and last_route in {"calendar", "tasks"}
+        and _can_refine_previous_object(context, last_route)
+    ):
         if (
             last_route == "tasks"
             and task_intent is not None

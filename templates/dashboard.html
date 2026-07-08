@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="n4os-dashboard-action-token" content="{{ACTION_TOKEN}}">
     <title>N4OS Portal Dashboard</title>
     <link rel="stylesheet" href="/static/dashboard/dashboard.css">
   </head>
@@ -130,6 +131,7 @@
                 <h3>Pending Queue</h3>
                 <span id="pending-task-count">0 pending</span>
               </div>
+              <p id="task-action-status" class="task-action-status" aria-live="polite"></p>
               <div id="pending-task-items" class="pending-task-list"></div>
             </article>
             <article class="panel task-triage-panel">

@@ -1023,3 +1023,53 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
             for warning in warnings
         )
         return data
+
+
+def complete_dashboard_task(
+    task_id: str | None,
+    task_list_id: str | None = None,
+    sources: DashboardSources | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    cleaned_task_id = _clean_text(task_id)
+    if not cleaned_task_id:
+        return {
+            "status": "error",
+            "message": "Missing required task information: task_id.",
+            "data": {"missing_fields": ["task_id"]},
+        }
+
+    active_sources = sources or default_sources()
+    tools = active_sources.task_tools
+    kwargs: dict[str, Any] = {
+        "task_id": cleaned_task_id,
+        "confirmed": True,
+    }
+    cleaned_task_list_id = _clean_text(task_list_id)
+    if cleaned_task_list_id:
+        kwargs["task_list_id"] = cleaned_task_list_id
+
+    try:
+        response = tools.complete_task(**kwargs)
+    except Exception as error:
+        return _source_error_response("Tasks", error)
+
+    if response.get("status") != "ok":
+        return response
+
+    raw_task = response.get("data", {}).get("task")
+    if not isinstance(raw_task, dict):
+        return response
+
+    normalized_task = _normalize_task(
+        raw_task,
+        active_sources.read_task_metadata,
+        _local_now(now).date(),
+    )
+    return {
+        **response,
+        "data": {
+            **response.get("data", {}),
+            "task": _public_task(normalized_task),
+        },
+    }

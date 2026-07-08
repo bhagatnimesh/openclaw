@@ -4,18 +4,20 @@ import argparse
 import html
 import json
 import mimetypes
+import secrets
 from pathlib import Path
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from dashboard_data import get_dashboard_data
+from dashboard_data import complete_dashboard_task, get_dashboard_data
 
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATE_FILE = ROOT / "templates" / "dashboard.html"
 STATIC_ROOT = ROOT / "static" / "dashboard"
+ACTION_TOKEN = secrets.token_urlsafe(24)
 
 
 def _json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
@@ -45,6 +47,79 @@ def _file_response(handler: BaseHTTPRequestHandler, path: Path, content_type: st
     handler.wfile.write(body)
 
 
+def _dashboard_response(handler: BaseHTTPRequestHandler) -> None:
+    body = TEMPLATE_FILE.read_text(encoding="utf-8").replace(
+        "{{ACTION_TOKEN}}",
+        html.escape(ACTION_TOKEN, quote=True),
+    ).encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+    try:
+        content_length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        return {}
+    if content_length <= 0:
+        return {}
+    body = handler.rfile.read(min(content_length, 32_768))
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _host_allowed(host: str) -> bool:
+    hostname = host.rsplit("@", 1)[-1].rsplit(":", 1)[0].strip("[]").lower()
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        return True
+    parts = hostname.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        octets = [int(part) for part in parts]
+    except ValueError:
+        return False
+    if any(octet < 0 or octet > 255 for octet in octets):
+        return False
+    return (
+        octets[0] == 10
+        or (octets[0] == 172 and 16 <= octets[1] <= 31)
+        or (octets[0] == 192 and octets[1] == 168)
+        or (octets[0] == 169 and octets[1] == 254)
+    )
+
+
+def _same_origin_allowed(handler: BaseHTTPRequestHandler) -> bool:
+    host = handler.headers.get("Host", "")
+    if not host or not _host_allowed(host):
+        return False
+    allowed_origins = {f"http://{host}", f"https://{host}"}
+    for header_name in ("Origin", "Referer"):
+        raw = handler.headers.get(header_name)
+        if not raw:
+            continue
+        parsed = urlparse(raw)
+        if f"{parsed.scheme}://{parsed.netloc}" not in allowed_origins:
+            return False
+    return True
+
+
+def _authorized_action_request(handler: BaseHTTPRequestHandler) -> bool:
+    content_type = handler.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    return (
+        content_type == "application/json"
+        and handler.headers.get("X-N4OS-Dashboard-Action-Token") == ACTION_TOKEN
+        and _same_origin_allowed(handler)
+    )
+
+
 class DashboardRequestHandler(BaseHTTPRequestHandler):
     server_version = "N4OSDashboard/1.0"
 
@@ -68,7 +143,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if route == "/dashboard":
-            _file_response(self, TEMPLATE_FILE, "text/html; charset=utf-8")
+            _dashboard_response(self)
             return
         if route == "/healthz":
             _json_response(self, {"status": "ok"})
@@ -113,6 +188,30 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        route = parsed.path.rstrip("/") or "/"
+        if route == "/api/tasks/complete":
+            if not _authorized_action_request(self):
+                _json_response(
+                    self,
+                    {
+                        "status": "error",
+                        "message": "Dashboard action is not authorized.",
+                    },
+                    status=403,
+                )
+                return
+            payload = _read_json_body(self)
+            response = complete_dashboard_task(
+                task_id=payload.get("task_id"),
+                task_list_id=payload.get("task_list_id"),
+            )
+            status = 200 if response.get("status") == "ok" else 400
+            _json_response(self, response, status=status)
+            return
+        self.send_error(404)
+
 
 def create_app() -> Any:
     try:
@@ -128,7 +227,10 @@ def create_app() -> Any:
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard() -> str:
-        return TEMPLATE_FILE.read_text(encoding="utf-8")
+        return TEMPLATE_FILE.read_text(encoding="utf-8").replace(
+            "{{ACTION_TOKEN}}",
+            html.escape(ACTION_TOKEN, quote=True),
+        )
 
     @app.get("/healthz", response_class=JSONResponse)
     def healthz() -> Any:
@@ -145,6 +247,36 @@ def create_app() -> Any:
     @app.get("/api/tasks/recommended", response_class=JSONResponse)
     def api_tasks_recommended() -> Any:
         return get_dashboard_data()["tasks"]["recommended"]
+
+    @app.post("/api/tasks/complete", response_class=JSONResponse)
+    async def api_tasks_complete(request: Any) -> Any:
+        headers = request.headers
+        if (
+            headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"
+            or headers.get("x-n4os-dashboard-action-token") != ACTION_TOKEN
+            or not _same_origin_allowed(request)
+        ):
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "message": "Dashboard action is not authorized.",
+                },
+                status_code=403,
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        response = complete_dashboard_task(
+            task_id=payload.get("task_id"),
+            task_list_id=payload.get("task_list_id"),
+        )
+        return JSONResponse(
+            response,
+            status_code=200 if response.get("status") == "ok" else 400,
+        )
 
     @app.get("/api/planning", response_class=JSONResponse)
     def api_planning() -> Any:

@@ -628,7 +628,7 @@ class N4OSClaw:
             route=route or "unknown",
             action="undo",
             confidence=1.0,
-            followup_kind="followup",
+            followup_kind="none",
             normalized_request=request,
         )
         self._remember_route(request, frame)

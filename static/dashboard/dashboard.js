@@ -495,6 +495,64 @@
     return "";
   }
 
+  function setTaskActionStatus(message, state) {
+    var node = byId("task-action-status");
+    if (!node) return;
+    node.textContent = text(message);
+    node.dataset.state = state || "";
+  }
+
+  function actionToken() {
+    var node = document.querySelector('meta[name="n4os-dashboard-action-token"]');
+    return node ? node.getAttribute("content") || "" : "";
+  }
+
+  function taskCompleteButton(task) {
+    if (!task.id) return "";
+    return (
+      '<button class="task-complete-button" type="button" data-task-complete="' +
+      escapeHtml(task.id) +
+      '" aria-label="Complete ' +
+      escapeHtml(task.title) +
+      '">Complete</button>'
+    );
+  }
+
+  function postCompleteTask(taskId, button) {
+    if (!taskId) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Completing";
+    }
+    setTaskActionStatus("Completing task...", "pending");
+
+    var request = new XMLHttpRequest();
+    request.open("POST", "/api/tasks/complete", true);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      var payload = {};
+      try {
+        payload = JSON.parse(request.responseText || "{}");
+      } catch (_error) {
+        payload = {};
+      }
+      if (request.status >= 200 && request.status < 300 && payload.status === "ok") {
+        setTaskActionStatus("Task completed.", "ok");
+        loadDashboard();
+        return;
+      }
+      var message = payload.message || "Task completion failed.";
+      setTaskActionStatus(message, "error");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Complete";
+      }
+    };
+    request.send(JSON.stringify({ task_id: taskId }));
+  }
+
   function renderPendingTasks(tasks) {
     var node = byId("pending-task-items");
     tasks = tasks || [];
@@ -534,11 +592,13 @@
       return (
         '<div class="pending-task ' +
         escapeHtml(taskTone(task)) +
-        '"><div><strong>' +
+        '"><div class="pending-task-main"><strong>' +
         escapeHtml(task.title) +
         '</strong><div class="pending-task-badges">' +
         badges +
-        '</div></div></div>'
+        '</div></div><div class="pending-task-actions">' +
+        taskCompleteButton(task) +
+        "</div></div>"
       );
     }).join("");
   }
@@ -728,6 +788,14 @@
   window.setInterval(loadDashboard, refreshMs);
   window.setInterval(syncWakeLock, wakeLockCheckMs);
   document.addEventListener("visibilitychange", syncWakeLock);
+  document.addEventListener("click", function (event) {
+    var target = event.target;
+    while (target && target !== document && !target.getAttribute("data-task-complete")) {
+      target = target.parentNode;
+    }
+    if (!target || target === document) return;
+    postCompleteTask(target.getAttribute("data-task-complete"), target);
+  });
   window.addEventListener("focus", syncWakeLock);
   window.addEventListener("hashchange", function () {
     updateActiveNav();

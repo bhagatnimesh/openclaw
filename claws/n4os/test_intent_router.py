@@ -463,6 +463,7 @@ class IntentRouterTest(unittest.TestCase):
                 ("undo", None, None),
             ],
         )
+        self.assertEqual(claw.route_context.last_artifact["followup_kind"], "none")
         self.assertEqual(len(interpreter.calls), 1)
 
     def test_undo_tracks_last_mutation_across_routes(self):
@@ -719,6 +720,49 @@ class IntentRouterTest(unittest.TestCase):
             ],
         )
 
+    def test_hashtag_after_task_recommendation_does_not_update_previous_task(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "show me #shopping",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "add #urgent",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "tasks")
+        self.assertEqual(second["route"], "tasks")
+        self.assertEqual(second["intent_summary"], "Route to family-tasks for recommend_tasks.")
+        self.assertEqual(
+            tasks.calls,
+            [
+                ("recommend", "show me #shopping", REFERENCE_TIME),
+                ("recommend", "add #urgent", REFERENCE_TIME),
+            ],
+        )
+
+    def test_object_update_after_task_recommendation_requires_explicit_target(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "What can I do while driving?",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "assign it to mom",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "tasks")
+        self.assertEqual(second["route"], "unknown")
+        self.assertEqual(tasks.calls, [("recommend", "What can I do while driving?", REFERENCE_TIME)])
+
     def test_hashtag_show_query_without_task_word_recommends_tasks(self):
         tasks = FakeTasksClaw()
         claw = N4OSClaw(tasks_claw=tasks)
@@ -848,6 +892,26 @@ class IntentRouterTest(unittest.TestCase):
             ("assign_owner", "assign it to nimesh", REFERENCE_TIME),
         )
         self.assertEqual(home_board.calls, [])
+
+    def test_object_update_after_calendar_list_requires_explicit_target(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            first = claw.handle_request(
+                "What do I have tomorrow?",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.handle_request(
+                "assign it to mom",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(first["route"], "calendar")
+        self.assertEqual(second["route"], "unknown")
+        self.assertEqual(calendar.calls, [("list", "What do I have tomorrow?", REFERENCE_TIME)])
+        self.assertEqual(tasks.calls, [])
 
     def test_hashtag_after_calendar_context_does_not_update_calendar(self):
         calendar = FakeCalendarClaw()

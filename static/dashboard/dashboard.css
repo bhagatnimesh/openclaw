@@ -930,12 +930,23 @@ main > .section:first-of-type {
 
 .pending-task {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
   min-height: 82px;
   align-items: center;
   padding: 16px 18px;
   border-radius: 24px;
   background: rgba(255, 255, 255, 0.86);
   box-shadow: none;
+}
+
+.pending-task-main {
+  min-width: 0;
+}
+
+.pending-task-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .pending-task.is-overdue {
@@ -995,6 +1006,52 @@ main > .section:first-of-type {
 .task-badge.green {
   background: var(--secondary-soft);
   color: var(--secondary);
+}
+
+.task-complete-button {
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: center;
+  padding: 9px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--secondary);
+  color: #fff;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.task-complete-button:hover,
+.task-complete-button:focus-visible {
+  background: var(--primary);
+}
+
+.task-complete-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.task-action-status {
+  min-height: 24px;
+  margin: -6px 0 12px;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.task-action-status:empty {
+  display: none;
+}
+
+.task-action-status[data-state="ok"] {
+  color: var(--secondary);
+}
+
+.task-action-status[data-state="error"] {
+  color: var(--error);
 }
 
 .task-metric-grid {
@@ -1295,6 +1352,14 @@ main > .section:first-of-type {
 
   .home-board-item {
     transform: none;
+  }
+
+  .pending-task {
+    grid-template-columns: 1fr;
+  }
+
+  .pending-task-actions {
+    justify-content: flex-start;
   }
 
   .section {

@@ -65,6 +65,9 @@ class _UnavailableTaskTools(_UnavailableSourceTools):
     def list_tasks(self, **_kwargs: Any) -> dict[str, Any]:
         return self._response()
 
+    def complete_task(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
 
 class _UnavailableHomeBoardTools(_UnavailableSourceTools):
     def list_items(self, **_kwargs: Any) -> dict[str, Any]:
