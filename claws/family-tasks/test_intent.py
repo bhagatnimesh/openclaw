@@ -53,6 +53,83 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["title"], "Buy new water filter")
         self.assertEqual(intent["due"], "2026-07-15")
 
+    def test_relative_week_from_now_task_uses_clean_title(self):
+        now = datetime(2026, 7, 8, 10, 33, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add task follow up if solar response comes from the builder. "
+            "Check one week from now",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(
+            intent["title"],
+            "Follow up if solar response comes from the builder",
+        )
+        self.assertEqual(intent["due"], "2026-07-15")
+
+    def test_relative_in_two_weeks_task_uses_clean_title(self):
+        now = datetime(2026, 7, 8, 10, 33, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Add task call builder in two weeks", now=now)
+
+        self.assertEqual(intent["title"], "Call builder")
+        self.assertEqual(intent["due"], "2026-07-22")
+
+    def test_refined_task_header_and_body_create_title_and_notes(self):
+        now = datetime(2026, 7, 8, 10, 33, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "\n".join(
+                [
+                    "Add task: Call FUSD about Nysha waitlist",
+                    "Notes: Follow up with Chadbourne about the overflow waitlist.",
+                    "Ask for the right contact and next steps.",
+                ]
+            ),
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Call FUSD about Nysha waitlist")
+        self.assertEqual(
+            intent["notes"],
+            "Follow up with Chadbourne about the overflow waitlist.\n"
+            "Ask for the right contact and next steps.",
+        )
+
+    def test_refined_inline_task_header_and_body_create_title_and_notes(self):
+        now = datetime(2026, 7, 8, 10, 33, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add task: Call builder Notes: Ask whether the solar response came in.",
+            now=now,
+        )
+
+        self.assertEqual(intent["title"], "Call builder")
+        self.assertEqual(intent["notes"], "Ask whether the solar response came in.")
+
+    def test_below_email_followup_creates_readable_title_and_notes(self):
+        now = datetime(2026, 7, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "For below email to follow-up next Wednesday. Hello Nimesh Your close "
+            "of escrow was back in April of 2021. When is it that the powering "
+            "down occurred? I included the roofing contractor number.",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Follow up on email")
+        self.assertEqual(intent["due"], "2026-07-15")
+        self.assertEqual(
+            intent["notes"],
+            "Hello Nimesh Your close of escrow was back in April of 2021. "
+            "When is it that the powering down occurred? I included the "
+            "roofing contractor number.",
+        )
+
     def test_create_task_extracts_dynamic_hashtag_tags(self):
         now = datetime(2026, 7, 7, 9, 31, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 

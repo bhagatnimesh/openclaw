@@ -107,6 +107,8 @@ for contract details.
 Common plugin-provided tools include:
 
 - [Diffs](/tools/diffs) for rendering file and markdown diffs
+- [Home Assistant](/plugins/home-assistant) for Assist calls, allowlisted
+  service calls, and speaker output
 - [LLM Task](/tools/llm-task) for JSON-only workflow steps
 - [Lobster](/tools/lobster) for typed workflows with resumable approvals
 - [Tokenjuice](/tools/tokenjuice) for compacting noisy `exec` and `bash` tool

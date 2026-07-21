@@ -331,6 +331,52 @@ class DashboardDataTest(unittest.TestCase):
             ["Call school office", "Upload passport form", "Clean garage shelf"],
         )
 
+    def test_dashboard_tasks_expose_tags_for_filtering(self):
+        data = build_dashboard_data(
+            sources(
+                tasks=[
+                    task(
+                        "Buy water filter",
+                        metadata={"tags": ["shopping", "#home", "shopping"]},
+                    ),
+                    task(
+                        "File receipt",
+                        metadata={"tags": "finance, home"},
+                    ),
+                    task("Clean garage shelf"),
+                ],
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["tasks"]["tags"], ["finance", "home", "shopping"])
+        tasks_by_title = {
+            task_data["title"]: task_data["tags"]
+            for task_data in data["tasks"]["pending"]
+        }
+        self.assertEqual(tasks_by_title["Buy water filter"], ["shopping", "home"])
+        self.assertEqual(tasks_by_title["File receipt"], ["finance", "home"])
+        self.assertEqual(tasks_by_title["Clean garage shelf"], [])
+
+    def test_dashboard_tasks_expose_visible_note_tags(self):
+        data = build_dashboard_data(
+            sources(
+                tasks=[
+                    task("Pack some food", notes="Tags: #packing"),
+                    task("Add documents", notes="Tags: #paperwork #packing"),
+                ],
+            ),
+            now=datetime.fromisoformat("2026-07-07T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["tasks"]["tags"], ["packing", "paperwork"])
+        tasks_by_title = {
+            task_data["title"]: task_data["tags"]
+            for task_data in data["tasks"]["pending"]
+        }
+        self.assertEqual(tasks_by_title["Pack some food"], ["packing"])
+        self.assertEqual(tasks_by_title["Add documents"], ["paperwork", "packing"])
+
     def test_planning_view_links_important_event_to_action_item(self):
         data = build_dashboard_data(
             sources(
@@ -704,8 +750,13 @@ class DashboardServerRouteTest(unittest.TestCase):
                     self.assertIn('id="library"', body)
                     self.assertIn('id="library-visit-label"', body)
                     self.assertIn('id="library-bag-list"', body)
+                    self.assertIn('data-dashboard-card="library-bag"', body)
+                    self.assertIn('data-dashboard-card="reading-photos"', body)
+                    self.assertIn('data-dashboard-card="decision-attention"', body)
+                    self.assertIn('data-dashboard-card="family-members"', body)
                     self.assertIn('id="decision-items"', body)
                     self.assertIn('id="pending-task-items"', body)
+                    self.assertIn('id="task-lanes-heading"', body)
                     self.assertLess(body.index('id="tasks"'), body.index('id="library"'))
                     self.assertLess(body.index('id="library"'), body.index('id="family"'))
                     self.assertIn('id="screen-status"', body)

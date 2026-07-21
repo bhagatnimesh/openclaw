@@ -144,7 +144,9 @@ OBJECT_UPDATE_RE = re.compile(
 )
 TAG_UPDATE_TEXT_RE = re.compile(
     r"^\s*(?:(?:add|append|set|update|put)\s+#[A-Za-z][A-Za-z0-9_-]*\b|"
-    r"(?:tags?|labels?)\s*:)",
+    r"(?:tags?|labels?)\s*:|"
+    r"(?:add|append|set|update|put|change)\b.*\b(?:tags?|labels?)\b.*"
+    r"#[A-Za-z][A-Za-z0-9_-]*\b)",
     re.IGNORECASE,
 )
 EXPLICIT_TASK_CREATE_TEXT_RE = re.compile(
@@ -705,6 +707,23 @@ def _call_interpreter(
     return interpreter(request, now=now, context=context)
 
 
+def _should_keep_rule_fallback(
+    frame: N4OSIntentFrame,
+    fallback: N4OSIntentFrame,
+) -> bool:
+    if fallback.route == "unknown" or fallback.confidence < LOW_CONFIDENCE_THRESHOLD:
+        return False
+    if frame.confidence < LOW_CONFIDENCE_THRESHOLD:
+        return True
+    if (
+        fallback.confidence >= 0.9
+        and frame.route != fallback.route
+        and frame.confidence < 0.9
+    ):
+        return True
+    return False
+
+
 def _contextual_followup_frame(
     request: str,
     context: dict[str, Any] | None,
@@ -985,10 +1004,9 @@ def interpret_request(
     except Exception:
         return _rule_intent_frame(request, now=now, context=context)
 
-    if frame.confidence < LOW_CONFIDENCE_THRESHOLD:
-        fallback = _rule_intent_frame(request, now=now, context=context)
-        if fallback.route != "unknown" and fallback.confidence >= LOW_CONFIDENCE_THRESHOLD:
-            return fallback
+    fallback = _rule_intent_frame(request, now=now, context=context)
+    if _should_keep_rule_fallback(frame, fallback):
+        return fallback
     return frame
 
 

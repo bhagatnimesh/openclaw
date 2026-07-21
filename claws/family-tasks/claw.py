@@ -35,6 +35,7 @@ class PendingAction:
     action: str
     task: dict[str, Any] | None = None
     choices: list[dict[str, Any]] | None = None
+    update: TaskUpdateRequest | None = None
     task_list_id: str = DEFAULT_TASK_LIST_ID
 
 
@@ -549,6 +550,12 @@ class FamilyTasksClaw:
             for index, task in enumerate(matches, start=1):
                 lines.append(f"{index}. {_format_task_choice(task)}")
             message = "\n".join(lines)
+            self.pending_action = PendingAction(
+                action="update",
+                choices=matches,
+                update=update,
+                task_list_id=task_list_id,
+            )
             print(message)
             return message
         return self._update_task(matches[0], update, task_list_id)
@@ -907,6 +914,10 @@ class FamilyTasksClaw:
                 return True
             pending.task = pending.choices[index]
             pending.choices = None
+            if pending.action == "update" and pending.update is not None:
+                self._update_task(pending.task, pending.update, pending.task_list_id)
+                self.pending_action = None
+                return True
             print(f"Selected {_format_task_choice(pending.task)}. Confirm yes/no.")
             return True
 

@@ -131,6 +131,30 @@ DAY_ORDINALS = {
 }
 DAY_TENS = {"twentieth": 20, "thirtieth": 30}
 DAY_TENS_PREFIXES = {"twenty": 20, "thirty": 30}
+RELATIVE_DATE_NUMBERS = {
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+RELATIVE_DATE_PATTERN = (
+    r"(?P<count>\d{1,2}|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+    r"\s+(?P<unit>days?|weeks?)"
+)
+RELATIVE_DATE_TEXT_PATTERN = (
+    r"(?:\d{1,2}|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+    r"\s+(?:days?|weeks?)"
+)
 DAY_ONES_PATTERN = "|".join(
     re.escape(value)
     for value in sorted(DAY_ORDINALS, key=len, reverse=True)
@@ -274,6 +298,12 @@ EXPLICIT_CLOCK_TIME_RE = re.compile(
     r"\bat\s+\d{1,2}(?::\d{2})?\b",
     re.IGNORECASE,
 )
+FOLLOWUP_BLOB_RE = re.compile(
+    r"^\s*(?:for\s+)?(?:below|following|this|the)\s+"
+    r"(?P<object>email|message|text|note)\s+to\s+follow[- ]?up"
+    r"(?P<timing>.*?)(?:[.:\n]\s+)(?P<body>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
 TASK_OWNER_NOTE_RE = re.compile(
     r"\b(?:this\s+)?task\s+(?:is\s+)?for\s+[\w'.-]+\.?.*$",
     re.IGNORECASE,
@@ -306,6 +336,18 @@ ASSISTANT_HELP_MARKER_LINE_RE = re.compile(
 )
 ASSISTANT_DETAIL_LABEL_RE = re.compile(
     r"\b(?P<label>assistant\s+help|help|assistant\s+context|context|email|notes?)\s*:\s*",
+    re.IGNORECASE,
+)
+TASK_DETAIL_LABEL_RE = re.compile(
+    r"^\s*(?P<label>body|details?|notes?)\s*:\s*(?P<value>.*)$",
+    re.IGNORECASE,
+)
+TASK_TITLE_LABEL_RE = re.compile(
+    r"^\s*(?P<label>header|title)\s*:\s*(?P<value>.*)$",
+    re.IGNORECASE,
+)
+INLINE_TASK_LABEL_RE = re.compile(
+    r"\s+\b(?P<label>header|title|body|details?|notes?)\s*:",
     re.IGNORECASE,
 )
 ASSISTANT_GOAL_CONTEXT_RE = re.compile(
@@ -412,6 +454,58 @@ def _assistant_note_text(help_request: str, assistant_context: str) -> str | Non
     if assistant_context:
         lines.append(f"Assistant context: {assistant_context}")
     return "\n".join(lines)
+
+
+def _join_note_sections(*sections: str | None) -> str | None:
+    cleaned = [section.strip() for section in sections if section and section.strip()]
+    if not cleaned:
+        return None
+    return "\n\n".join(cleaned)
+
+
+def _extract_task_detail_notes(user_text: str) -> tuple[str, str | None]:
+    labeled_text = INLINE_TASK_LABEL_RE.sub(
+        lambda match: f"\n{match.group('label')}:",
+        user_text,
+    )
+    lines = [line.strip() for line in labeled_text.splitlines()]
+    title_parts: list[str] = []
+    leading_parts: list[str] = []
+    note_parts: list[str] = []
+    current_section: str | None = None
+
+    for line in lines:
+        if not line:
+            continue
+
+        title_match = TASK_TITLE_LABEL_RE.match(line)
+        if title_match is not None:
+            value = _clean_spaces(title_match.group("value").strip(" ."))
+            if value:
+                title_parts.append(value)
+            current_section = "title"
+            continue
+
+        detail_match = TASK_DETAIL_LABEL_RE.match(line)
+        if detail_match is not None:
+            value = _clean_spaces(detail_match.group("value").strip())
+            if value:
+                note_parts.append(value)
+            current_section = "notes"
+            continue
+
+        if current_section == "notes":
+            note_parts.append(_clean_spaces(line))
+        elif current_section == "title":
+            title_parts.append(_clean_spaces(line))
+        else:
+            leading_parts.append(_clean_spaces(line))
+
+    if not note_parts:
+        return user_text, None
+
+    title_text = " ".join(title_parts or leading_parts).strip()
+    return title_text, "\n".join(note_parts).strip() or None
 
 
 def _assistant_metadata(
@@ -642,6 +736,35 @@ def _day_from_month_day_text(value: str) -> int | None:
     return tens + ones
 
 
+def _relative_date_count(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized.isdigit():
+        count = int(normalized)
+    else:
+        count = RELATIVE_DATE_NUMBERS.get(normalized)
+    if count is None or count <= 0:
+        return None
+    return count
+
+
+def _extract_relative_due_date(user_text: str, reference: datetime) -> tuple[str | None, str]:
+    patterns = [
+        rf"\bin\s+{RELATIVE_DATE_PATTERN}\b",
+        rf"\b{RELATIVE_DATE_PATTERN}\s+from\s+now\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, user_text, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        count = _relative_date_count(match.group("count"))
+        if count is None:
+            continue
+        unit = match.group("unit").lower()
+        days = count * 7 if unit.startswith("week") else count
+        return (reference + timedelta(days=days)).date().isoformat(), match.group(0)
+    return None, ""
+
+
 def _contains_any_word(user_text: str, words: tuple[str, ...]) -> bool:
     return any(re.search(rf"\b{re.escape(word)}\b", user_text) for word in words)
 
@@ -771,6 +894,10 @@ def _extract_due_date(user_text: str, reference: datetime) -> tuple[str | None, 
         return reference.date().isoformat(), "today"
     if "this weekend" in lowered or re.search(r"\bweekend\b", lowered):
         return _current_or_next_weekday(reference, WEEKDAYS["saturday"]).isoformat(), "this weekend"
+
+    relative_due, relative_anchor = _extract_relative_due_date(user_text, reference)
+    if relative_due is not None:
+        return relative_due, relative_anchor
 
     for name, weekday in WEEKDAYS.items():
         if (
@@ -1062,7 +1189,7 @@ def _strip_create_words(user_text: str) -> str:
         r"^\s*(?:please\s+)?(?:"
         r"(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
         r"(?:add|create|capture|remember)\s+(?:an?\s+)?"
-        r"(?:(?:task|todo|to-do|open loop)\s+)?(?:to\s+)?"
+        r"(?:(?:task|todo|to-do|open loop)\b[:\s-]*)?(?:to\s+)?"
         r"|to\s+)",
         "",
         user_text,
@@ -1103,6 +1230,19 @@ def _strip_task_annotations(title: str) -> str:
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(r"\s*,\s*challenge\b.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        rf"(?:^|[\s,.])(?:check|review|revisit|remind(?:\s+me)?|follow\s+up)\s+"
+        rf"(?:in\s+{RELATIVE_DATE_TEXT_PATTERN}|{RELATIVE_DATE_TEXT_PATTERN}\s+from\s+now)\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        rf"\b(?:in\s+{RELATIVE_DATE_TEXT_PATTERN}|{RELATIVE_DATE_TEXT_PATTERN}\s+from\s+now)\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\bcall\s+up\b", "call", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(
         r"\s+to\s+check\s+how\s+to\s+handle\s+with\s+(.+)$",
@@ -1152,7 +1292,7 @@ def _extract_create_intent(
     reference: datetime,
 ) -> dict[str, Any]:
     task_text, assistant_metadata, assistant_notes = _extract_assistant_help(user_text)
-    intent_text = task_text or user_text
+    intent_text, detail_notes = _extract_task_detail_notes(task_text or user_text)
     due, _ = _extract_due_date(intent_text, reference)
     title = _title_from_request(intent_text)
     missing_fields = []
@@ -1165,7 +1305,7 @@ def _extract_create_intent(
     return {
         "intent": "create_task",
         "title": title,
-        "notes": assistant_notes,
+        "notes": _join_note_sections(detail_notes, assistant_notes),
         "due": due,
         "metadata": normalize_metadata(metadata),
         "missing_fields": missing_fields,
@@ -1285,6 +1425,14 @@ def _extract_query_after_action(user_text: str) -> str | None:
 
 
 def _normalize_create_request_text(user_text: str) -> str:
+    followup_blob = FOLLOWUP_BLOB_RE.match(user_text)
+    if followup_blob is not None:
+        target = followup_blob.group("object").lower()
+        timing = _clean_spaces(followup_blob.group("timing").strip(" .,:;-"))
+        title = f"Follow up on {target}{f' {timing}' if timing else ''}"
+        body = _clean_spaces(followup_blob.group("body").strip())
+        return f"add task: {title}\nNotes: {body}"
+
     normalized = CREATE_TASK_TRANSCRIPTION_RE.sub("add ", user_text, count=1)
     return re.sub(
         r"^\s*(?:i\s+had|there\s+is|this\s+is)\s+(?:a\s+)?"

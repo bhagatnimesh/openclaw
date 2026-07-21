@@ -41,6 +41,11 @@
       - any-glob-to-any-file:
           - "extensions/google-meet/**"
           - "docs/plugins/google-meet.md"
+"plugin: home-assistant":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "extensions/home-assistant/**"
+          - "docs/plugins/home-assistant.md"
 "plugin: workboard":
   - changed-files:
       - any-glob-to-any-file:

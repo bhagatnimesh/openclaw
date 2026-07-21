@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import date
 from pathlib import Path
 import sys
 import tempfile
@@ -20,6 +21,7 @@ from telegram_audio import (
 from telegram_bot import (
     ERROR_MESSAGE,
     HELP_MESSAGE,
+    HOW_TO_HELP,
     SETUP_USER_MESSAGE,
     UNAUTHORIZED_MESSAGE,
     N4OSTelegramBot,
@@ -33,6 +35,7 @@ from telegram_bot import (
     build_application,
     load_config,
 )
+from n4os_memory_inbox import MemoryIngestResult, MemoryObservation
 
 
 class FakeMessage:
@@ -279,6 +282,168 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(claw.requests, ["add task buy milk"])
         self.assertEqual(message.replies, ["router replied to: add task buy milk"])
+
+    async def test_authorized_memory_inbox_is_captured_without_routing(self):
+        claw = FakeClaw()
+        result = MemoryIngestResult(
+            added=[
+                MemoryObservation(
+                    observed_on=date(2026, 7, 21),
+                    person="Nysha",
+                    observation="liked teaching younger kids",
+                    source="Telegram",
+                )
+            ],
+            skipped_duplicates=[],
+        )
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/mem-inbox\nNysha: liked teaching younger kids")
+
+        with patch("telegram_bot.ingest_memory_inbox_notes", return_value=result) as ingest:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        ingest.assert_called_once_with(
+            "/mem-inbox\nNysha: liked teaching younger kids",
+            source="Telegram",
+        )
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(
+            message.replies,
+            [
+                "N4OS memory inbox processed.\n"
+                "Captured 1 new observations.\n"
+                "New observations by person:\n"
+                "- Nysha: 1\n"
+                "Saved to n4os/family/observations/YYYY-MM.md.\n"
+                "No child profiles were promoted automatically."
+            ],
+        )
+
+    async def test_authorized_memory_status_reports_without_routing_or_capture(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/memory-status family")
+
+        with (
+            patch("telegram_bot.format_memory_status", return_value="family memory summary") as status,
+            patch("telegram_bot.ingest_memory_inbox_notes") as ingest,
+        ):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        status.assert_called_once_with("family")
+        ingest.assert_not_called()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["family memory summary"])
+
+    async def test_authorized_goals_question_reports_from_n4os_memory(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("what are my current goals?")
+
+        with patch("telegram_bot.format_goals_status", return_value="current goals summary") as goals:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        goals.assert_called_once_with()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["current goals summary"])
+
+    async def test_authorized_status_alias_routes_to_reading_status(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/status")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, ["reading status"])
+        self.assertEqual(message.replies, ["router replied to: reading status"])
+
+    async def test_authorized_how_to_memory_gets_direct_help(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("how do I add a memory?")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, [HOW_TO_HELP["memory"]])
+
+    async def test_authorized_commands_question_gets_general_help(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("what commands can I use?")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, [HELP_MESSAGE])
+
+    async def test_authorized_how_to_before_leaving_portal_gets_direct_help(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage(
+            "how do I add things to carry before leaving which appears on portal"
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, [HOW_TO_HELP["before_leave"]])
+
+    async def test_authorized_can_i_add_date_for_home_board_gets_direct_help(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("can I add a date for the item for home board?")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, [HOW_TO_HELP["home_board"]])
+
+    async def test_authorized_how_to_library_gets_direct_help(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("how do I use library?")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, [HOW_TO_HELP["library"]])
 
     async def test_authorized_voice_routes_transcript_to_n4os(self):
         claw = FakeClaw()
@@ -594,6 +759,11 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         await bot.handle_help(FakeUpdate(12345, message), None)
 
         self.assertEqual(message.replies, [HELP_MESSAGE])
+        self.assertIn("/mem Nysha", HELP_MESSAGE)
+        self.assertIn("/memory-status family", HELP_MESSAGE)
+        self.assertIn("/event create", HELP_MESSAGE)
+        self.assertIn("/goals", HELP_MESSAGE)
+        self.assertIn("Nysha read 8 pages", HELP_MESSAGE)
 
     async def test_router_errors_are_reported_gracefully(self):
         bot = N4OSTelegramBot(

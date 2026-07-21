@@ -53,6 +53,15 @@ Use `archive/raw_notes.md` only when nuance is missing.
 - Prefer calm response over emotional reaction.
 - Prefer simple systems over complex intentions.
 
+## Family Memory Capture
+
+- New family observations first land as dated observations under `family/observations/YYYY-MM.md`.
+- Google Docs or Telegram inbox imports may append observations automatically.
+- Do not promote raw observations directly into `family/Nysha.md` or `family/Navya.md`.
+- Promote only repeated, recent, actionable, non-limiting patterns after review.
+- Prefer current-pattern wording such as "currently tends to" over fixed identity wording.
+- When advice depends on family memory, state which N4OS files were used.
+
 ## Non-Goals To Guard Against
 
 Do not optimize me for:
@@ -89,4 +98,3 @@ Good N4OS guidance should end with:
 - the tradeoff
 - the next action
 - the review point
-

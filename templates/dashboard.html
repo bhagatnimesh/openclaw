@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="n4os-dashboard-action-token" content="{{ACTION_TOKEN}}">
     <title>N4OS Portal Dashboard</title>
-    <link rel="stylesheet" href="/static/dashboard/dashboard.css">
+    <link rel="stylesheet" href="/static/dashboard/dashboard.css?v={{ASSET_VERSION}}">
   </head>
   <body>
     <div class="app-frame">
@@ -62,7 +62,7 @@
                 <p id="best-action-why" class="lede">Looking for the highest-leverage read-only signal.</p>
                 <div id="best-action-reasons" class="reason-list"></div>
               </article>
-              <article class="panel home-board-panel">
+              <article class="panel home-board-panel" data-dashboard-card="home-board">
                 <div class="panel-header">
                   <h3>Today at Home</h3>
                   <span id="home-board-count">0 pending</span>
@@ -70,7 +70,7 @@
                 <div id="home-board-items" class="home-board-list"></div>
               </article>
             </div>
-            <article class="panel timeline-panel">
+            <article class="panel timeline-panel" data-dashboard-card="timeline">
               <div class="panel-header">
                 <h3>Today's Timeline</h3>
                 <span id="busy-day-label">No schedule yet</span>
@@ -79,15 +79,15 @@
             </article>
           </div>
           <div class="signal-grid">
-            <article class="signal-card must">
+            <article class="signal-card must" data-dashboard-card="open-loops">
               <p class="eyebrow">Open Loops</p>
               <div id="open-loops"></div>
             </article>
-            <article class="signal-card should">
+            <article class="signal-card should" data-dashboard-card="prep-needed">
               <p class="eyebrow">Prep Needed</p>
               <div id="prep-needed"></div>
             </article>
-            <article class="signal-card can">
+            <article class="signal-card can" data-dashboard-card="warnings">
               <p class="eyebrow">Warnings</p>
               <div id="warnings"></div>
             </article>
@@ -109,7 +109,7 @@
             <strong id="decision-count-label" class="section-count">0 open</strong>
           </div>
           <div class="decisions-layout">
-            <article class="panel decision-summary-panel">
+            <article class="panel decision-summary-panel" data-dashboard-card="decision-attention">
               <div class="panel-header">
                 <h3>Needs Attention</h3>
                 <span id="decision-attention-count">0</span>
@@ -127,15 +127,16 @@
             <strong id="task-count-label" class="section-count">0 pending</strong>
           </div>
           <div class="tasks-overview">
-            <article class="panel pending-tasks-panel">
+            <article class="panel pending-tasks-panel" data-dashboard-card="pending-tasks">
               <div class="panel-header">
                 <h3>Pending Queue</h3>
                 <span id="pending-task-count">0 pending</span>
               </div>
+              <div id="task-tag-filters" class="task-tag-filters" aria-label="Filter tasks by tag"></div>
               <p id="task-action-status" class="task-action-status" aria-live="polite"></p>
               <div id="pending-task-items" class="pending-task-list"></div>
             </article>
-            <article class="panel task-triage-panel">
+            <article class="panel task-triage-panel" data-dashboard-card="task-triage">
               <div class="panel-header">
                 <h3>Quick Triage</h3>
                 <span>Today</span>
@@ -156,7 +157,7 @@
               </div>
             </article>
           </div>
-          <div class="task-lanes-heading">
+          <div id="task-lanes-heading" class="task-lanes-heading">
             <h3>Context Lanes</h3>
           </div>
           <div id="task-groups" class="task-grid"></div>
@@ -213,7 +214,7 @@
                   </div>
                 </article>
 
-                <article class="panel reading-moments-panel">
+                <article class="panel reading-moments-panel" data-dashboard-card="reading-moments">
                   <div class="panel-header">
                     <h3>Recent Reading Moments</h3>
                     <span id="reading-moment-count">0 moments</span>
@@ -232,7 +233,7 @@
                   <p id="library-due-date" class="library-due-date"></p>
                 </article>
 
-                <article class="panel reading-bag-panel">
+                <article class="panel reading-bag-panel" data-dashboard-card="library-bag">
                   <div class="panel-header">
                     <h3>Current Library Bag</h3>
                     <span id="library-bag-count">0 books</span>
@@ -240,7 +241,7 @@
                   <div id="library-bag-list" class="library-bag-list"></div>
                 </article>
 
-                <article class="panel reading-bloomed-panel">
+                <article class="panel reading-bloomed-panel" data-dashboard-card="reading-bloomed">
                   <div class="panel-header">
                     <h3>Recently Bloomed</h3>
                     <span id="reading-bloomed-count">0</span>
@@ -248,7 +249,7 @@
                   <div id="reading-finished-books" class="reading-mini-list"></div>
                 </article>
 
-                <article class="panel reading-photos-panel">
+                <article class="panel reading-photos-panel" data-dashboard-card="reading-photos">
                   <div class="panel-header">
                     <h3>Book Snaps</h3>
                     <span id="reading-photo-count">0</span>
@@ -258,7 +259,7 @@
               </aside>
             </div>
 
-            <article class="panel reading-collection-panel">
+            <article class="panel reading-collection-panel" data-dashboard-card="reading-collection">
               <div class="panel-header">
                 <h3>My Book Collection</h3>
                 <span id="reading-collection-count">0 books</span>
@@ -274,28 +275,28 @@
             <span></span>
           </div>
           <div class="family-grid">
-            <article class="panel">
+            <article class="panel" data-dashboard-card="family-members">
               <div class="panel-header">
                 <h3>Family Members</h3>
                 <span id="family-count">0 known</span>
               </div>
               <div id="family-members" class="member-list"></div>
             </article>
-            <article class="panel">
+            <article class="panel" data-dashboard-card="responsibilities">
               <div class="panel-header">
                 <h3>Responsibilities</h3>
                 <span>Today</span>
               </div>
               <div id="responsibilities" class="compact-list"></div>
             </article>
-            <article class="panel">
+            <article class="panel" data-dashboard-card="child-events">
               <div class="panel-header">
                 <h3>Child Events</h3>
                 <span>Today</span>
               </div>
               <div id="child-events" class="compact-list"></div>
             </article>
-            <article class="panel warm-panel">
+            <article class="panel warm-panel" data-dashboard-card="unassigned">
               <div class="panel-header">
                 <h3>Unassigned</h3>
                 <span id="unassigned-count">0</span>
@@ -307,6 +308,6 @@
       </main>
     </div>
 
-    <script src="/static/dashboard/dashboard.js"></script>
+    <script src="/static/dashboard/dashboard.js?v={{ASSET_VERSION}}"></script>
   </body>
 </html>

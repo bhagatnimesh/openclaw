@@ -8,6 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 try:
+    from .ai_refinement import OpenAIN4OSIntentInterpreter
     from .intent_router import (
         CALENDAR_ROOT,
         DECISIONS_ROOT,
@@ -17,6 +18,7 @@ try:
         N4OSIntentFrame,
         SCIENCE_LAB_ROOT,
         TASKS_ROOT,
+        _is_object_update_request,
         interpret_request,
         load_scoped_module,
         module_scope,
@@ -25,6 +27,7 @@ try:
     from .input_normalizer import improve_entered_text
     from .prompts import CLARIFICATION_PROMPT, SYSTEM_PROMPT
 except ImportError:
+    from ai_refinement import OpenAIN4OSIntentInterpreter
     from intent_router import (
         CALENDAR_ROOT,
         DECISIONS_ROOT,
@@ -34,6 +37,7 @@ except ImportError:
         N4OSIntentFrame,
         SCIENCE_LAB_ROOT,
         TASKS_ROOT,
+        _is_object_update_request,
         interpret_request,
         load_scoped_module,
         module_scope,
@@ -367,6 +371,16 @@ def _clarified_route_action(
     if route == "calendar":
         return str(_calendar_module().extract_intent(request, now=reference_time)["intent"])
     if route == "tasks":
+        has_dangling_owner_annotation = (
+            re.search(
+                r"\b(?:the\s+)?owner\s*(?:is|:)?\s*$",
+                request,
+                flags=re.IGNORECASE,
+            )
+            is not None
+        )
+        if _is_object_update_request(request) and not has_dangling_owner_annotation:
+            return "update_task"
         task_intent = _tasks_module().extract_intent(request, now=reference_time)
         if task_intent.get("intent") != "recommend_tasks":
             return str(task_intent["intent"])
@@ -417,6 +431,10 @@ class N4OSClaw:
     intent_interpreter: Any | None = None
     pending_route_clarification: PendingRouteClarification | None = None
     route_context: RouteContext = field(default_factory=RouteContext)
+
+    @classmethod
+    def default(cls) -> "N4OSClaw":
+        return cls(intent_interpreter=OpenAIN4OSIntentInterpreter.from_env_or_none())
 
     def route(self, request: str, reference_time: datetime | None = None) -> dict[str, Any]:
         request = improve_entered_text(request)
@@ -476,7 +494,12 @@ class N4OSClaw:
         decisions = self.decisions_claw
         pending_owner = _pending_owner(calendar, tasks, home_board, decisions)
         if pending_owner is not None:
-            frame = self.interpret(request, reference_time=reference_time)
+            frame = interpret_request(
+                request,
+                now=reference_time,
+                context=self._context_payload(),
+                interpreter=None,
+            )
             decision = frame.to_route_decision()
             if _is_confident_new_route(decision, pending_owner):
                 _clear_pending_action(calendar)
@@ -886,7 +909,7 @@ class N4OSClaw:
 
 def run_cli(argv: list[str] | None = None) -> None:
     args = argv if argv is not None else sys.argv[1:]
-    claw = N4OSClaw()
+    claw = N4OSClaw.default()
     request = " ".join(args).strip()
     if request:
         claw.handle_request(request)

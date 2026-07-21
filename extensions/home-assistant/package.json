@@ -1,0 +1,18 @@
+{
+  "name": "@openclaw/home-assistant",
+  "version": "2026.7.10",
+  "private": true,
+  "description": "OpenClaw Home Assistant tool plugin",
+  "type": "module",
+  "dependencies": {
+    "typebox": "1.1.39"
+  },
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

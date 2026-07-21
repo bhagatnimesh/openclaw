@@ -8,6 +8,7 @@
   var keepAliveCanvas = null;
   var keepAliveFrameTimer = null;
   var keepAliveFrame = 0;
+  var lastTasksData = {};
 
   function byId(id) {
     return document.getElementById(id);
@@ -51,6 +52,30 @@
     return '<p class="empty">' + escapeHtml(label) + "</p>";
   }
 
+  function setCardHidden(cardKey, hidden) {
+    var node = document.querySelector('[data-dashboard-card="' + cardKey + '"]');
+    if (node) {
+      node.hidden = !!hidden;
+    }
+  }
+
+  function setContainerHidden(id, hidden) {
+    var node = byId(id);
+    if (node) {
+      node.hidden = !!hidden;
+    }
+  }
+
+  function closestActionTarget(target) {
+    while (target && target !== document) {
+      if (target.getAttribute("data-task-complete") !== null || target.getAttribute("data-task-tag-filter") !== null) {
+        return target;
+      }
+      target = target.parentNode;
+    }
+    return null;
+  }
+
   function currentSectionId() {
     var hash = window.location.hash || "#today";
     if (!/^#[A-Za-z0-9_-]+$/.test(hash)) return "today";
@@ -79,6 +104,26 @@
     } catch (_error) {
       return null;
     }
+  }
+
+  function normalizeTag(value) {
+    return text(value).trim().replace(/^#/, "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  }
+
+  function selectedTaskTag() {
+    return normalizeTag(getQueryParam("tag"));
+  }
+
+  function setSelectedTaskTag(tag) {
+    var selected = normalizeTag(tag);
+    var url = new URL(window.location.href);
+    if (selected) {
+      url.searchParams.set("tag", selected);
+      url.hash = "#tasks";
+    } else {
+      url.searchParams.delete("tag");
+    }
+    window.history.replaceState({}, "", url.toString());
   }
 
   function parseClockMinutes(value) {
@@ -313,8 +358,10 @@
   function renderTimeline(events) {
     var node = byId("today-timeline");
     if (!node) return;
-    if (!events || !events.length) {
-      node.innerHTML = empty("No calendar events today.");
+    events = events || [];
+    setCardHidden("timeline", !events.length);
+    if (!events.length) {
+      node.innerHTML = "";
       return;
     }
     node.innerHTML = events.map(function (event) {
@@ -336,8 +383,9 @@
     if (!node) return;
     items = items || [];
     setText("home-board-count", items.length + " pending");
+    setCardHidden("home-board", !items.length);
     if (!items.length) {
-      node.innerHTML = empty("Nothing pinned for the household today.");
+      node.innerHTML = "";
       return;
     }
 
@@ -422,8 +470,9 @@
     if (countNode) {
       countNode.textContent = books.length + (books.length === 1 ? " book" : " books");
     }
+    setCardHidden("reading-collection", !books.length);
     if (!books.length) {
-      node.innerHTML = empty("No books in the garden yet.");
+      node.innerHTML = "";
       return;
     }
     node.innerHTML = books.slice(0, 10).map(function (book, index) {
@@ -496,6 +545,7 @@
 
     var finishedNode = byId("reading-finished-books");
     var recentBooks = finished.recent_books || [];
+    setCardHidden("reading-bloomed", !recentBooks.length);
     if (finishedNode) {
       finishedNode.innerHTML = recentBooks.length
         ? recentBooks.slice(0, 4).map(function (book) {
@@ -505,12 +555,13 @@
               '</strong><span>I read it myself</span></div></div>'
             );
           }).join("")
-        : empty("No finished books yet.");
+        : "";
     }
 
     var photoNode = byId("reading-photo-list");
     var photos = data.recent_photos || [];
     setText("reading-photo-count", photos.length);
+    setCardHidden("reading-photos", !photos.length);
     if (photoNode) {
       photoNode.innerHTML = photos.length
         ? photos.slice(0, 6).map(function (photo) {
@@ -528,10 +579,11 @@
             }
             return listItem(book, "");
           }).join("")
-        : empty("No book photos yet.");
+        : "";
     }
 
     var eventsNode = byId("reading-recent-events");
+    setCardHidden("reading-moments", !recentEvents.length);
     if (eventsNode) {
       eventsNode.innerHTML = recentEvents.length
         ? recentEvents.slice(0, 6).map(function (event) {
@@ -544,7 +596,7 @@
               "</span></div></div>"
             );
           }).join("")
-        : empty("No recent reading moments yet.");
+        : "";
     }
 
     renderLibraryBag(data.library_visit || {}, data.current_bag || {});
@@ -572,6 +624,7 @@
 
     var listNode = byId("library-bag-list");
     var titles = bag.titles || [];
+    setCardHidden("library-bag", !titles.length);
     if (!listNode) return;
     listNode.innerHTML = titles.length
       ? titles.slice(0, 12).map(function (title) {
@@ -581,7 +634,7 @@
             "</strong></div>"
           );
         }).join("")
-      : empty("No library books saved yet.");
+      : "";
   }
 
   function renderSummary(data) {
@@ -602,8 +655,10 @@
   function renderOpenLoops(tasks) {
     var node = byId("open-loops");
     if (!node) return;
-    if (!tasks || !tasks.length) {
-      node.innerHTML = empty("No urgent task loops.");
+    tasks = tasks || [];
+    setCardHidden("open-loops", !tasks.length);
+    if (!tasks.length) {
+      node.innerHTML = "";
       return;
     }
     node.innerHTML = tasks.slice(0, 3).map(function (task) {
@@ -614,8 +669,10 @@
   function renderPrep(events) {
     var node = byId("prep-needed");
     if (!node) return;
-    if (!events || !events.length) {
-      node.innerHTML = empty("No prep-needed items in the next 7 days.");
+    events = events || [];
+    setCardHidden("prep-needed", !events.length);
+    if (!events.length) {
+      node.innerHTML = "";
       return;
     }
     node.innerHTML = events.slice(0, 3).map(function (event) {
@@ -626,8 +683,10 @@
   function renderWarnings(warnings) {
     var node = byId("warnings");
     if (!node) return;
-    if (!warnings || !warnings.length) {
-      node.innerHTML = empty("No conflicts or overload warnings.");
+    warnings = warnings || [];
+    setCardHidden("warnings", !warnings.length);
+    if (!warnings.length) {
+      node.innerHTML = "";
       return;
     }
     node.innerHTML = warnings.slice(0, 3).map(function (warning) {
@@ -638,8 +697,10 @@
   function renderPlanning(items) {
     var node = byId("planning-items");
     if (!node) return;
-    if (!items || !items.length) {
-      node.innerHTML = empty("No upcoming trips, school events, paperwork, birthdays, or medical planning items found.");
+    items = items || [];
+    setContainerHidden("planning-items", !items.length);
+    if (!items.length) {
+      node.innerHTML = "";
       return;
     }
     node.innerHTML = items.map(function (item) {
@@ -683,6 +744,71 @@
   function taskBadge(label, tone) {
     if (!label) return "";
     return '<span class="task-badge ' + escapeHtml(tone || "") + '">' + escapeHtml(label) + "</span>";
+  }
+
+  function taskTagBadge(tag) {
+    var normalized = normalizeTag(tag);
+    if (!normalized) return "";
+    return (
+      '<button class="task-badge tag" type="button" data-task-tag-filter="' +
+      escapeHtml(normalized) +
+      '">#' +
+      escapeHtml(normalized) +
+      "</button>"
+    );
+  }
+
+  function taskMatchesTag(task, tag) {
+    if (!tag) return true;
+    return (task.tags || []).some(function (taskTag) {
+      return normalizeTag(taskTag) === tag;
+    });
+  }
+
+  function filterTasksByTag(tasks, tag) {
+    tasks = tasks || [];
+    if (!tag) return tasks;
+    return tasks.filter(function (task) {
+      return taskMatchesTag(task, tag);
+    });
+  }
+
+  function renderTaskTagFilters(tags, selectedTag, taskCount) {
+    var node = byId("task-tag-filters");
+    if (!node) return;
+    tags = (tags || []).map(normalizeTag).filter(Boolean);
+    var seen = {};
+    tags = tags.filter(function (tag) {
+      if (seen[tag]) return false;
+      seen[tag] = true;
+      return true;
+    });
+    if (selectedTag && !seen[selectedTag]) {
+      tags.unshift(selectedTag);
+    }
+    if (!tags.length && !selectedTag) {
+      node.hidden = true;
+      node.innerHTML = "";
+      return;
+    }
+    node.hidden = false;
+    var allButton =
+      '<button class="task-tag-filter ' +
+      (!selectedTag ? "is-active" : "") +
+      '" type="button" data-task-tag-filter="">All</button>';
+    var tagButtons = tags.map(function (tag) {
+      return (
+        '<button class="task-tag-filter ' +
+        (tag === selectedTag ? "is-active" : "") +
+        '" type="button" data-task-tag-filter="' +
+        escapeHtml(tag) +
+        '">#' +
+        escapeHtml(tag) +
+        "</button>"
+      );
+    }).join("");
+    var resultLabel = selectedTag ? '<span class="task-tag-result">' + escapeHtml(taskCount) + " shown</span>" : "";
+    node.innerHTML = allButton + tagButtons + resultLabel;
   }
 
   function taskTone(task) {
@@ -773,32 +899,30 @@
     request.send(JSON.stringify({ task_id: taskId }));
   }
 
-  function renderPendingTasks(tasks) {
+  function renderPendingTasks(tasks, allTaskCount) {
     var node = byId("pending-task-items");
     tasks = tasks || [];
-    setText("task-count-label", tasks.length + " pending");
-    setText("pending-task-count", tasks.length + " pending");
-    setText(
-      "task-due-count",
-      tasks.filter(function (task) {
-        return task.days_until_due !== null && task.days_until_due !== undefined && task.days_until_due <= 0;
-      }).length
-    );
-    setText(
-      "task-unassigned-count",
-      tasks.filter(function (task) {
-        return task.owner === "unknown";
-      }).length
-    );
-    setText(
-      "task-unscheduled-count",
-      tasks.filter(function (task) {
-        return task.days_until_due === null || task.days_until_due === undefined;
-      }).length
-    );
+    allTaskCount = allTaskCount === undefined ? tasks.length : allTaskCount;
+    var dueCount = tasks.filter(function (task) {
+      return task.days_until_due !== null && task.days_until_due !== undefined && task.days_until_due <= 0;
+    }).length;
+    var unassignedCount = tasks.filter(function (task) {
+      return task.owner === "unknown";
+    }).length;
+    var unscheduledCount = tasks.filter(function (task) {
+      return task.days_until_due === null || task.days_until_due === undefined;
+    }).length;
+    var countLabel = tasks.length === allTaskCount ? tasks.length + " pending" : tasks.length + " of " + allTaskCount + " pending";
+    setText("task-count-label", countLabel);
+    setText("pending-task-count", countLabel);
+    setText("task-due-count", dueCount);
+    setText("task-unassigned-count", unassignedCount);
+    setText("task-unscheduled-count", unscheduledCount);
+    setCardHidden("pending-tasks", !allTaskCount);
+    setCardHidden("task-triage", dueCount + unassignedCount + unscheduledCount === 0);
     if (!node) return;
     if (!tasks.length) {
-      node.innerHTML = empty("No pending Google Tasks found.");
+      node.innerHTML = empty("No pending tasks match this tag.");
       return;
     }
     node.innerHTML = tasks.slice(0, 10).map(function (task) {
@@ -808,7 +932,7 @@
         taskBadge(task.owner_label || "Unassigned", task.owner === "unknown" ? "alert" : "green"),
         task.duration_minutes ? taskBadge(task.duration_minutes + " min", "") : "",
         context ? taskBadge(context, "") : "",
-      ].join("");
+      ].concat((task.tags || []).map(taskTagBadge)).join("");
       return (
         '<div class="pending-task ' +
         escapeHtml(taskTone(task)) +
@@ -823,21 +947,36 @@
     }).join("");
   }
 
-  function renderTaskGroups(groups) {
+  function renderTaskGroups(groups, selectedTag) {
     var node = byId("task-groups");
     if (!node) return;
-    if (!groups || !groups.length) {
-      node.innerHTML = empty("No recommended task groups.");
+    var visibleGroups = (groups || []).map(function (group) {
+      var items = group.items || [];
+      if (selectedTag) {
+        items = items.filter(function (recommendation) {
+          return recommendation.task && taskMatchesTag(recommendation.task, selectedTag);
+        });
+      }
+      return {
+        label: group.label,
+        detail: group.detail,
+        items: items,
+      };
+    }).filter(function (group) {
+      return group.items && group.items.length;
+    });
+    setContainerHidden("task-lanes-heading", !visibleGroups.length);
+    setContainerHidden("task-groups", !visibleGroups.length);
+    if (!visibleGroups.length) {
+      node.innerHTML = "";
       return;
     }
-    node.innerHTML = groups.map(function (group) {
-      var items = group.items && group.items.length
-        ? group.items.map(function (recommendation) {
-            var task = recommendation.task;
-            var reason = recommendation.reasons && recommendation.reasons.length ? recommendation.reasons[0] : task.due_label;
-            return listItem(task.title, reason);
-          }).join("")
-        : empty("Nothing matching this context.");
+    node.innerHTML = visibleGroups.map(function (group) {
+      var items = group.items.map(function (recommendation) {
+        var task = recommendation.task;
+        var reason = recommendation.reasons && recommendation.reasons.length ? recommendation.reasons[0] : task.due_label;
+        return listItem(task.title, reason);
+      }).join("");
       return (
         '<article class="task-card"><h3>' +
         escapeHtml(group.label) +
@@ -868,6 +1007,7 @@
     var attention = data.attention || [];
     setText("decision-count-label", open.length + " open");
     setText("decision-attention-count", attention.length);
+    setCardHidden("decision-attention", !attention.length);
 
     var attentionNode = byId("decision-attention");
     if (attentionNode) {
@@ -878,13 +1018,14 @@
               : decision.due_label;
             return listItem(decision.title, missing);
           }).join("")
-        : empty("No open decision needs attention.");
+        : "";
     }
 
     var node = byId("decision-items");
     if (!node) return;
+    setContainerHidden("decision-items", !open.length);
     if (!open.length) {
-      node.innerHTML = empty("No pending family decisions.");
+      node.innerHTML = "";
       return;
     }
     node.innerHTML = open.map(function (decision) {
@@ -918,6 +1059,7 @@
     setText("family-count", members.length + " known");
     setText("unassigned-count", data.unassigned ? data.unassigned.length : 0);
     var memberNode = byId("family-members");
+    setCardHidden("family-members", !members.length);
     if (memberNode) {
       memberNode.innerHTML = members.length
         ? members.map(function (member) {
@@ -931,31 +1073,37 @@
               "</p></div></div>"
             );
           }).join("")
-        : empty("No family metadata found in today's events or tasks.");
+        : "";
     }
     var responsibilities = byId("responsibilities");
+    var responsibilityItems = data.responsibilities || [];
+    setCardHidden("responsibilities", !responsibilityItems.length);
     if (responsibilities) {
-      responsibilities.innerHTML = data.responsibilities && data.responsibilities.length
-        ? data.responsibilities.map(function (item) {
+      responsibilities.innerHTML = responsibilityItems.length
+        ? responsibilityItems.map(function (item) {
             return listItem(item.title, item.owner + " | " + item.detail);
           }).join("")
-        : empty("No owned responsibilities today.");
+        : "";
     }
     var childEvents = byId("child-events");
+    var childEventItems = data.child_events || [];
+    setCardHidden("child-events", !childEventItems.length);
     if (childEvents) {
-      childEvents.innerHTML = data.child_events && data.child_events.length
-        ? data.child_events.map(function (event) {
+      childEvents.innerHTML = childEventItems.length
+        ? childEventItems.map(function (event) {
             return listItem(event.title, [event.person, event.time_label].filter(Boolean).join(" | "));
           }).join("")
-        : empty("No child-specific events today.");
+        : "";
     }
     var unassigned = byId("unassigned");
+    var unassignedItems = data.unassigned || [];
+    setCardHidden("unassigned", !unassignedItems.length);
     if (unassigned) {
-      unassigned.innerHTML = data.unassigned && data.unassigned.length
-        ? data.unassigned.map(function (item) {
+      unassigned.innerHTML = unassignedItems.length
+        ? unassignedItems.map(function (item) {
             return listItem(item.title, item.detail);
           }).join("")
-        : empty("Nothing unassigned.");
+        : "";
     }
   }
 
@@ -983,11 +1131,21 @@
     renderOpenLoops(tasks.open_loops || []);
     renderPlanning(data.planning ? data.planning.items : []);
     renderDecisions(data.decisions || {});
-    renderPendingTasks(tasks.pending || []);
-    renderTaskGroups(tasks.groups || []);
+    lastTasksData = tasks;
+    renderTasks(tasks);
     renderFamily(data.family || {});
     updateActiveNav();
     scrollToHashSection();
+  }
+
+  function renderTasks(tasks) {
+    tasks = tasks || {};
+    var pendingTasks = tasks.pending || [];
+    var selectedTag = selectedTaskTag();
+    var filteredTasks = filterTasksByTag(pendingTasks, selectedTag);
+    renderTaskTagFilters(tasks.tags || [], selectedTag, filteredTasks.length);
+    renderPendingTasks(filteredTasks, pendingTasks.length);
+    renderTaskGroups(tasks.groups || [], selectedTag);
   }
 
   function loadDashboard() {
@@ -1010,11 +1168,15 @@
   window.setInterval(syncWakeLock, wakeLockCheckMs);
   document.addEventListener("visibilitychange", syncWakeLock);
   document.addEventListener("click", function (event) {
-    var target = event.target;
-    while (target && target !== document && !target.getAttribute("data-task-complete")) {
-      target = target.parentNode;
+    var target = closestActionTarget(event.target);
+    if (!target) return;
+    if (target.getAttribute("data-task-tag-filter") !== null) {
+      setSelectedTaskTag(target.getAttribute("data-task-tag-filter"));
+      renderTasks(lastTasksData);
+      updateActiveNav();
+      scrollToHashSection();
+      return;
     }
-    if (!target || target === document) return;
     postCompleteTask(target.getAttribute("data-task-complete"), target);
   });
   window.addEventListener("focus", syncWakeLock);

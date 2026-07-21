@@ -98,6 +98,56 @@ describe("buildOpenAISpeechProvider", () => {
     });
   });
 
+  it("uses the shared OpenAI provider key when speech config omits a TTS key", () => {
+    const provider = buildOpenAISpeechProvider();
+    const resolved = provider.resolveConfig?.({
+      cfg: {
+        models: {
+          providers: {
+            openai: {
+              apiKey: "sk-shared",
+            },
+          },
+        },
+      } as never,
+      timeoutMs: 30_000,
+      rawConfig: {
+        providers: {
+          openai: {
+            model: "tts-1",
+          },
+        },
+      },
+    });
+
+    expect(resolved?.apiKey).toBe("sk-shared");
+  });
+
+  it("keeps an explicit TTS key ahead of the shared OpenAI provider key", () => {
+    const provider = buildOpenAISpeechProvider();
+    const resolved = provider.resolveConfig?.({
+      cfg: {
+        models: {
+          providers: {
+            openai: {
+              apiKey: "sk-shared",
+            },
+          },
+        },
+      } as never,
+      timeoutMs: 30_000,
+      rawConfig: {
+        providers: {
+          openai: {
+            apiKey: "sk-tts",
+          },
+        },
+      },
+    });
+
+    expect(resolved?.apiKey).toBe("sk-tts");
+  });
+
   it("drops malformed speech speed values", () => {
     const provider = buildOpenAISpeechProvider();
     const resolved = provider.resolveConfig?.({

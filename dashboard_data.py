@@ -92,6 +92,35 @@ def _tokens(value: str | None) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", value.lower()))
 
 
+def _extract_hashtag_tags(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [
+        match.group("tag")
+        for match in re.finditer(r"(?<![\w/])#(?P<tag>[A-Za-z][A-Za-z0-9_-]*)", value)
+    ]
+
+
+def _normalize_tags(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_tags = re.split(r"[\s,]+", value)
+    elif isinstance(value, list | tuple | set):
+        raw_tags = value
+    else:
+        raw_tags = []
+
+    tags = []
+    seen = set()
+    for raw_tag in raw_tags:
+        tag = _clean_text(raw_tag).lstrip("#").lower()
+        tag = re.sub(r"[^a-z0-9_-]+", "-", tag).strip("-")
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        tags.append(tag)
+    return tags
+
+
 def _normalize_event(
     event: dict[str, Any],
     read_metadata: CalendarMetadataReader,
@@ -171,6 +200,13 @@ def _normalize_task(
         "requires": list(metadata.get("requires") or []),
         "can_do_while": list(metadata.get("can_do_while") or []),
         "location": _clean_text(metadata.get("location"), "unknown"),
+        "tags": _normalize_tags(
+            [
+                *_normalize_tags(metadata.get("tags")),
+                *_extract_hashtag_tags(task.get("title")),
+                *_extract_hashtag_tags(notes),
+            ],
+        ),
         "metadata": metadata,
     }
 
@@ -957,6 +993,7 @@ def build_dashboard_data(
     )
     open_loops = open_loops[:8]
     pending_tasks = tasks[:24]
+    task_tags = sorted({tag for task in pending_tasks for tag in task["tags"]})
 
     warnings = [
         {"level": "warning", "title": conflict["title"], "detail": conflict["detail"]}
@@ -1014,6 +1051,7 @@ def build_dashboard_data(
             "urgent": [_public_task(task) for task in urgent_tasks],
             "due_soon": [_public_task(task) for task in due_soon_tasks],
             "pending": [_public_task(task) for task in pending_tasks],
+            "tags": task_tags,
             "recommended": [
                 {
                     "task": _public_task(recommendation["task"]),

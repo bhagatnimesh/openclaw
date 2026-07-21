@@ -20,6 +20,22 @@ STATIC_ROOT = ROOT / "static" / "dashboard"
 ACTION_TOKEN = secrets.token_urlsafe(24)
 
 
+def _dashboard_asset_version() -> str:
+    mtimes = [
+        (STATIC_ROOT / "dashboard.css").stat().st_mtime_ns,
+        (STATIC_ROOT / "dashboard.js").stat().st_mtime_ns,
+    ]
+    return str(max(mtimes))
+
+
+def _render_dashboard_html() -> str:
+    return (
+        TEMPLATE_FILE.read_text(encoding="utf-8")
+        .replace("{{ACTION_TOKEN}}", html.escape(ACTION_TOKEN, quote=True))
+        .replace("{{ASSET_VERSION}}", html.escape(_dashboard_asset_version(), quote=True))
+    )
+
+
 def _json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
     body = json.dumps(payload, indent=2, default=str).encode("utf-8")
     handler.send_response(status)
@@ -48,10 +64,7 @@ def _file_response(handler: BaseHTTPRequestHandler, path: Path, content_type: st
 
 
 def _dashboard_response(handler: BaseHTTPRequestHandler) -> None:
-    body = TEMPLATE_FILE.read_text(encoding="utf-8").replace(
-        "{{ACTION_TOKEN}}",
-        html.escape(ACTION_TOKEN, quote=True),
-    ).encode("utf-8")
+    body = _render_dashboard_html().encode("utf-8")
     handler.send_response(200)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
     handler.send_header("Cache-Control", "no-cache")
@@ -227,10 +240,7 @@ def create_app() -> Any:
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard() -> str:
-        return TEMPLATE_FILE.read_text(encoding="utf-8").replace(
-            "{{ACTION_TOKEN}}",
-            html.escape(ACTION_TOKEN, quote=True),
-        )
+        return _render_dashboard_html()
 
     @app.get("/healthz", response_class=JSONResponse)
     def healthz() -> Any:

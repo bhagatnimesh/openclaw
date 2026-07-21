@@ -292,6 +292,30 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertEqual(metadata["effort_type"], "communication")
         self.assertEqual(metadata["requires"], ["phone"])
 
+    def test_add_task_from_refined_header_and_body(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "\n".join(
+                    [
+                        "Add task: Call FUSD about Nysha waitlist",
+                        "Notes: Follow up with Chadbourne about the overflow waitlist.",
+                        "Ask for the right contact and next steps.",
+                    ]
+                ),
+            )
+
+        self.assertIn("Created task: Call FUSD about Nysha waitlist", message)
+        created = provider.created[0]
+        self.assertEqual(created["title"], "Call FUSD about Nysha waitlist")
+        self.assertEqual(
+            created["notes"],
+            "Follow up with Chadbourne about the overflow waitlist.\n"
+            "Ask for the right contact and next steps.",
+        )
+
     def test_add_task_from_request_persists_visible_tags(self):
         provider = FakeProvider()
         claw = FamilyTasksClaw.from_provider(provider)
@@ -921,6 +945,25 @@ class FamilyTasksClawTest(unittest.TestCase):
         _, metadata = _task_notes_and_metadata(provider.updated[-1])
         self.assertEqual(metadata["owner"], "dad")
 
+    def test_assign_owner_by_ambiguous_title_updates_selected_task(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            _task("Return amazon", {"owner": "unknown"}, due="2026-07-07"),
+            _task("Return library book", {"owner": "unknown"}, due="2026-07-07"),
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            first = claw.assign_owner_from_request("assign return library to nimesh")
+            second_choice = claw.pending_action.choices[1]
+            handled = claw.handle_pending_response("2")
+
+        self.assertIn("Multiple matching tasks found", first)
+        self.assertTrue(handled)
+        self.assertEqual(provider.updated[-1]["id"], second_choice["id"])
+        _, metadata = _task_notes_and_metadata(provider.updated[-1])
+        self.assertEqual(metadata["owner"], "dad")
+
     def test_update_task_owner_accepts_non_assign_wording(self):
         provider = FakeProvider()
         claw = FamilyTasksClaw.from_provider(provider)
@@ -962,6 +1005,22 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertEqual(updated["notes"], "Tags: #home #cleanup")
         _, metadata = _task_notes_and_metadata(updated)
         self.assertEqual(metadata["tags"], ["home", "cleanup"])
+
+    def test_update_task_with_tags_phrase_updates_last_created_task(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.add_task_from_request("Add task research India trip restaurants")
+            message = claw.update_task_from_request(
+                "Update the task with tags #commute #india",
+            )
+
+        self.assertIn("Updated task (tags=#commute #india)", message)
+        updated = provider.updated[-1]
+        self.assertEqual(updated["notes"], "Tags: #commute #india")
+        _, metadata = _task_notes_and_metadata(updated)
+        self.assertEqual(metadata["tags"], ["commute", "india"])
 
     def test_update_task_followup_queues_noah_help_on_last_created_task(self):
         provider = FakeProvider()

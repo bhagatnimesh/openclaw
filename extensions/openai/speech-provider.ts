@@ -108,6 +108,13 @@ function readExtraBody(value: unknown): Record<string, unknown> | undefined {
   return body;
 }
 
+function readSharedOpenAIProviderConfig(cfg: unknown): Record<string, unknown> | undefined {
+  const root = asObjectRecord(cfg);
+  const models = asObjectRecord(root?.models);
+  const providers = asObjectRecord(models?.providers);
+  return asObjectRecord(providers?.openai);
+}
+
 function normalizeOpenAISpeechSpeed(value: unknown, baseUrl?: string): number | undefined {
   const speed = asFiniteNumber(value);
   if (speed === undefined) {
@@ -121,18 +128,24 @@ function normalizeOpenAISpeechSpeed(value: unknown, baseUrl?: string): number | 
 
 function normalizeOpenAIProviderConfig(
   rawConfig: Record<string, unknown>,
+  cfg?: unknown,
 ): OpenAITtsProviderConfig {
   const raw = resolveOpenAIProviderConfigRecord(rawConfig);
+  const shared = readSharedOpenAIProviderConfig(cfg);
   const extraBody = readExtraBody(raw?.extraBody) ?? readExtraBody(raw?.extra_body);
   const baseUrl = normalizeOpenAITtsBaseUrl(
     trimToUndefined(raw?.baseUrl) ??
       trimToUndefined(process.env.OPENAI_TTS_BASE_URL) ??
+      trimToUndefined(shared?.baseUrl) ??
       DEFAULT_OPENAI_BASE_URL,
   );
   return {
     apiKey: normalizeResolvedSecretInputString({
-      value: raw?.apiKey,
-      path: "messages.tts.providers.openai.apiKey",
+      value: raw?.apiKey ?? shared?.apiKey,
+      path:
+        raw?.apiKey === undefined
+          ? "models.providers.openai.apiKey"
+          : "messages.tts.providers.openai.apiKey",
     }),
     baseUrl,
     model: trimToUndefined(raw?.model) ?? "gpt-4o-mini-tts",
@@ -279,10 +292,10 @@ export function buildOpenAISpeechProvider(): SpeechProviderPlugin {
     defaultModel: OPENAI_TTS_MODELS[0],
     models: OPENAI_TTS_MODELS,
     voices: OPENAI_TTS_VOICES,
-    resolveConfig: ({ rawConfig }) => normalizeOpenAIProviderConfig(rawConfig),
+    resolveConfig: ({ cfg, rawConfig }) => normalizeOpenAIProviderConfig(rawConfig, cfg),
     parseDirectiveToken,
-    resolveTalkConfig: ({ baseTtsConfig, talkProviderConfig }) => {
-      const base = normalizeOpenAIProviderConfig(baseTtsConfig);
+    resolveTalkConfig: ({ cfg, baseTtsConfig, talkProviderConfig }) => {
+      const base = normalizeOpenAIProviderConfig(baseTtsConfig, cfg);
       const responseFormat = normalizeOpenAISpeechResponseFormat(talkProviderConfig.responseFormat);
       const baseUrl = trimToUndefined(talkProviderConfig.baseUrl) ?? base.baseUrl;
       const speed = normalizeOpenAISpeechSpeed(talkProviderConfig.speed, baseUrl);

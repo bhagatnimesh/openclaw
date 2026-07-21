@@ -860,6 +860,16 @@ importers:
         specifier: workspace:*
         version: link:../../packages/plugin-sdk
 
+  extensions/home-assistant:
+    dependencies:
+      typebox:
+        specifier: 1.1.39
+        version: 1.1.39
+    devDependencies:
+      '@openclaw/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+
   extensions/huggingface:
     devDependencies:
       '@openclaw/plugin-sdk':
