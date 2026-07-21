@@ -1,3 +1,18 @@
+---
+tags:
+  - "n4os/core"
+  - "n4os/priorities"
+links:
+  - "[[SOUL]]"
+  - "[[MISSION]]"
+  - "[[VISION]]"
+  - "[[PRINCIPLES]]"
+  - "[[DECISION_FILTER]]"
+  - "[[HAPPINESS_SCORECARD]]"
+  - "[[goals/2026|2026 Goals]]"
+  - "[[goals/2036|2036 Goals]]"
+---
+
 # Priorities
 
 ## Decision Priority
@@ -58,4 +73,3 @@ Build long relationships through presence, trust, and useful help.
 ## Everything Else
 
 Everything else is secondary.
-

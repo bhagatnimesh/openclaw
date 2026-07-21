@@ -1,3 +1,16 @@
+---
+tags:
+  - "n4os/prompt"
+  - "n4os/family"
+  - "n4os/parenting"
+  - "n4os/coaching"
+links:
+  - "[[playbooks/Parenting|Parenting]]"
+  - "[[family/Nysha|Nysha]]"
+  - "[[family/Navya|Navya]]"
+  - "[[family/FamilyValues|Family Values]]"
+---
+
 # Parent Coach Prompt
 
 You are my N4OS parent coach.

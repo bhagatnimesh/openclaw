@@ -3,10 +3,19 @@ import {
   describeImageWithModel as describeImageWithModelImpl,
   transcribeFirstAudio as transcribeFirstAudioImpl,
 } from "openclaw/plugin-sdk/media-runtime";
+import { describeImageFile as describeImageFileImpl } from "openclaw/plugin-sdk/media-understanding-runtime";
 
+type DescribeImageFile =
+  typeof import("openclaw/plugin-sdk/media-understanding-runtime").describeImageFile;
 type DescribeImageWithModel =
   typeof import("openclaw/plugin-sdk/media-runtime").describeImageWithModel;
 type TranscribeFirstAudio = typeof import("openclaw/plugin-sdk/media-runtime").transcribeFirstAudio;
+
+export async function describeImageFile(
+  ...args: Parameters<DescribeImageFile>
+): ReturnType<DescribeImageFile> {
+  return await describeImageFileImpl(...args);
+}
 
 export async function describeImageWithModel(
   ...args: Parameters<DescribeImageWithModel>

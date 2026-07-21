@@ -70,11 +70,97 @@ class N4OSMemoryInboxTest(unittest.TestCase):
         self.assertEqual(len(first.skipped_duplicates), 1)
         self.assertEqual(len(second.added), 0)
         self.assertEqual(len(second.skipped_duplicates), 3)
+        self.assertIn('  - "n4os/family"', month_text)
+        self.assertIn('  - "n4os/memory"', month_text)
+        self.assertIn('  - "[[playbooks/Parenting|Parenting]]"', month_text)
+        self.assertIn('  - "[[family/Nysha|Nysha]]"', month_text)
         self.assertIn("# Family Observations - 2026-07", month_text)
-        self.assertIn("### Nysha", month_text)
+        self.assertIn("### [[family/Nysha|Nysha]]", month_text)
         self.assertIn("- Observation: loved gymnastics and climbing", month_text)
-        self.assertIn("### Navya", month_text)
-        self.assertIn("- Observation: enjoys reflection through books", month_text)
+        self.assertIn("### [[family/Navya|Navya]]", month_text)
+        self.assertIn("- Observation: enjoys reflection through [[Reading|books]]", month_text)
+        self.assertIn("  Topics: [[Reading]]", month_text)
+
+    def test_ingest_links_observations_to_known_concepts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "observations"
+            ingest_memory_inbox_notes(
+                "\n".join(
+                    [
+                        "/mem-inbox",
+                        "2026-07-21",
+                        "Nysha: nervous about starting new school and speaking in public",
+                        "Navya: read books independently",
+                    ]
+                ),
+                observations_root=root,
+                default_date=date(2026, 7, 20),
+            )
+
+            month_text = (root / "2026-07.md").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "[[School Transition|starting new school]]",
+            month_text,
+        )
+        self.assertIn("[[Confidence|speaking]]", month_text)
+        self.assertIn("[[Confidence|public]]", month_text)
+        self.assertIn("  Topics: [[Confidence]], [[School Transition]]", month_text)
+        self.assertIn("[[Reading|read]] [[Reading|books]] [[Confidence|independently]]", month_text)
+        self.assertIn("  Topics: [[Reading]], [[Confidence]]", month_text)
+
+    def test_ingest_updates_existing_month_frontmatter_links(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "observations"
+            ingest_memory_inbox_notes(
+                "/mem Nysha: loved the library",
+                observations_root=root,
+                default_date=date(2026, 7, 21),
+            )
+            ingest_memory_inbox_notes(
+                "/mem Navya: nervous about speaking",
+                observations_root=root,
+                default_date=date(2026, 7, 22),
+            )
+
+            month_text = (root / "2026-07.md").read_text(encoding="utf-8")
+
+        self.assertIn('  - "[[family/Nysha|Nysha]]"', month_text)
+        self.assertIn('  - "[[family/Navya|Navya]]"', month_text)
+        self.assertIn('  - "[[Reading]]"', month_text)
+        self.assertIn('  - "[[Confidence]]"', month_text)
+        self.assertEqual(month_text.count('  - "[[playbooks/Parenting|Parenting]]"'), 1)
+
+    def test_duplicates_match_existing_wiki_linked_observations(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "observations"
+            root.mkdir(parents=True)
+            (root / "2026-07.md").write_text(
+                "\n".join(
+                    [
+                        "# Family Observations - 2026-07",
+                        "",
+                        "## 2026-07-21",
+                        "",
+                        "### [[family/Nysha|Nysha]]",
+                        "- Observation: enjoys reflection through [[Reading|books]]",
+                        "  Topics: [[Reading]]",
+                        "  Source: Telegram",
+                        "  Freshness: new",
+                        "  Confidence: low",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = ingest_memory_inbox_notes(
+                "/mem Nysha: enjoys reflection through books",
+                observations_root=root,
+                default_date=date(2026, 7, 21),
+            )
+
+        self.assertEqual(len(result.added), 0)
+        self.assertEqual(len(result.skipped_duplicates), 1)
 
     def test_message_detection_and_empty_reply(self):
         self.assertTrue(is_memory_inbox_message("/mem Nysha: liked teaching"))

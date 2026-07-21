@@ -11,6 +11,15 @@ from zoneinfo import ZoneInfo
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 METADATA_MARKER = "N4OS_METADATA:"
 HASHTAG_RE = re.compile(r"(?<![\w/])#(?P<tag>[A-Za-z][A-Za-z0-9_-]*)")
+TAG_ANNOTATION_RE = re.compile(
+    r"\b(?:with|and)\s+(?:tag|label)\b\s*:?\s*(?P<single>#?[A-Za-z][A-Za-z0-9_-]*)\b|"
+    r"\b(?:tag|label)\b\s*:\s*(?P<label_single>#?[A-Za-z][A-Za-z0-9_-]*)\b|"
+    r"\b(?:with|and)\s+(?:tags|labels)\b\s+(?P<many_hash>#[A-Za-z][A-Za-z0-9_-]*"
+    r"(?:[\s,]+#[A-Za-z][A-Za-z0-9_-]*)*)|"
+    r"\b(?:tags|labels)\b\s*:\s*(?P<many>#?[A-Za-z][A-Za-z0-9_-]*"
+    r"(?:[\s,]+#?[A-Za-z][A-Za-z0-9_-]*)*)",
+    re.IGNORECASE,
+)
 TAG_FILTER_CLAUSE_RE = re.compile(
     r"\b(?:with\s+)?tags?\s*(?:(?:is|are|with)\s+|:\s*|\s+)"
     r"(?P<tags>#?[A-Za-z][A-Za-z0-9_-]*"
@@ -651,7 +660,17 @@ def normalize_tags(values: Any) -> list[str]:
 def extract_tags(value: str | None) -> list[str]:
     if not value:
         return []
-    return normalize_tags([match.group("tag") for match in HASHTAG_RE.finditer(value)])
+    tags = [match.group("tag") for match in HASHTAG_RE.finditer(value)]
+    for match in TAG_ANNOTATION_RE.finditer(value):
+        captured = (
+            match.group("single")
+            or match.group("label_single")
+            or match.group("many_hash")
+            or match.group("many")
+            or ""
+        )
+        tags.extend(re.split(r"[\s,]+", captured))
+    return normalize_tags(tags)
 
 
 def _extract_tag_filter_text(user_text: str) -> tuple[list[str], str]:
@@ -1222,6 +1241,7 @@ def _strip_task_annotations(title: str) -> str:
     cleaned = TASK_OWNER_ANNOTATION_RE.sub("", cleaned)
     cleaned = TASK_OWNER_NOTE_RE.sub("", cleaned)
     cleaned = DUE_DATE_ANNOTATION_RE.sub("", cleaned)
+    cleaned = TAG_ANNOTATION_RE.sub("", cleaned)
     cleaned = HASHTAG_RE.sub("", cleaned)
     cleaned = re.sub(
         r"\s*,?\s*(?:the\s+)?owner\s*(?:is|:)?\s*$",

@@ -74,6 +74,7 @@ function loadMediaUnderstandingRuntime(): Promise<MediaUnderstandingRuntime> {
 export type TelegramInboundBodyResult = {
   bodyText: string;
   rawBody: string;
+  commandBody?: string;
   historyKey?: string;
   commandAuthorized: boolean;
   effectiveWasMentioned: boolean;
@@ -83,6 +84,7 @@ export type TelegramInboundBodyResult = {
   hasControlCommand: boolean;
   audioTranscript?: string;
   audioTranscribedMediaIndex?: number;
+  mediaPreflightedIndexes?: number[];
   stickerCacheHit: boolean;
   locationData?: NormalizedLocation;
 };
@@ -90,6 +92,14 @@ export type TelegramInboundBodyResult = {
 function formatAudioTranscriptForAgent(transcript: string): string {
   return `[Audio transcript (machine-generated, untrusted)]: ${JSON.stringify(transcript)}`;
 }
+
+const TELEGRAM_IMAGE_NOTES_INSTRUCTION =
+  "Read the attached image and convert any visible notes into text. If it contains observations, tasks, or things to do, organize them clearly.";
+const TELEGRAM_IMAGE_NOTES_PREFLIGHT_PROMPT =
+  "Extract all visible notes, observations, tasks, and things to do from this image. Preserve wording when legible. Organize the result clearly and include uncertainty for unclear handwriting.";
+const TELEGRAM_IMAGE_NOTES_ACTION_HINT =
+  "If the user asks to add or create tasks/items from this image, treat the extracted rows as new items. Do not update a prior task/item unless the user explicitly asks to update, edit, or change an existing one.";
+const TELEGRAM_IMAGE_NOTES_PREFLIGHT_MAX_CHARS = 2000;
 
 type TelegramSavedMediaKind = "audio" | "document" | "image" | "video";
 
@@ -127,6 +137,80 @@ function formatSavedMediaPlaceholder(allMedia: TelegramMediaRef[]): string | und
     return `<media:audio> (${allMedia.length} audio attachments)`;
   }
   return `<media:document> (${allMedia.length} attachments)`;
+}
+
+function hasOnlySavedImages(allMedia: TelegramMediaRef[]): boolean {
+  return allMedia.length > 0 && allMedia.every(isSavedImage);
+}
+
+function isSavedImage(media: TelegramMediaRef): boolean {
+  return resolveSavedMediaKind(media.contentType) === "image";
+}
+
+function formatImageNotesForAgent(notes: string[]): string | undefined {
+  const normalized = notes.map((note) => note.trim()).filter(Boolean);
+  if (normalized.length === 0) {
+    return undefined;
+  }
+  const body =
+    normalized.length === 1
+      ? normalized[0]
+      : normalized.map((note, index) => `Image ${index + 1}:\n${note}`).join("\n\n");
+  return `[Image text extraction (machine-generated, untrusted)]:\n${body}\n\n${TELEGRAM_IMAGE_NOTES_ACTION_HINT}`;
+}
+
+async function describeTelegramNoteImages(params: {
+  allMedia: TelegramMediaRef[];
+  cfg: OpenClawConfig;
+  chatType?: string;
+  sessionKey?: string;
+}): Promise<{ text: string; mediaIndexes: number[] } | undefined> {
+  const imageMedia = params.allMedia
+    .map((media, index) => ({ media, index }))
+    .filter((entry) => isSavedImage(entry.media));
+  if (imageMedia.length === 0) {
+    return undefined;
+  }
+  const { describeImageFile } = await loadMediaUnderstandingRuntime();
+  const imageCfg = params.cfg.tools?.media?.image;
+  const cfg: OpenClawConfig = {
+    ...params.cfg,
+    tools: {
+      ...params.cfg.tools,
+      media: {
+        ...params.cfg.tools?.media,
+        image: {
+          ...imageCfg,
+          maxChars: imageCfg?.maxChars ?? TELEGRAM_IMAGE_NOTES_PREFLIGHT_MAX_CHARS,
+        },
+      },
+    },
+  };
+  const notes: string[] = [];
+  const mediaIndexes: number[] = [];
+  for (const { media, index } of imageMedia) {
+    try {
+      const result = await describeImageFile({
+        filePath: media.path,
+        cfg,
+        mime: media.contentType,
+        prompt: TELEGRAM_IMAGE_NOTES_PREFLIGHT_PROMPT,
+        scopeContext: {
+          channel: "telegram",
+          ...(params.chatType ? { chatType: params.chatType } : {}),
+          ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+        },
+      });
+      if (result.text?.trim()) {
+        notes.push(result.text);
+        mediaIndexes.push(index);
+      }
+    } catch (err) {
+      logVerbose(`telegram: image note extraction failed: ${String(err)}`);
+    }
+  }
+  const text = formatImageNotesForAgent(notes);
+  return text ? { text, mediaIndexes } : undefined;
 }
 
 function resolveTelegramMentionFacts(params: {
@@ -345,6 +429,7 @@ export async function resolveTelegramInboundBody(params: {
     preflightTranscript === undefined
       ? undefined
       : allMedia.findIndex((media) => media.contentType?.startsWith("audio/"));
+  let mediaPreflightedIndexes: number[] | undefined;
 
   if (hasAudio && bodyText === "<media:audio>" && preflightTranscript) {
     bodyText = formatAudioTranscriptForAgent(preflightTranscript);
@@ -377,6 +462,16 @@ export async function resolveTelegramInboundBody(params: {
     } else {
       bodyText = savedMediaPlaceholder ?? "<media:document>";
     }
+  }
+  if (
+    !msg.sticker &&
+    !stickerCacheHit &&
+    !hasUserText &&
+    !hasAudio &&
+    hasOnlySavedImages(allMedia) &&
+    bodyText === savedMediaPlaceholder
+  ) {
+    bodyText = `${bodyText}\n${TELEGRAM_IMAGE_NOTES_INSTRUCTION}`;
   }
 
   const hasAnyMention = messageTextParts.entities.some((ent) => ent.type === "mention");
@@ -493,9 +588,30 @@ export async function resolveTelegramInboundBody(params: {
     return null;
   }
 
+  if (
+    !msg.sticker &&
+    !stickerCacheHit &&
+    !hasAudio &&
+    hasOnlySavedImages(allMedia)
+  ) {
+    const imageNotesResult = await describeTelegramNoteImages({
+      allMedia,
+      cfg,
+      chatType: isGroup ? "group" : "direct",
+      sessionKey,
+    });
+    if (imageNotesResult) {
+      bodyText = `${bodyText}\n${imageNotesResult.text}`;
+      mediaPreflightedIndexes = imageNotesResult.mediaIndexes;
+    }
+  }
+
   return {
     bodyText,
     rawBody,
+    ...(mediaPreflightedIndexes && mediaPreflightedIndexes.length > 0
+      ? { commandBody: bodyText, mediaPreflightedIndexes }
+      : {}),
     historyKey,
     commandAuthorized,
     effectiveWasMentioned,

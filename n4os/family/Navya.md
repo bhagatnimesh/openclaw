@@ -1,14 +1,28 @@
+---
+tags:
+  - "n4os/family"
+  - "n4os/person"
+  - "n4os/parenting"
+links:
+  - "[[Reading]]"
+  - "[[Confidence]]"
+  - "[[playbooks/Parenting|Parenting]]"
+  - "[[goals/2026|2026 Goals]]"
+  - "[[family/FamilyValues|Family Values]]"
+  - "[[family/observations/2026-07|2026-07 Observations]]"
+---
+
 # Navya
 
 ## Focus
 
-Help Navya grow with love, curiosity, resilience, confidence, emotional intelligence, strong values, and strong foundations.
+Help Navya grow with love, curiosity, resilience, [[Confidence|confidence]], emotional intelligence, strong values, and strong foundations.
 
 ## What To Protect
 
 - love of learning
 - sense of safety
-- confidence
+- [[Confidence|confidence]]
 - curiosity
 - sibling bond
 - emotional expression
@@ -30,4 +44,3 @@ Adjust plans for her age, temperament, needs, and current season.
 - What curiosity or play can I encourage?
 - What habit or emotional skill can we gently practice?
 - What should I notice before it becomes invisible?
-

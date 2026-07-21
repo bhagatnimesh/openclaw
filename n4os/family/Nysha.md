@@ -1,8 +1,23 @@
+---
+tags:
+  - "n4os/family"
+  - "n4os/person"
+  - "n4os/parenting"
+links:
+  - "[[Reading]]"
+  - "[[Confidence]]"
+  - "[[School Transition]]"
+  - "[[playbooks/Parenting|Parenting]]"
+  - "[[goals/2026|2026 Goals]]"
+  - "[[family/FamilyValues|Family Values]]"
+  - "[[family/observations/2026-07|2026-07 Observations]]"
+---
+
 # Nysha
 
 ## 2026 Focus
 
-Help Nysha build love of reading, logical reasoning, curiosity, emotional ability, confidence, and strong family connection.
+Help Nysha build love of [[Reading|reading]], logical reasoning, curiosity, emotional ability, [[Confidence|confidence]], and strong family connection.
 
 ## Love For Reading
 
@@ -17,7 +32,7 @@ Success looks like:
 
 Inputs:
 
-- reading proficiency
+- [[Reading|reading]] proficiency
 - exposure to books
 - parents role modeling reading
 - discussion and reflection
@@ -74,3 +89,11 @@ Inputs:
 - emotion labeling during reading and real situations
 - sibling relationship practice
 - parent emotional regulation
+
+## Related
+
+- [[Reading]]
+- [[Confidence]]
+- [[School Transition]]
+- [[playbooks/Parenting|Parenting]]
+- [[goals/2026|2026 Goals]]

@@ -1,3 +1,14 @@
+---
+tags:
+  - "n4os/playbook"
+  - "n4os/routine"
+links:
+  - "[[PERSONAL_MODEL]]"
+  - "[[OPERATING_RULES]]"
+  - "[[DECISION_FILTER]]"
+  - "[[playbooks/Fear|Fear]]"
+---
+
 # Overwhelmed Playbook
 
 ## First Move

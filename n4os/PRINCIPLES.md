@@ -1,3 +1,16 @@
+---
+tags:
+  - "n4os/core"
+  - "n4os/principles"
+links:
+  - "[[SOUL]]"
+  - "[[MISSION]]"
+  - "[[VISION]]"
+  - "[[PRIORITIES]]"
+  - "[[OPERATING_RULES]]"
+  - "[[PERSONAL_MODEL]]"
+---
+
 # Principles
 
 ## 1. Play Long Games
@@ -47,4 +60,3 @@ You will figure it out. Things usually work out when you act with optimism, cour
 ## 12. Leave People Stronger
 
 Build trust. Help others succeed. Create positive-sum outcomes.
-

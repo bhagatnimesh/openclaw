@@ -1,3 +1,14 @@
+---
+tags:
+  - "n4os/playbook"
+  - "n4os/relationships"
+links:
+  - "[[MISSION]]"
+  - "[[PRIORITIES]]"
+  - "[[PRINCIPLES]]"
+  - "[[goals/2036|2036 Goals]]"
+---
+
 # Relationships Playbook
 
 ## Objective

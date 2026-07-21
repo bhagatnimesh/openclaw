@@ -104,6 +104,7 @@ describe("buildChannelInboundEventContext", () => {
           path: "/tmp/image.png",
           contentType: "image/png",
           kind: "image",
+          preflighted: true,
         },
         {
           url: "https://example.test/audio.mp3",
@@ -153,6 +154,7 @@ describe("buildChannelInboundEventContext", () => {
       MediaUrls: ["/tmp/image.png", "https://example.test/audio.mp3"],
       MediaTypes: ["image/png", "audio/mpeg"],
       MediaTranscribedIndexes: [1],
+      MediaPreflightedIndexes: [0],
       ChatType: "group",
       ChatId: "room-1",
       ConversationLabel: "Room One",

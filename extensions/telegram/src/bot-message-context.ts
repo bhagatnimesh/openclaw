@@ -514,6 +514,7 @@ export const buildTelegramMessageContext = async ({
     route,
     rawBody: bodyResult.rawBody,
     bodyText: bodyResult.bodyText,
+    ...(bodyResult.commandBody !== undefined ? { commandBody: bodyResult.commandBody } : {}),
     historyKey: bodyResult.historyKey ?? "",
     historyLimit,
     groupHistories,
@@ -526,6 +527,9 @@ export const buildTelegramMessageContext = async ({
     stickerCacheHit: bodyResult.stickerCacheHit,
     ...(bodyResult.audioTranscribedMediaIndex !== undefined
       ? { audioTranscribedMediaIndex: bodyResult.audioTranscribedMediaIndex }
+      : {}),
+    ...(bodyResult.mediaPreflightedIndexes !== undefined
+      ? { mediaPreflightedIndexes: bodyResult.mediaPreflightedIndexes }
       : {}),
     locationData: bodyResult.locationData,
     options,

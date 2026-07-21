@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/playbook"
+  - "n4os/health"
+links:
+  - "[[MISSION]]"
+  - "[[PRIORITIES]]"
+  - "[[HAPPINESS_SCORECARD]]"
+  - "[[goals/2026|2026 Goals]]"
+  - "[[daily/Morning|Morning]]"
+---
+
 # Health Playbook
 
 ## Objective

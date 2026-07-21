@@ -1,12 +1,14 @@
 // Telegram tests cover bot message context.body plugin behavior.
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeAllowFrom } from "./bot-access.js";
 
 const {
+  describeImageFileMock,
   resolveStickerVisionSupportRuntimeMock,
   transcribeFirstAudioMock,
   triggerInternalHookMock,
 } = vi.hoisted(() => ({
+  describeImageFileMock: vi.fn(),
   resolveStickerVisionSupportRuntimeMock: vi.fn(async (_params: unknown) => false),
   transcribeFirstAudioMock: vi.fn(),
   triggerInternalHookMock: vi.fn<(event: unknown) => Promise<void>>(async () => undefined),
@@ -18,6 +20,7 @@ vi.mock("./sticker-vision.runtime.js", () => ({
 }));
 
 vi.mock("./media-understanding.runtime.js", () => ({
+  describeImageFile: (...args: unknown[]) => describeImageFileMock(...args),
   transcribeFirstAudio: (...args: unknown[]) => transcribeFirstAudioMock(...args),
 }));
 
@@ -37,6 +40,10 @@ vi.mock("openclaw/plugin-sdk/hook-runtime", async () => {
 const { resolveTelegramInboundBody } = await import("./bot-message-context.body.js");
 
 type TelegramInboundBodyParams = Parameters<typeof resolveTelegramInboundBody>[0];
+const imageNotesInstruction =
+  "Read the attached image and convert any visible notes into text. If it contains observations, tasks, or things to do, organize them clearly.";
+const imageNotesActionHint =
+  "If the user asks to add or create tasks/items from this image, treat the extracted rows as new items. Do not update a prior task/item unless the user explicitly asks to update, edit, or change an existing one.";
 
 function resolveTelegramBody(overrides: Partial<TelegramInboundBodyParams>) {
   const chatId = overrides.chatId ?? 42;
@@ -82,7 +89,20 @@ function transcribeCallContext(index = 0): Record<string, unknown> {
   return arg.ctx;
 }
 
+function describeImageCall(index = 0): Record<string, unknown> {
+  const arg = describeImageFileMock.mock.calls[index]?.[0] as Record<string, unknown> | undefined;
+  if (!arg) {
+    throw new Error(`Expected describe image call ${index}`);
+  }
+  return arg;
+}
+
 describe("resolveTelegramInboundBody", () => {
+  beforeEach(() => {
+    describeImageFileMock.mockReset();
+    describeImageFileMock.mockResolvedValue({ text: undefined });
+  });
+
   it("delivers rich-message-only updates as a sanitized placeholder", async () => {
     const result = await resolveTelegramBody({
       msg: {
@@ -324,7 +344,11 @@ describe("resolveTelegramInboundBody", () => {
     expect(result?.bodyText).toBe("<media:document>");
   });
 
-  it("summarizes multiple saved images as images", async () => {
+  it("asks the agent to transcribe captionless saved images", async () => {
+    describeImageFileMock
+      .mockResolvedValueOnce({ text: "Observation: Pack lunch.\nTodo: Sign permission slip." })
+      .mockResolvedValueOnce({ text: "Todo: Bring library book." });
+
     const result = await resolveTelegramBody({
       msg: {
         message_id: 4,
@@ -339,7 +363,71 @@ describe("resolveTelegramInboundBody", () => {
       ],
     });
 
-    expect(result?.bodyText).toBe("<media:image> (2 images)");
+    expect(result?.rawBody).toBe("<media:image>");
+    expect(result?.bodyText).toBe(
+      `<media:image> (2 images)\n${imageNotesInstruction}\n` +
+        "[Image text extraction (machine-generated, untrusted)]:\n" +
+        "Image 1:\nObservation: Pack lunch.\nTodo: Sign permission slip.\n\n" +
+        "Image 2:\nTodo: Bring library book.\n\n" +
+        imageNotesActionHint,
+    );
+    expect(describeImageFileMock).toHaveBeenCalledTimes(2);
+    expect(describeImageCall(0)).toMatchObject({
+      filePath: "/tmp/photo-1.webp",
+      mime: "image/webp",
+      prompt:
+        "Extract all visible notes, observations, tasks, and things to do from this image. Preserve wording when legible. Organize the result clearly and include uncertainty for unclear handwriting.",
+      scopeContext: { channel: "telegram", chatType: "direct" },
+    });
+    expect(describeImageCall(1)).toMatchObject({
+      filePath: "/tmp/photo-2.png",
+      mime: "image/png",
+      scopeContext: { channel: "telegram", chatType: "direct" },
+    });
+  });
+
+  it("adds extracted image text to captioned image requests", async () => {
+    describeImageFileMock.mockResolvedValueOnce({
+      text:
+        "- Check letters\n" +
+        "- Clarify this year taxes paper work with davendera\n" +
+        "- Meet Bandish\n" +
+        "- Fix phone",
+    });
+
+    const result = await resolveTelegramBody({
+      msg: {
+        message_id: 14,
+        date: 1_700_000_014,
+        chat: { id: 42, type: "private", first_name: "Pat" },
+        from: { id: 42, first_name: "Pat" },
+        photo: [{ file_id: "photo-14", file_unique_id: "photo-u14", width: 120, height: 80 }],
+        caption: "I want to add tasks attached in the image",
+      } as never,
+      allMedia: [{ path: "/tmp/photo-14.png", contentType: "image/png" }],
+    });
+
+    expect(result?.rawBody).toBe("I want to add tasks attached in the image");
+    expect(result?.commandBody).toBe(
+      "I want to add tasks attached in the image\n" +
+        "[Image text extraction (machine-generated, untrusted)]:\n" +
+        "- Check letters\n" +
+        "- Clarify this year taxes paper work with davendera\n" +
+        "- Meet Bandish\n" +
+        "- Fix phone\n\n" +
+        imageNotesActionHint,
+    );
+    expect(result?.mediaPreflightedIndexes).toEqual([0]);
+    expect(result?.bodyText).toBe(
+      "I want to add tasks attached in the image\n" +
+        "[Image text extraction (machine-generated, untrusted)]:\n" +
+        "- Check letters\n" +
+        "- Clarify this year taxes paper work with davendera\n" +
+        "- Meet Bandish\n" +
+        "- Fix phone\n\n" +
+        imageNotesActionHint,
+    );
+    expect(describeImageFileMock).toHaveBeenCalledTimes(1);
   });
 
   it("summarizes mixed saved media as attachments", async () => {
@@ -456,6 +544,7 @@ describe("resolveTelegramInboundBody", () => {
     });
 
     expect(result?.bodyText).toBe("<media:image>");
+    expect(describeImageFileMock).not.toHaveBeenCalled();
     expect(result?.stickerCacheHit).toBe(false);
   });
 
@@ -487,7 +576,7 @@ describe("resolveTelegramInboundBody", () => {
 
     expect(logger.info).not.toHaveBeenCalled();
     expect(result?.rawBody).toBe("<media:image>");
-    expect(result?.bodyText).toBe("<media:image>");
+    expect(result?.bodyText).toBe(`<media:image>\n${imageNotesInstruction}`);
     expect(result?.effectiveWasMentioned).toBe(true);
   });
 
@@ -521,6 +610,7 @@ describe("resolveTelegramInboundBody", () => {
       { chatId: -1001234567890, reason: "no-mention" },
       "skipping group message",
     );
+    expect(describeImageFileMock).not.toHaveBeenCalled();
     expect(result).toBeNull();
   });
 

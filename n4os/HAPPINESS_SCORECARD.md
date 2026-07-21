@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/core"
+  - "n4os/review"
+links:
+  - "[[PRIORITIES]]"
+  - "[[OPERATING_RULES]]"
+  - "[[daily/Evening|Evening]]"
+  - "[[reviews/Weekly|Weekly Review]]"
+  - "[[playbooks/Health|Health]]"
+---
+
 # Happiness Scorecard
 
 A successful week is not defined by status.

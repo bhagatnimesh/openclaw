@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from io import StringIO
+import json
 import logging
+import mimetypes
 import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Any
+import urllib.request
 
 from dotenv import dotenv_values, load_dotenv
 
@@ -34,19 +39,33 @@ else:
 
 from claws.n4os.claw import N4OSClaw
 from claws.n4os.input_normalizer import improve_entered_text
-from n4os_memory_inbox import (
-    format_memory_ingest_reply,
-    ingest_memory_inbox_notes,
-    is_memory_inbox_message,
+from n4os_capture import (
+    format_capture_reply,
+    ingest_capture_notes,
+    is_capture_message,
 )
 from n4os_memory_status import (
     format_memory_status,
     is_memory_status_message,
     parse_memory_status_target,
 )
+from n4os_review import (
+    format_n4os_review,
+    is_n4os_review_message,
+    parse_review_period,
+)
+from n4os_status import (
+    format_n4os_status,
+    is_n4os_status_message,
+    parse_status_target,
+)
 from n4os_goals_status import (
     format_goals_status,
     is_goals_status_message,
+)
+from n4os_advice import (
+    format_n4os_advice,
+    is_n4os_advice_message,
 )
 from telegram_audio import (
     AudioTranscriber,
@@ -69,15 +88,18 @@ UNAUTHORIZED_MESSAGE = "Unauthorized."
 HELP_MESSAGE = (
     "N4OS Telegram help\n\n"
     "You can usually speak naturally. Examples:\n"
+    "- Capture: /capture Nysha was nervous about school. I felt unsure how to help\n"
+    "- Ask: /ask How should I approach Nysha's reading?\n"
+    "- Review: /review week\n"
+    "- Status: /status Nysha, /status goals, or /status reading\n"
     "- Add event: /event create dinner with Rahul next Tuesday at 7 PM\n"
     "- Add task: add task call FUSD tomorrow morning\n"
     "- Day briefing: give me today's briefing\n"
-    "- Add memory: /mem Nysha liked teaching younger kids today\n"
-    "- Batch memory: /mem-inbox then paste dated notes\n"
-    "- Memory status: /memory-status family, Nysha, or Navya\n"
+    "- Legacy memory: /mem Nysha liked teaching younger kids today\n"
     "- Goals status: /goals or what are my current goals?\n"
     "- Library: Nysha read 8 pages of Mercy Watson by herself\n"
     "- Library status: /status or reading status\n"
+    "- Science Lab: plan the next 4 science lab experiments\n"
     "- Family decision: create decision for summer camp options\n"
     "- Home board: add home board item buy milk\n\n"
     "If you forget the exact command, ask in plain English, for example: "
@@ -85,6 +107,9 @@ HELP_MESSAGE = (
 )
 ERROR_MESSAGE = "Sorry, N4OS hit an error while handling that."
 UNSUPPORTED_MESSAGE = "Please send a text or voice message."
+IMAGE_TEXT_MARKER = "Image text:"
+OPENAI_IMAGE_TEXT_MODEL = "gpt-5.4-mini"
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 VOICE_TRANSCRIPTION_STARTED_MESSAGE = "Got it, transcribing that voice message."
 VOICE_TRANSCRIPTION_RESULT_MESSAGE = "Transcribed: {text}"
 VOICE_TRANSCRIPTION_EMPTY_MESSAGE = "I could not hear any speech in that voice message."
@@ -94,14 +119,15 @@ VOICE_TRANSCRIPTION_TIMEOUT_MESSAGE = (
 )
 VOICE_TRANSCRIPTION_HANDLER_TIMEOUT_SECONDS = 90
 HOW_TO_HELP = {
-    "memory": (
-        "To add memory, send one note:\n"
-        "/mem Nysha liked teaching younger kids today\n\n"
+    "capture": (
+        "To capture anything worth remembering, send:\n"
+        "/capture Nysha liked teaching younger kids today. I felt proud.\n\n"
         "For a batch, send:\n"
-        "/mem-inbox\n"
+        "/capture\n"
         "2026-07-21\n"
         "Nysha playing games very well\n"
-        "Navya has identity I love Maths"
+        "I felt scattered after poor sleep\n\n"
+        "Old /mem and /mem-inbox commands still work as capture aliases."
     ),
     "event": (
         "To add an event, speak naturally or use /event:\n"
@@ -115,16 +141,33 @@ HOW_TO_HELP = {
         "For richer tasks, include owner, timing, and why it matters."
     ),
     "memory_status": (
-        "To see current family memory, send:\n"
-        "/memory-status family\n"
-        "/memory-status Nysha\n"
-        "/memory-status Navya"
+        "To see current N4OS status, send:\n"
+        "/status family\n"
+        "/status Nysha\n"
+        "/status Navya\n"
+        "/status goals\n"
+        "/status reading"
     ),
     "goals": (
         "To see your current N4OS goals, send:\n"
         "/goals\n"
         "or\n"
         "what are my current goals?"
+    ),
+    "n4os_advice": (
+        "For memory-backed N4OS advice, use:\n"
+        "/ask How should we approach Nysha's reading?\n"
+        "/n4os How should we approach Nysha's reading?\n"
+        "/coach What should I focus on this week?\n"
+        "/advice How should I handle this career decision?\n\n"
+        "N4OS will load relevant markdown memory and use OpenAI enrichment when configured."
+    ),
+    "review": (
+        "To review patterns, send:\n"
+        "/review day\n"
+        "/review week\n"
+        "/review month\n\n"
+        "Reviews suggest promotion candidates but do not change stable N4OS files."
     ),
     "decision": (
         "To track a family decision, say:\n"
@@ -141,6 +184,14 @@ HOW_TO_HELP = {
         "Check status:\n"
         "/status\n"
         "reading status"
+    ),
+    "science_lab": (
+        "Science Lab helps plan kid-friendly experiments and materials.\n\n"
+        "Ask:\n"
+        "plan the next 4 science lab experiments\n"
+        "plan 2 science experiments\n\n"
+        "It will return experiment ideas plus materials already at home, "
+        "materials to confirm, and recommended Amazon orders."
     ),
     "home_board": (
         "To add a home board item, say:\n"
@@ -173,6 +224,127 @@ class RouterResult:
     response: str
     route: str
     elapsed_ms: float
+
+
+def _extract_response_text(payload: dict[str, Any]) -> str:
+    output = payload.get("output", [])
+    if not isinstance(output, list):
+        return ""
+
+    parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+class OpenAIImageTextExtractor:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = OPENAI_IMAGE_TEXT_MODEL,
+        urlopen: Any = urllib.request.urlopen,
+    ) -> None:
+        if not api_key.strip():
+            raise RuntimeError("Image text extraction needs OPENAI_API_KEY.")
+        self.api_key = api_key.strip()
+        self.model = model.strip() or OPENAI_IMAGE_TEXT_MODEL
+        self.urlopen = urlopen
+
+    @classmethod
+    def from_env_or_none(cls) -> "OpenAIImageTextExtractor | None":
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            return None
+        return cls(api_key=api_key, model=os.environ.get("N4OS_IMAGE_TEXT_MODEL", OPENAI_IMAGE_TEXT_MODEL))
+
+    def extract_text(self, image_path: Path) -> str:
+        mime_type = mimetypes.guess_type(str(image_path))[0] or "image/jpeg"
+        image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        payload = {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Extract task/checklist entries visible in this image. "
+                                "If a list title is visible, return it first as "
+                                "`List title: <title>`. Then return each task entry, one per line. "
+                                "Do not include checkbox symbols, bullets, numbering, explanations, or guesses."
+                            ),
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:{mime_type};base64,{image_data}",
+                            "detail": "high",
+                        },
+                    ],
+                }
+            ],
+        }
+        request = urllib.request.Request(
+            OPENAI_RESPONSES_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with self.urlopen(request, timeout=20) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+        return _extract_response_text(response_payload)
+
+
+def _is_image_document(document: Any) -> bool:
+    mime_type = str(getattr(document, "mime_type", "") or "")
+    return mime_type.startswith("image/")
+
+
+def _has_image(message: Any) -> bool:
+    photos = getattr(message, "photo", None)
+    if photos:
+        return True
+    return _is_image_document(getattr(message, "document", None))
+
+
+def _largest_photo(message: Any) -> Any | None:
+    photos = list(getattr(message, "photo", None) or [])
+    if photos:
+        return max(
+            photos,
+            key=lambda photo: (
+                int(getattr(photo, "file_size", 0) or 0),
+                int(getattr(photo, "width", 0) or 0) * int(getattr(photo, "height", 0) or 0),
+            ),
+        )
+
+    document = getattr(message, "document", None)
+    if _is_image_document(document):
+        return document
+    return None
+
+
+def _combine_text_and_image_text(text: str, image_text: str) -> str:
+    cleaned_image_text = image_text.strip()
+    if not cleaned_image_text:
+        return text
+    cleaned_text = text.strip()
+    if not cleaned_text:
+        return f"{IMAGE_TEXT_MARKER}\n{cleaned_image_text}"
+    return f"{cleaned_text}\n\n{IMAGE_TEXT_MARKER}\n{cleaned_image_text}"
 
 
 def configure_logging() -> None:
@@ -232,10 +404,14 @@ def _telegram_how_to_reply(text: str) -> str | None:
 
     if "memory-status" in lowered or ("memory" in lowered and "status" in lowered):
         return HOW_TO_HELP["memory_status"]
+    if "capture" in lowered or "note" in lowered or "memory" in lowered or "observation" in lowered:
+        return HOW_TO_HELP["capture"]
+    if "review" in lowered or "pattern" in lowered:
+        return HOW_TO_HELP["review"]
     if "goal" in lowered or "priority" in lowered:
         return HOW_TO_HELP["goals"]
-    if "memory" in lowered or "observation" in lowered:
-        return HOW_TO_HELP["memory"]
+    if "n4os" in lowered or "coach" in lowered or "advice" in lowered:
+        return HOW_TO_HELP["n4os_advice"]
     if (
         "before leaving" in lowered
         or "before leave" in lowered
@@ -253,6 +429,8 @@ def _telegram_how_to_reply(text: str) -> str | None:
         or "checkout" in lowered
     ):
         return HOW_TO_HELP["library"]
+    if "science" in lowered or "experiment" in lowered:
+        return HOW_TO_HELP["science_lab"]
     if "task" in lowered or "todo" in lowered or "to-do" in lowered:
         return HOW_TO_HELP["task"]
     if "decision" in lowered:
@@ -276,6 +454,7 @@ class N4OSTelegramBot:
         claw: N4OSClaw | None = None,
         logger: logging.Logger | None = None,
         audio_transcriber: AudioTranscriber | None = None,
+        image_text_extractor: Any | None = None,
     ) -> None:
         self.config = config
         self.claw = claw or N4OSClaw()
@@ -283,6 +462,7 @@ class N4OSTelegramBot:
         self.audio_transcriber = audio_transcriber or create_default_audio_transcriber(
             config.voice_transcribe_command,
         )
+        self.image_text_extractor = image_text_extractor or OpenAIImageTextExtractor.from_env_or_none()
 
     def route_message(self, text: str) -> RouterResult:
         started = time.perf_counter()
@@ -309,6 +489,36 @@ class N4OSTelegramBot:
         if user_id != self.config.allowed_user_id:
             return UNAUTHORIZED_MESSAGE
         return None
+
+    async def _extract_image_text(self, message: Any) -> str:
+        if self.image_text_extractor is None:
+            return ""
+
+        photo = _largest_photo(message)
+        if photo is None:
+            return ""
+
+        suffix = ".jpg"
+        document = getattr(message, "document", None)
+        file_name = getattr(document, "file_name", "") if document is not None else ""
+        if file_name:
+            guessed_suffix = Path(file_name).suffix
+            if guessed_suffix:
+                suffix = guessed_suffix
+
+        image_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="n4os-telegram-image-", suffix=suffix, delete=False) as temp:
+                image_path = Path(temp.name)
+            telegram_file = await photo.get_file()
+            await telegram_file.download_to_drive(image_path)
+            return self.image_text_extractor.extract_text(image_path).strip()
+        finally:
+            if image_path is not None:
+                try:
+                    image_path.unlink(missing_ok=True)
+                except OSError:
+                    self.logger.warning("could not remove temporary Telegram image %s", image_path)
 
     async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -341,7 +551,8 @@ class N4OSTelegramBot:
             or getattr(message, "caption", None)
             or ""
         ).strip()
-        message_kind = "text" if text else ("audio" if has_audio(message) else "unsupported")
+        has_image = _has_image(message)
+        message_kind = "text" if text else ("image" if has_image else ("audio" if has_audio(message) else "unsupported"))
         self.logger.info(
             "incoming message user_id=%s kind=%s text=%r",
             user_id,
@@ -393,6 +604,15 @@ class N4OSTelegramBot:
                 elapsed_ms,
             )
 
+        if has_image:
+            try:
+                image_text = await self._extract_image_text(message)
+            except Exception:
+                self.logger.exception("error while extracting Telegram image text")
+                image_text = ""
+            if image_text:
+                text = _combine_text_and_image_text(text, image_text)
+
         if not text:
             await message.reply_text(UNSUPPORTED_MESSAGE)
             self.logger.info("chosen route=unsupported execution_ms=0.00")
@@ -404,14 +624,24 @@ class N4OSTelegramBot:
             await message.reply_text(format_memory_status(target))
             return
 
-        if is_memory_inbox_message(text):
+        if is_n4os_status_message(text):
+            target = parse_status_target(text)
+            status_reply = format_n4os_status(target)
+            if status_reply is None:
+                text = "reading status"
+            else:
+                self.logger.info("chosen route=n4os_status target=%s execution_ms=0.00", target)
+                await message.reply_text(status_reply)
+                return
+
+        if is_capture_message(text):
             started = time.perf_counter()
             try:
-                result = ingest_memory_inbox_notes(text, source="Telegram")
+                result = ingest_capture_notes(text, source="Telegram")
             except Exception:
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 self.logger.exception(
-                    "error while ingesting N4OS memory inbox execution_ms=%.2f",
+                    "error while ingesting N4OS capture execution_ms=%.2f",
                     elapsed_ms,
                 )
                 await message.reply_text(ERROR_MESSAGE)
@@ -419,12 +649,12 @@ class N4OSTelegramBot:
 
             elapsed_ms = (time.perf_counter() - started) * 1000
             self.logger.info(
-                "chosen route=memory_inbox added=%d duplicates=%d execution_ms=%.2f",
-                len(result.added),
-                len(result.skipped_duplicates),
+                "chosen route=n4os_capture family_added=%d journal_added=%d execution_ms=%.2f",
+                len(result.family.added),
+                len(result.journal_entries),
                 elapsed_ms,
             )
-            await message.reply_text(format_memory_ingest_reply(result))
+            await message.reply_text(format_capture_reply(result))
             return
 
         if is_goals_status_message(text):
@@ -432,9 +662,23 @@ class N4OSTelegramBot:
             await message.reply_text(format_goals_status())
             return
 
+        if is_n4os_review_message(text):
+            period = parse_review_period(text)
+            self.logger.info("chosen route=n4os_review period=%s execution_ms=0.00", period)
+            await message.reply_text(format_n4os_review(period))
+            return
+
         library_status_request = _library_status_alias(text)
         if library_status_request is not None:
             text = library_status_request
+
+        if is_n4os_advice_message(text):
+            started = time.perf_counter()
+            reply = format_n4os_advice(text)
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.logger.info("chosen route=n4os_advice execution_ms=%.2f", elapsed_ms)
+            await message.reply_text(reply)
+            return
 
         how_to_reply = _telegram_how_to_reply(text)
         if how_to_reply is not None:

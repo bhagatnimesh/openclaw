@@ -200,6 +200,8 @@ export type MsgContext = {
   MediaWorkspaceDir?: string;
   /** Attachment indexes whose audio was already transcribed before media understanding runs. */
   MediaTranscribedIndexes?: number[];
+  /** Attachment indexes whose media text was already produced before media understanding runs. */
+  MediaPreflightedIndexes?: number[];
   /**
    * Marker: skip downstream stageSandboxMedia. chat.send RPC sets this so
    * staging runs synchronously before respond() and surfaces 5xx to the

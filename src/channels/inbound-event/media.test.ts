@@ -15,6 +15,7 @@ describe("channel inbound media facts", () => {
           {
             path: " /tmp/image.png ",
             contentType: " image/png ",
+            preflighted: true,
             messageId: " ",
           },
           {
@@ -36,6 +37,7 @@ describe("channel inbound media facts", () => {
         contentType: "image/png",
         kind: "image",
         transcribed: false,
+        preflighted: true,
         messageId: "msg-1",
       },
       {
@@ -44,6 +46,7 @@ describe("channel inbound media facts", () => {
         contentType: "audio/mpeg",
         kind: "audio",
         transcribed: true,
+        preflighted: false,
         messageId: "msg-1",
       },
     ]);
@@ -52,7 +55,7 @@ describe("channel inbound media facts", () => {
   it("builds legacy media payload fields from inbound media facts", () => {
     expect(
       buildChannelInboundMediaPayload([
-        { path: "/tmp/image.png", contentType: "image/png", kind: "image" },
+        { path: "/tmp/image.png", contentType: "image/png", kind: "image", preflighted: true },
         {
           url: "https://example.test/audio.mp3",
           contentType: "audio/mpeg",
@@ -68,6 +71,7 @@ describe("channel inbound media facts", () => {
       MediaUrls: ["/tmp/image.png", "https://example.test/audio.mp3"],
       MediaTypes: ["image/png", "audio/mpeg"],
       MediaTranscribedIndexes: [1],
+      MediaPreflightedIndexes: [0],
     });
   });
 

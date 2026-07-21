@@ -338,6 +338,70 @@ class FamilyTasksClawTest(unittest.TestCase):
         _, metadata = _task_notes_and_metadata(created)
         self.assertEqual(metadata["tags"], ["shopping", "home"])
 
+    def test_add_task_from_image_entries_creates_individual_tasks(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 21, 20, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "\n".join(
+                    [
+                        "Create a task for every entry in the image with due date august first "
+                        "and tag IndiaTrip",
+                        "",
+                        "Image text:",
+                        "List title: India trip",
+                        "Check letters",
+                        "Clarify this year taxes paper work with davendera",
+                        "Meet Bandish",
+                    ]
+                ),
+                reference_time=now,
+            )
+
+        self.assertEqual(message, "Created 3 tasks from the image.")
+        self.assertEqual(
+            [task["title"] for task in provider.created],
+            [
+                "Check letters",
+                "Clarify this year taxes paper work with davendera",
+                "Meet Bandish",
+            ],
+        )
+        self.assertEqual([task["due"] for task in provider.created], ["2026-08-01"] * 3)
+        for created in provider.created:
+            self.assertEqual(created["notes"], "Tags: #indiatrip")
+            _, metadata = _task_notes_and_metadata(created)
+            self.assertEqual(metadata["tags"], ["indiatrip"])
+
+    def test_add_task_from_image_entries_uses_list_title_as_fallback_tag(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 7, 21, 20, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "\n".join(
+                    [
+                        "Create a task for every entry in the image with due date august first",
+                        "",
+                        "Image text:",
+                        "List title: India trip",
+                        "Check letters",
+                        "Bank locker",
+                    ]
+                ),
+                reference_time=now,
+            )
+
+        self.assertEqual(message, "Created 2 tasks from the image.")
+        self.assertEqual([task["due"] for task in provider.created], ["2026-08-01"] * 2)
+        for created in provider.created:
+            self.assertEqual(created["notes"], "Tags: #indiatrip")
+            _, metadata = _task_notes_and_metadata(created)
+            self.assertEqual(metadata["tags"], ["indiatrip"])
+
     def test_add_task_from_voice_chatter_creates_clean_google_task(self):
         provider = FakeProvider()
         claw = FamilyTasksClaw.from_provider(provider)

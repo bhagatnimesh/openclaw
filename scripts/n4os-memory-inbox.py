@@ -10,6 +10,11 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from n4os_capture import (  # noqa: E402
+    DEFAULT_N4OS_ROOT,
+    format_capture_reply,
+    ingest_capture_notes,
+)
 from n4os_memory_inbox import (  # noqa: E402
     DEFAULT_OBSERVATIONS_ROOT,
     format_memory_ingest_reply,
@@ -30,7 +35,16 @@ def main() -> int:
         "--observations-root",
         type=Path,
         default=DEFAULT_OBSERVATIONS_ROOT,
-        help="Directory for n4os family observation month files.",
+        help=(
+            "Legacy directory for n4os family observation month files. "
+            "When changed from the default, only family observations are written."
+        ),
+    )
+    parser.add_argument(
+        "--n4os-root",
+        type=Path,
+        default=DEFAULT_N4OS_ROOT,
+        help="N4OS vault root for capture routing, observations, and journal entries.",
     )
     parser.add_argument(
         "--source",
@@ -45,13 +59,23 @@ def main() -> int:
     args = parser.parse_args()
 
     inbox_text = _read_input(args.input)
-    result = ingest_memory_inbox_notes(
+    if args.observations_root != DEFAULT_OBSERVATIONS_ROOT:
+        result = ingest_memory_inbox_notes(
+            inbox_text,
+            observations_root=args.observations_root,
+            default_date=args.default_date,
+            source=args.source,
+        )
+        print(format_memory_ingest_reply(result))
+        return 0
+
+    result = ingest_capture_notes(
         inbox_text,
-        observations_root=args.observations_root,
+        n4os_root=args.n4os_root,
         default_date=args.default_date,
         source=args.source,
     )
-    print(format_memory_ingest_reply(result))
+    print(format_capture_reply(result))
     return 0
 
 

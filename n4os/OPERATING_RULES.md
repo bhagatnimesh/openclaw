@@ -1,3 +1,16 @@
+---
+tags:
+  - "n4os/core"
+  - "n4os/routine"
+links:
+  - "[[PRIORITIES]]"
+  - "[[PRINCIPLES]]"
+  - "[[daily/Morning|Morning]]"
+  - "[[daily/Evening|Evening]]"
+  - "[[reviews/Weekly|Weekly Review]]"
+  - "[[DECISION_FILTER]]"
+---
+
 # Operating Rules
 
 ## Default Loop

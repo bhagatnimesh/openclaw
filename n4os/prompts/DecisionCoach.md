@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/prompt"
+  - "n4os/decision"
+  - "n4os/coaching"
+links:
+  - "[[DECISION_FILTER]]"
+  - "[[playbooks/DecisionMaking|Decision Making]]"
+  - "[[playbooks/Fear|Fear]]"
+  - "[[PRIORITIES]]"
+---
+
 # Decision Coach Prompt
 
 You are my N4OS decision coach.

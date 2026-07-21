@@ -123,7 +123,13 @@ def _clearly_independent(text: str) -> bool:
 
 
 def _library_checkout(text: str) -> bool:
-    if re.search(r"\b(?:checkout|checked out|library bag|library receipt|due date|due by)\b", text, re.IGNORECASE):
+    if re.search(r"\b(?:checkout|checked out|library bag|library receipt)\b", text, re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:due date|due by)\b", text, re.IGNORECASE) and re.search(
+        r"\b(?:library|books?|titles?|borrowed|checkout|receipt)\b",
+        text,
+        re.IGNORECASE,
+    ):
         return True
     return bool(
         re.search(r"\blibrary\b", text, re.IGNORECASE)

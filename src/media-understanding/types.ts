@@ -21,6 +21,7 @@ export type MediaAttachment = {
   mime?: string;
   index: number;
   alreadyTranscribed?: boolean;
+  alreadyPreflighted?: boolean;
 };
 
 export type MediaUnderstandingOutput = {

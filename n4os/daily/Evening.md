@@ -1,3 +1,14 @@
+---
+tags:
+  - "n4os/daily"
+  - "n4os/review"
+links:
+  - "[[HAPPINESS_SCORECARD]]"
+  - "[[OPERATING_RULES]]"
+  - "[[reviews/Weekly|Weekly Review]]"
+  - "[[PERSONAL_MODEL]]"
+---
+
 # Evening
 
 Use this to close the loop without judgment.

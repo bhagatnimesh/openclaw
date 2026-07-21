@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/review"
+  - "n4os/quarterly"
+links:
+  - "[[MISSION]]"
+  - "[[PRIORITIES]]"
+  - "[[goals/2036|2036 Goals]]"
+  - "[[goals/2026|2026 Goals]]"
+  - "[[HAPPINESS_SCORECARD]]"
+---
+
 # Quarterly Review
 
 Use this to make strategic adjustments.

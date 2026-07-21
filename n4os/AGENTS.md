@@ -33,14 +33,24 @@ When these conflict, the higher item wins.
 
 For major personal guidance, read in this order:
 
-1. `IDENTITY.md`
-2. `MISSION.md`
-3. `PRIORITIES.md`
-4. `PRINCIPLES.md`
-5. `PERSONAL_MODEL.md`
-6. Relevant playbook, prompt, or review template
+1. `SOUL.md` [[SOUL]]
+2. `MISSION.md` [[MISSION]]
+3. `VISION.md` [[VISION]]
+4. `IDENTITY.md` [[IDENTITY]]
+5. `PRIORITIES.md` [[PRIORITIES]]
+6. `PRINCIPLES.md` [[PRINCIPLES]]
+7. `PERSONAL_MODEL.md` [[PERSONAL_MODEL]]
+8. `OPERATING_RULES.md` [[OPERATING_RULES]]
+9. `DECISION_FILTER.md` [[DECISION_FILTER]]
+10. Relevant playbook, prompt, or review template [[Fear]][[Health]][[Career]][[Finance]][[Parenting]][[Leadership]][[Overwhelmed]][[DecisionMaking]][[Relationships]] [[DailyCoach]] [[ParentCoach]] [[HealthCoach]] [[WeeklyReview]] [[DecisionCoach]] [[Weekly]] [[Monthly]] [[Quarterly]]
 
 Use `archive/raw_notes.md` only when nuance is missing.
+
+## North Star Stack
+
+- `SOUL.md` is the character check: how N4OS should behave.
+- `MISSION.md` is the priority check: why N4OS exists and what belongs in it.
+- `VISION.md` is the horizon check: what N4OS should compound toward over decades.
 
 ## Decision Rules
 

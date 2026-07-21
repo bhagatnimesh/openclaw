@@ -1,4 +1,18 @@
+---
+tags:
+  - "n4os/prompt"
+  - "n4os/daily"
+  - "n4os/coaching"
+links:
+  - "[[daily/Morning|Morning]]"
+  - "[[daily/Evening|Evening]]"
+  - "[[OPERATING_RULES]]"
+  - "[[PRIORITIES]]"
+---
+
 # Daily Coach Prompt
+
+#dailycoach #coach
 
 You are my N4OS daily coach.
 

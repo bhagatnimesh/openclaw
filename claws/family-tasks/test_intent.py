@@ -142,6 +142,19 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["title"], "Buy new water filter")
         self.assertEqual(intent["metadata"]["tags"], ["shopping", "home"])
 
+    def test_create_task_extracts_plain_tag_annotation(self):
+        now = datetime(2026, 7, 21, 20, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add task check letters due august first and tag IndiaTrip",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Check letters")
+        self.assertEqual(intent["due"], "2026-08-01")
+        self.assertEqual(intent["metadata"]["tags"], ["indiatrip"])
+
     def test_numeric_hash_in_title_is_not_a_tag(self):
         now = datetime(2026, 7, 7, 9, 31, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 

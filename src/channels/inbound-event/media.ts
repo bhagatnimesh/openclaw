@@ -16,6 +16,7 @@ export type ChannelInboundMediaInput = {
   contentType?: string | null;
   kind?: InboundMediaFacts["kind"] | null;
   transcribed?: boolean | null;
+  preflighted?: boolean | null;
   messageId?: string | null;
 };
 
@@ -30,6 +31,7 @@ export type ChannelInboundMediaPayload = {
   MediaUrls?: string[];
   MediaTypes?: string[];
   MediaTranscribedIndexes?: number[];
+  MediaPreflightedIndexes?: number[];
 };
 
 function alignedStrings(values: Array<string | undefined>): string[] | undefined {
@@ -69,6 +71,7 @@ export function toInboundMediaFacts(
     contentType: normalizeString(entry.contentType),
     kind: normalizeKind(entry.kind) ?? defaults.kind,
     transcribed: entry.transcribed === true || defaults.transcribed?.(entry, index) === true,
+    preflighted: entry.preflighted === true,
     messageId: normalizeString(entry.messageId) ?? defaults.messageId,
   }));
 }
@@ -102,6 +105,9 @@ export function buildChannelInboundMediaPayload(
   const transcribedIndexes = entries
     .map((item, index) => (item.transcribed ? index : undefined))
     .filter((index): index is number => index !== undefined);
+  const preflightedIndexes = entries
+    .map((item, index) => (item.preflighted ? index : undefined))
+    .filter((index): index is number => index !== undefined);
   return {
     MediaPath: entries[0]?.path,
     MediaUrl: entries[0]?.url ?? entries[0]?.path,
@@ -110,5 +116,6 @@ export function buildChannelInboundMediaPayload(
     MediaUrls: alignedStrings(entries.map((item) => item.url ?? item.path)),
     MediaTypes: alignedStrings(entries.map(mediaType)),
     MediaTranscribedIndexes: transcribedIndexes.length > 0 ? transcribedIndexes : undefined,
+    MediaPreflightedIndexes: preflightedIndexes.length > 0 ? preflightedIndexes : undefined,
   };
 }

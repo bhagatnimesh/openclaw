@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/playbook"
+  - "n4os/work"
+links:
+  - "[[playbooks/AI|AI]]"
+  - "[[PRIORITIES]]"
+  - "[[NON_GOALS]]"
+  - "[[DECISION_FILTER]]"
+  - "[[playbooks/Leadership|Leadership]]"
+---
+
 # Career Playbook
 
 ## Objective

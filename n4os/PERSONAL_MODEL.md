@@ -1,3 +1,16 @@
+---
+tags:
+  - "n4os/core"
+  - "n4os/coaching"
+links:
+  - "[[PRIORITIES]]"
+  - "[[PRINCIPLES]]"
+  - "[[playbooks/Fear|Fear]]"
+  - "[[playbooks/Overwhelmed|Overwhelmed]]"
+  - "[[DECISION_FILTER]]"
+  - "[[HAPPINESS_SCORECARD]]"
+---
+
 # Personal Model
 
 This file helps future agents coach me well.

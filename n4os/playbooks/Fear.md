@@ -1,3 +1,14 @@
+---
+tags:
+  - "n4os/playbook"
+  - "n4os/decision"
+links:
+  - "[[PERSONAL_MODEL]]"
+  - "[[DECISION_FILTER]]"
+  - "[[playbooks/Overwhelmed|Overwhelmed]]"
+  - "[[PRINCIPLES]]"
+---
+
 # Fear Playbook
 
 ## Rule

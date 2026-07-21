@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/daily"
+  - "n4os/routine"
+links:
+  - "[[PRIORITIES]]"
+  - "[[OPERATING_RULES]]"
+  - "[[goals/2026|2026 Goals]]"
+  - "[[playbooks/Health|Health]]"
+  - "[[playbooks/Parenting|Parenting]]"
+---
+
 # Morning
 
 Use this to start the day with alignment.

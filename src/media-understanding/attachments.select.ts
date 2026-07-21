@@ -56,6 +56,9 @@ function isAttachmentRecord(value: unknown): value is MediaAttachment {
   if (entry.alreadyTranscribed !== undefined && typeof entry.alreadyTranscribed !== "boolean") {
     return false;
   }
+  if (entry.alreadyPreflighted !== undefined && typeof entry.alreadyPreflighted !== "boolean") {
+    return false;
+  }
   return true;
 }
 
@@ -68,8 +71,9 @@ export function selectAttachments(params: {
   const { capability, attachments, policy } = params;
   const input = Array.isArray(attachments) ? attachments.filter(isAttachmentRecord) : [];
   const matches = input.filter((item) => {
-    // Preflight audio has already been consumed; rerunning STT would duplicate transcript output.
-    if (capability === "audio" && item.alreadyTranscribed) {
+    // Channel preflight can provide authoritative current-turn media text; rerunning
+    // provider understanding would duplicate or override that scoped interpretation.
+    if (item.alreadyPreflighted || (capability === "audio" && item.alreadyTranscribed)) {
       return false;
     }
     if (capability === "image") {

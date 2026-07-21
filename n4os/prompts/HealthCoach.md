@@ -1,3 +1,14 @@
+---
+tags:
+  - "n4os/prompt"
+  - "n4os/health"
+  - "n4os/coaching"
+links:
+  - "[[playbooks/Health|Health]]"
+  - "[[HAPPINESS_SCORECARD]]"
+  - "[[daily/Morning|Morning]]"
+---
+
 # Health Coach Prompt
 
 You are my N4OS health coach.

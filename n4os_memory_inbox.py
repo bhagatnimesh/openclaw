@@ -15,6 +15,33 @@ KNOWN_PEOPLE = {
     "both": "Family",
     "both kids": "Family",
 }
+PERSON_LINKS = {
+    "Nysha": "[[family/Nysha|Nysha]]",
+    "Navya": "[[family/Navya|Navya]]",
+}
+CONCEPT_RULES = [
+    (
+        "Reading",
+        re.compile(
+            r"\b(read|reading|book|books|chapter|library|libraries|story|stories)\b",
+            re.I,
+        ),
+    ),
+    (
+        "Confidence",
+        re.compile(
+            r"\b("
+            r"confiden\w*|new people|eye contact|low voice|public|speaking|"
+            r"hesitant|nervous|brave|independent\w*"
+            r")\b",
+            re.I,
+        ),
+    ),
+    (
+        "School Transition",
+        re.compile(r"\b(starting new school|new school|school transition|new classmates)\b", re.I),
+    ),
+]
 COMMAND_PREFIX_RE = re.compile(
     r"^\s*/(?:mem-inbox|memory-inbox|memory|mem)(?:@\w+)?(?=\s|$)",
     re.I,
@@ -189,16 +216,23 @@ def _month_path(observations_root: Path, observed_on: date) -> Path:
 def _append_observation(observations_root: Path, observation: MemoryObservation) -> None:
     observations_root.mkdir(parents=True, exist_ok=True)
     path = _month_path(observations_root, observation.observed_on)
+    links = _observation_note_links(observation)
     if not path.exists():
-        path.write_text(f"# Family Observations - {observation.observed_on:%Y-%m}\n", encoding="utf-8")
+        path.write_text(_month_header(observation, links), encoding="utf-8")
+    else:
+        _merge_frontmatter_links(path, links)
 
+    linked_observation = _link_observation_text(observation.observation)
+    concept_links = _infer_concept_links(observation.observation)
+    topic_line = [f"  Topics: {', '.join(concept_links)}"] if concept_links else []
     block = "\n".join(
         [
             "",
             f"## {observation.observed_on.isoformat()}",
             "",
-            f"### {observation.person}",
-            f"- Observation: {observation.observation}",
+            f"### {_person_heading(observation.person)}",
+            f"- Observation: {linked_observation}",
+            *topic_line,
             f"  Source: {observation.source}",
             "  Freshness: new",
             "  Confidence: low",
@@ -206,6 +240,106 @@ def _append_observation(observations_root: Path, observation: MemoryObservation)
     )
     with path.open("a", encoding="utf-8") as file:
         file.write(block + "\n")
+
+
+def _month_header(observation: MemoryObservation, links: list[str]) -> str:
+    return "\n".join(
+        [
+            "---",
+            "tags:",
+            "  - \"n4os/family\"",
+            "  - \"n4os/memory\"",
+            "  - \"n4os/observation\"",
+            "links:",
+            *[f"  - \"{link}\"" for link in links],
+            f"month: \"{observation.observed_on:%Y-%m}\"",
+            "---",
+            "",
+            f"# Family Observations - {observation.observed_on:%Y-%m}",
+            "",
+        ]
+    )
+
+
+def _observation_note_links(observation: MemoryObservation) -> list[str]:
+    links = [
+        "[[playbooks/Parenting|Parenting]]",
+        "[[family/FamilyValues|Family Values]]",
+    ]
+    person_link = PERSON_LINKS.get(observation.person)
+    if person_link:
+        links.append(person_link)
+    links.extend(_infer_concept_links(observation.observation))
+    return _dedupe_preserving_order(links)
+
+
+def _dedupe_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _merge_frontmatter_links(path: Path, links: list[str]) -> None:
+    if not links:
+        return
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return
+    frontmatter = text[4:end].splitlines()
+    existing_links = set(_frontmatter_list_values(frontmatter, "links"))
+    new_links = [link for link in links if link not in existing_links]
+    if not new_links:
+        return
+
+    insert_at = _frontmatter_list_end(frontmatter, "links")
+    if insert_at is None:
+        insert_at = len(frontmatter)
+        frontmatter.append("links:")
+    for link in reversed(new_links):
+        frontmatter.insert(insert_at, f"  - \"{link}\"")
+
+    body = text[end + len("\n---\n") :]
+    updated = "---\n" + "\n".join(frontmatter) + "\n---\n" + body
+    path.write_text(updated, encoding="utf-8")
+
+
+def _frontmatter_list_values(lines: list[str], key: str) -> list[str]:
+    start = _frontmatter_key_index(lines, key)
+    if start is None:
+        return []
+    values: list[str] = []
+    for line in lines[start + 1 :]:
+        if line and not line.startswith(" ") and not line.startswith("-"):
+            break
+        match = re.match(r'^\s*-\s*"?([^"]+)"?\s*$', line)
+        if match:
+            values.append(match.group(1))
+    return values
+
+
+def _frontmatter_list_end(lines: list[str], key: str) -> int | None:
+    start = _frontmatter_key_index(lines, key)
+    if start is None:
+        return None
+    end = start + 1
+    while end < len(lines) and (not lines[end] or lines[end].startswith(" ") or lines[end].startswith("-")):
+        end += 1
+    return end
+
+
+def _frontmatter_key_index(lines: list[str], key: str) -> int | None:
+    for index, line in enumerate(lines):
+        if line == f"{key}:":
+            return index
+    return None
 
 
 def _load_existing_keys(observations_root: Path) -> set[tuple[str, str, str]]:
@@ -221,7 +355,7 @@ def _load_existing_keys(observations_root: Path) -> set[tuple[str, str, str]]:
                 parsed = line.removeprefix("## ").strip()
                 current_date = parsed if _looks_like_date(parsed) else current_date
             elif line.startswith("### "):
-                current_person = line.removeprefix("### ").strip() or "Unknown"
+                current_person = _plain_wiki_text(line.removeprefix("### ").strip()) or "Unknown"
             elif line.startswith("- Observation: ") and current_date:
                 observation = line.removeprefix("- Observation: ").strip()
                 keys.add((current_date, current_person, _normalize_observation(observation)))
@@ -245,4 +379,60 @@ def _observation_key(observation: MemoryObservation) -> tuple[str, str, str]:
 
 
 def _normalize_observation(value: str) -> str:
-    return re.sub(r"\s+", " ", value.strip().lower())
+    plain = _plain_wiki_text(value)
+    return re.sub(r"\s+", " ", plain.strip().lower())
+
+
+def _person_heading(person: str) -> str:
+    return PERSON_LINKS.get(person, person)
+
+
+def _infer_concept_links(text: str) -> list[str]:
+    links: list[str] = []
+    for name, pattern in CONCEPT_RULES:
+        if pattern.search(text):
+            links.append(f"[[{name}]]")
+    return links
+
+
+def _link_observation_text(text: str) -> str:
+    linked = text
+    linked = re.sub(
+        r"\bstarting new school\b",
+        "[[School Transition|starting new school]]",
+        linked,
+        flags=re.I,
+    )
+    linked = re.sub(
+        r"\bnew classmates\b",
+        "[[School Transition|new classmates]]",
+        linked,
+        flags=re.I,
+    )
+    linked = re.sub(r"\breading\b", "[[Reading|reading]]", linked, flags=re.I)
+    linked = re.sub(r"\bbooks\b", "[[Reading|books]]", linked, flags=re.I)
+    linked = re.sub(r"\bread\b", "[[Reading|read]]", linked, flags=re.I)
+    linked = re.sub(r"\bconfidence\b", "[[Confidence|confidence]]", linked, flags=re.I)
+    linked = re.sub(
+        r"\bindependent\w*\b",
+        lambda match: f"[[Confidence|{match.group(0)}]]",
+        linked,
+        flags=re.I,
+    )
+    linked = re.sub(r"\bnew people\b", "[[Confidence|new people]]", linked, flags=re.I)
+    linked = re.sub(r"\beye contact\b", "[[Confidence|eye contact]]", linked, flags=re.I)
+    linked = re.sub(r"\blow voice\b", "[[Confidence|low voice]]", linked, flags=re.I)
+    linked = re.sub(r"\bpublic\b", "[[Confidence|public]]", linked, flags=re.I)
+    linked = re.sub(r"\bspeaking\b", "[[Confidence|speaking]]", linked, flags=re.I)
+    linked = re.sub(r"\bhesitant\b", "[[Confidence|hesitant]]", linked, flags=re.I)
+    return linked
+
+
+def _plain_wiki_text(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        target = match.group(1)
+        if "|" in target:
+            return target.rsplit("|", 1)[1]
+        return target.rsplit("/", 1)[-1]
+
+    return re.sub(r"\[\[([^\]]+)\]\]", replace, text)

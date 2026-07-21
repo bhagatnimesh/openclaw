@@ -1,3 +1,16 @@
+---
+tags:
+  - "n4os/playbook"
+  - "n4os/purpose"
+  - "n4os/work"
+links:
+  - "[[MISSION]]"
+  - "[[PRIORITIES]]"
+  - "[[playbooks/Career|Career]]"
+  - "[[goals/2026|2026 Goals]]"
+  - "[[goals/2036|2036 Goals]]"
+---
+
 # AI Playbook
 
 ## Objective

@@ -1234,6 +1234,52 @@ describe("applyMediaUnderstanding", () => {
     expect(ctx.Body).toBe("[Image]\nDescription:\nnormalized image");
   });
 
+  it("skips image understanding for attachments marked preflighted by the channel", async () => {
+    const imagePath = await createTempMediaFile({
+      fileName: "photo.jpg",
+      content: "image-bytes",
+    });
+    const describeImage = vi.fn(async () => ({ text: "duplicate image description" }));
+    const ctx: MsgContext = {
+      Body: "caption\n[Image text extraction (machine-generated, untrusted)]:\n- Check letters",
+      MediaPath: imagePath,
+      MediaType: "image/jpeg",
+      MediaPreflightedIndexes: [0],
+    };
+    const cfg: OpenClawConfig = {
+      tools: {
+        media: {
+          image: {
+            enabled: true,
+            models: [{ provider: "vision" }],
+          },
+        },
+      },
+    };
+
+    const result = await applyMediaUnderstanding({
+      ctx,
+      cfg,
+      providers: {
+        vision: {
+          id: "vision",
+          capabilities: ["image"],
+          describeImage,
+        },
+      },
+    });
+
+    expect(describeImage).not.toHaveBeenCalled();
+    expect(result.appliedImage).toBe(false);
+    expect(ctx.Body).toContain("- Check letters");
+    const imageDecision = result.decisions.find((decision) => decision.capability === "image");
+    expect(imageDecision).toEqual({
+      capability: "image",
+      outcome: "no-attachment",
+      attachments: [],
+    });
+  });
+
   it("uses active model when enabled and models are missing", async () => {
     const audioPath = await createTempMediaFile({
       fileName: "fallback.ogg",

@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/family"
+  - "n4os/values"
+links:
+  - "[[MISSION]]"
+  - "[[PRIORITIES]]"
+  - "[[playbooks/Parenting|Parenting]]"
+  - "[[family/Nysha|Nysha]]"
+  - "[[family/Navya|Navya]]"
+---
+
 # Family Values
 
 ## Family North Star

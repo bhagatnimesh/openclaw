@@ -1432,6 +1432,17 @@ class IntentRouterTest(unittest.TestCase):
         self.assertGreaterEqual(decision["confidence"], 0.6)
         self.assertIn("family-tasks", decision["intent_summary"])
 
+    def test_routes_image_task_entries_with_due_date_to_tasks(self):
+        request = (
+            "Create a task for every entry in the image with due date august first "
+            "and tag IndiaTrip"
+        )
+
+        decision = route_request(request, now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIn("create_task", decision["intent_summary"])
+
     def test_routes_ai_assistant_marked_task_creation(self):
         request = "\n".join(
             [
@@ -2028,6 +2039,23 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(home_board.calls, [])
         self.assertEqual(decisions.calls, [])
         self.assertEqual(science_lab.calls, [])
+
+    def test_dispatches_image_task_entries_with_due_date_to_tasks_claw(self):
+        tasks = FakeTasksClaw()
+        library = FakeLibraryClaw()
+        claw = N4OSClaw(tasks_claw=tasks, library_claw=library)
+        request = (
+            "Create a task for every entry in the image with due date august first "
+            "and tag IndiaTrip"
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(decision["intent_summary"], "Route to family-tasks for create_task.")
+        self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+        self.assertEqual(library.calls, [])
 
     def test_route_clarification_dispatches_original_request(self):
         calendar = FakeCalendarClaw()

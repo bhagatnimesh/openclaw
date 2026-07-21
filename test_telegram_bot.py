@@ -35,6 +35,7 @@ from telegram_bot import (
     build_application,
     load_config,
 )
+from n4os_capture import CaptureIngestResult, JournalEntry
 from n4os_memory_inbox import MemoryIngestResult, MemoryObservation
 
 
@@ -46,12 +47,14 @@ class FakeMessage:
         voice: Any | None = None,
         audio: Any | None = None,
         document: Any | None = None,
+        photo: list[Any] | None = None,
     ) -> None:
         self.text = text
         self.caption = caption
         self.voice = voice
         self.audio = audio
         self.document = document
+        self.photo = photo or []
         self.replies: list[str] = []
 
     async def reply_text(self, text: str) -> None:
@@ -131,12 +134,13 @@ class FakeVoice:
 
 
 class FakeTelegramFile:
-    def __init__(self) -> None:
+    def __init__(self, content: bytes = b"audio bytes") -> None:
+        self.content = content
         self.downloads: list[Path] = []
 
     async def download_to_drive(self, path: Path) -> Path:
         self.downloads.append(path)
-        path.write_bytes(b"audio bytes")
+        path.write_bytes(self.content)
         return path
 
 
@@ -148,6 +152,27 @@ class FakeTelegramVoice:
 
     async def get_file(self) -> FakeTelegramFile:
         return self.telegram_file
+
+
+class FakeTelegramPhoto:
+    def __init__(self, telegram_file: FakeTelegramFile, file_size: int = 1) -> None:
+        self.telegram_file = telegram_file
+        self.file_size = file_size
+        self.width = 100
+        self.height = 100
+
+    async def get_file(self) -> FakeTelegramFile:
+        return self.telegram_file
+
+
+class FakeImageTextExtractor:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.paths: list[Path] = []
+
+    def extract_text(self, image_path: Path) -> str:
+        self.paths.append(image_path)
+        return self.text
 
 
 class FakeAudioTranscriber:
@@ -249,6 +274,41 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claw.requests, ["Add task buy milk"])
         self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
 
+    async def test_photo_caption_routes_with_extracted_image_text(self):
+        claw = FakeClaw()
+        extractor = FakeImageTextExtractor("List title: India trip\nCheck letters\nBank locker")
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            image_text_extractor=extractor,
+        )
+        telegram_file = FakeTelegramFile(b"image bytes")
+        message = FakeMessage(
+            caption=(
+                "Create a task for every entry in the image with due date august first "
+                "and tag IndiaTrip"
+            ),
+            photo=[FakeTelegramPhoto(telegram_file)],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(
+            claw.requests,
+            [
+                "Create a task for every entry in the image with due date august first "
+                "and tag IndiaTrip\n"
+                "Image text:\n"
+                "List title: India trip\n"
+                "Check letters\n"
+                "Bank locker",
+            ],
+        )
+        self.assertEqual(message.replies, ["router replied to: " + claw.requests[0]])
+        self.assertEqual(len(extractor.paths), 1)
+        self.assertFalse(extractor.paths[0].exists())
+
     async def test_authorized_slash_calendar_routes_to_n4os_as_text(self):
         claw = FakeClaw()
         bot = N4OSTelegramBot(
@@ -283,43 +343,54 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claw.requests, ["add task buy milk"])
         self.assertEqual(message.replies, ["router replied to: add task buy milk"])
 
-    async def test_authorized_memory_inbox_is_captured_without_routing(self):
+    async def test_authorized_capture_alias_is_captured_without_routing(self):
         claw = FakeClaw()
-        result = MemoryIngestResult(
-            added=[
-                MemoryObservation(
-                    observed_on=date(2026, 7, 21),
-                    person="Nysha",
-                    observation="liked teaching younger kids",
+        result = CaptureIngestResult(
+            family=MemoryIngestResult(
+                added=[
+                    MemoryObservation(
+                        observed_on=date(2026, 7, 21),
+                        person="Nysha",
+                        observation="liked teaching younger kids",
+                        source="Telegram",
+                    )
+                ],
+                skipped_duplicates=[],
+            ),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 7, 21),
+                    text="I felt proud.",
+                    topics=["Parenting"],
                     source="Telegram",
                 )
             ],
-            skipped_duplicates=[],
+            skipped_journal_duplicates=[],
         )
         bot = N4OSTelegramBot(
             TelegramConfig(token="token", allowed_user_id=12345),
             claw,
             logger=QuietLogger(),
         )
-        message = FakeMessage("/mem-inbox\nNysha: liked teaching younger kids")
+        message = FakeMessage("/capture Nysha liked teaching younger kids. I felt proud.")
 
-        with patch("telegram_bot.ingest_memory_inbox_notes", return_value=result) as ingest:
+        with patch("telegram_bot.ingest_capture_notes", return_value=result) as ingest:
             await bot.handle_message(FakeUpdate(12345, message), None)
 
         ingest.assert_called_once_with(
-            "/mem-inbox\nNysha: liked teaching younger kids",
+            "/capture Nysha liked teaching younger kids. I felt proud.",
             source="Telegram",
         )
         self.assertEqual(claw.requests, [])
         self.assertEqual(
             message.replies,
             [
-                "N4OS memory inbox processed.\n"
-                "Captured 1 new observations.\n"
-                "New observations by person:\n"
-                "- Nysha: 1\n"
-                "Saved to n4os/family/observations/YYYY-MM.md.\n"
-                "No child profiles were promoted automatically."
+                "Captured.\n"
+                "\n"
+                "- Family observation: Nysha (1)\n"
+                "- Journal reflection: Parenting (1)\n"
+                "\n"
+                "No profiles, playbooks, or goals were promoted automatically."
             ],
         )
 
@@ -334,7 +405,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("telegram_bot.format_memory_status", return_value="family memory summary") as status,
-            patch("telegram_bot.ingest_memory_inbox_notes") as ingest,
+            patch("telegram_bot.ingest_capture_notes") as ingest,
         ):
             await bot.handle_message(FakeUpdate(12345, message), None)
 
@@ -342,6 +413,22 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         ingest.assert_not_called()
         self.assertEqual(claw.requests, [])
         self.assertEqual(message.replies, ["family memory summary"])
+
+    async def test_authorized_status_target_reports_without_routing(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/status Nysha")
+
+        with patch("telegram_bot.format_n4os_status", return_value="nysha status") as status:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        status.assert_called_once_with("nysha")
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["nysha status"])
 
     async def test_authorized_goals_question_reports_from_n4os_memory(self):
         claw = FakeClaw()
@@ -373,6 +460,54 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claw.requests, ["reading status"])
         self.assertEqual(message.replies, ["router replied to: reading status"])
 
+    async def test_authorized_review_week_reports_without_routing(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/review week")
+
+        with patch("telegram_bot.format_n4os_review", return_value="weekly review") as review:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        review.assert_called_once_with("week")
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["weekly review"])
+
+    async def test_authorized_n4os_advice_question_uses_memory_advice(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/ask How should we approach Nysha's reading?")
+
+        with patch("telegram_bot.format_n4os_advice", return_value="memory-backed advice") as advice:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        advice.assert_called_once_with("/ask How should we approach Nysha's reading?")
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["memory-backed advice"])
+
+    async def test_ask_question_with_help_word_still_uses_advice(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/ask how should I help Nysha with school transition?")
+
+        with patch("telegram_bot.format_n4os_advice", return_value="school advice") as advice:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        advice.assert_called_once_with("/ask how should I help Nysha with school transition?")
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["school advice"])
+
     async def test_authorized_how_to_memory_gets_direct_help(self):
         claw = FakeClaw()
         bot = N4OSTelegramBot(
@@ -385,7 +520,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         await bot.handle_message(FakeUpdate(12345, message), None)
 
         self.assertEqual(claw.requests, [])
-        self.assertEqual(message.replies, [HOW_TO_HELP["memory"]])
+        self.assertEqual(message.replies, [HOW_TO_HELP["capture"]])
 
     async def test_authorized_commands_question_gets_general_help(self):
         claw = FakeClaw()
@@ -444,6 +579,20 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(claw.requests, [])
         self.assertEqual(message.replies, [HOW_TO_HELP["library"]])
+
+    async def test_authorized_how_to_science_lab_gets_direct_help(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("how do I use the science experiment area?")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, [HOW_TO_HELP["science_lab"]])
 
     async def test_authorized_voice_routes_transcript_to_n4os(self):
         claw = FakeClaw()
@@ -759,11 +908,14 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         await bot.handle_help(FakeUpdate(12345, message), None)
 
         self.assertEqual(message.replies, [HELP_MESSAGE])
-        self.assertIn("/mem Nysha", HELP_MESSAGE)
-        self.assertIn("/memory-status family", HELP_MESSAGE)
+        self.assertIn("/capture Nysha", HELP_MESSAGE)
+        self.assertIn("/ask How should", HELP_MESSAGE)
+        self.assertIn("/review week", HELP_MESSAGE)
+        self.assertIn("/status Nysha", HELP_MESSAGE)
         self.assertIn("/event create", HELP_MESSAGE)
         self.assertIn("/goals", HELP_MESSAGE)
         self.assertIn("Nysha read 8 pages", HELP_MESSAGE)
+        self.assertIn("science lab experiments", HELP_MESSAGE)
 
     async def test_router_errors_are_reported_gracefully(self):
         bot = N4OSTelegramBot(

@@ -176,13 +176,13 @@ def _read_observations(observations_root: Path) -> list[ObservationRecord]:
                     )
                     current_text = None
                     current_source = None
-                current_person = line.removeprefix("### ").strip() or "Unknown"
+                current_person = _plain_wiki_text(line.removeprefix("### ").strip()) or "Unknown"
             elif line.startswith("- Observation: "):
                 if current_text is not None:
                     records.append(
                         ObservationRecord(current_date, current_person, current_text, current_source)
                     )
-                current_text = line.removeprefix("- Observation: ").strip()
+                current_text = _plain_wiki_text(line.removeprefix("- Observation: ").strip())
                 current_source = None
             elif line.strip().startswith("Source: ") and current_text is not None:
                 current_source = line.strip().removeprefix("Source: ").strip()
@@ -238,3 +238,13 @@ def _section_bullets(path: Path, heading: str, *, limit: int) -> list[str]:
 
 def _trim_period(value: str) -> str:
     return value.rstrip(".")
+
+
+def _plain_wiki_text(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        target = match.group(1)
+        if "|" in target:
+            return target.rsplit("|", 1)[1]
+        return target.rsplit("/", 1)[-1]
+
+    return re.sub(r"\[\[([^\]]+)\]\]", replace, text)

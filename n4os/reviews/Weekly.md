@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/review"
+  - "n4os/weekly"
+links:
+  - "[[HAPPINESS_SCORECARD]]"
+  - "[[goals/2026|2026 Goals]]"
+  - "[[daily/Evening|Evening]]"
+  - "[[PRIORITIES]]"
+  - "[[OPERATING_RULES]]"
+---
+
 # Weekly Review
 
 Use this to convert a week into learning and adjustment.

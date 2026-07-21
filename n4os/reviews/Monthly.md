@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/review"
+  - "n4os/monthly"
+links:
+  - "[[MISSION]]"
+  - "[[PRIORITIES]]"
+  - "[[goals/2026|2026 Goals]]"
+  - "[[reviews/Weekly|Weekly Review]]"
+  - "[[HAPPINESS_SCORECARD]]"
+---
+
 # Monthly Review
 
 Use this to check direction, not just activity.

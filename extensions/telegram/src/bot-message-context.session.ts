@@ -186,6 +186,7 @@ export async function buildTelegramInboundContextPayload(params: {
   route: ResolvedAgentRoute;
   rawBody: string;
   bodyText: string;
+  commandBody?: string;
   historyKey?: string;
   historyLimit: number;
   groupHistories: Map<string, HistoryEntry[]>;
@@ -197,6 +198,7 @@ export async function buildTelegramInboundContextPayload(params: {
   stickerCacheHit?: boolean;
   audioTranscript?: string;
   audioTranscribedMediaIndex?: number;
+  mediaPreflightedIndexes?: number[];
   commandAuthorized: boolean;
   locationData?: NormalizedLocation;
   options?: TelegramMessageContextOptions;
@@ -237,6 +239,7 @@ export async function buildTelegramInboundContextPayload(params: {
     route,
     rawBody,
     bodyText,
+    commandBody: providedCommandBody,
     historyKey,
     historyLimit,
     groupHistories,
@@ -248,6 +251,7 @@ export async function buildTelegramInboundContextPayload(params: {
     stickerCacheHit,
     audioTranscript,
     audioTranscribedMediaIndex,
+    mediaPreflightedIndexes,
     commandAuthorized,
     locationData,
     options,
@@ -406,7 +410,7 @@ export async function buildTelegramInboundContextPayload(params: {
   });
   const channelHistory = createChannelHistoryWindow({ historyMap: groupHistories });
   const hasGroupHistoryContext = isGroup;
-  const commandBody = normalizeCommandBody(rawBody, {
+  const commandBody = normalizeCommandBody(providedCommandBody ?? rawBody, {
     botUsername: normalizeOptionalLowercaseString(primaryCtx.me?.username),
   });
   const commandSource =
@@ -452,6 +456,7 @@ export async function buildTelegramInboundContextPayload(params: {
     url: media.path,
     contentType: media.contentType,
     transcribed: index !== undefined && audioTranscribedMediaIndex === index,
+    preflighted: index !== undefined && (mediaPreflightedIndexes ?? []).includes(index),
   });
   const currentMediaFacts = allMedia.map(toInboundMedia);
   const replyMediaFacts =

@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/family"
+  - "n4os/decision"
+links:
+  - "[[playbooks/Parenting|Parenting]]"
+  - "[[DECISION_FILTER]]"
+  - "[[family/FamilyValues|Family Values]]"
+  - "[[family/Nysha|Nysha]]"
+  - "[[family/Navya|Navya]]"
+---
+
 # Family Decisions User Guide
 
 Family Decisions helps the family keep track of open choices that need discussion, research, ownership, and follow-through. Use it for questions that should not disappear into chat history: camp plans, birthday parties, school choices, travel tradeoffs, medical logistics, and other family decisions that may take more than one conversation.

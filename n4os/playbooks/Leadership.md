@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/playbook"
+  - "n4os/work"
+  - "n4os/relationships"
+links:
+  - "[[playbooks/Career|Career]]"
+  - "[[playbooks/AI|AI]]"
+  - "[[PRINCIPLES]]"
+  - "[[PERSONAL_MODEL]]"
+---
+
 # Leadership Playbook
 
 ## Objective

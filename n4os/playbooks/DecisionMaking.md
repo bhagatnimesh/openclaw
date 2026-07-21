@@ -1,3 +1,14 @@
+---
+tags:
+  - "n4os/playbook"
+  - "n4os/decision"
+links:
+  - "[[DECISION_FILTER]]"
+  - "[[PRIORITIES]]"
+  - "[[playbooks/Fear|Fear]]"
+  - "[[PERSONAL_MODEL]]"
+---
+
 # Decision Making Playbook
 
 ## Principle

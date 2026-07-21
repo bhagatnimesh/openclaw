@@ -28,6 +28,20 @@ from tools import FamilyTaskTools, TasksProvider, build_default_tools
 
 NOAH_ASSISTANT_DEFAULT_LIMIT = 3
 NOAH_ASSISTANT_MAX_LIMIT = 20
+IMAGE_TEXT_MARKER = "Image text:"
+BULK_IMAGE_TASK_CUE_RE = re.compile(
+    r"\b(?:every|each|all)\b.*\b(?:entry|entries|items?|tasks?|todos?|to-dos?)\b.*\bimage\b|"
+    r"\bimage\b.*\b(?:every|each|all)\b.*\b(?:entry|entries|items?|tasks?|todos?|to-dos?)\b",
+    re.IGNORECASE,
+)
+IMAGE_TASK_HEADER_RE = re.compile(
+    r"^\s*(?:image\s+text|tasks?|todos?|to-dos?|entries?|items?)\s*:?\s*$",
+    re.IGNORECASE,
+)
+IMAGE_LIST_TITLE_RE = re.compile(
+    r"^\s*(?:list\s+title|title|heading)\s*:\s*(?P<title>.+?)\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -237,6 +251,79 @@ def _format_recommendations(
             suffix = " - " + "; ".join(str(reason) for reason in reasons)
         lines.append(f"- {_format_task_choice(task)}{suffix}")
     return "\n".join(lines)
+
+
+def _clean_image_task_line(line: str) -> str | None:
+    cleaned = line.strip()
+    if not cleaned:
+        return None
+    cleaned = re.sub(r"^\s*(?:[-*•]|\d+[.)]|\[[ xX]?\]|☐|☑|✓)\s*", "", cleaned)
+    cleaned = cleaned.strip(" \t-–—•☐☑✓")
+    if not cleaned or IMAGE_TASK_HEADER_RE.match(cleaned):
+        return None
+    if IMAGE_LIST_TITLE_RE.match(cleaned):
+        return None
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def _split_bulk_image_task_request(request: str) -> tuple[str, str] | None:
+    if IMAGE_TEXT_MARKER.lower() not in request.lower() or BULK_IMAGE_TASK_CUE_RE.search(request) is None:
+        return None
+    _, image_text = re.split(
+        re.escape(IMAGE_TEXT_MARKER),
+        request,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
+    caption = re.split(
+        re.escape(IMAGE_TEXT_MARKER),
+        request,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return caption, image_text
+
+
+def _image_list_title(image_text: str) -> str | None:
+    for line in image_text.splitlines():
+        match = IMAGE_LIST_TITLE_RE.match(line.strip())
+        if match is not None:
+            return match.group("title").strip()
+    return None
+
+
+def _bulk_image_task_titles(request: str) -> list[str]:
+    split_request = _split_bulk_image_task_request(request)
+    if split_request is None:
+        return []
+
+    _, image_text = split_request
+    titles: list[str] = []
+    seen: set[str] = set()
+    for line in image_text.splitlines():
+        title = _clean_image_task_line(line)
+        if title is None:
+            continue
+        key = title.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        titles.append(title)
+    return titles[:50]
+
+
+def _bulk_image_task_caption(request: str) -> str:
+    split_request = _split_bulk_image_task_request(request)
+    return split_request[0].strip() if split_request is not None else request
+
+
+def _bulk_image_fallback_tags(request: str) -> list[str]:
+    split_request = _split_bulk_image_task_request(request)
+    if split_request is None:
+        return []
+    _, image_text = split_request
+    title = _image_list_title(image_text)
+    return normalize_tags([title.replace(" ", "")]) if title else []
 
 
 def _is_task_list_request(request: str) -> bool:
@@ -456,6 +543,14 @@ class FamilyTasksClaw:
         reference_time: datetime | None = None,
         research_client: NoahResearchClient | None = None,
     ) -> str:
+        bulk_titles = _bulk_image_task_titles(request)
+        if bulk_titles:
+            return self._add_bulk_tasks_from_image_request(
+                request,
+                bulk_titles,
+                reference_time=reference_time,
+            )
+
         intent = extract_intent(request, now=reference_time)
         missing = intent.get("missing_fields", [])
         if intent.get("intent") != "create_task":
@@ -505,6 +600,62 @@ class FamilyTasksClaw:
             )
             if assistant_acknowledgment:
                 message = f"{message}\n{assistant_acknowledgment}"
+        print(message)
+        return message
+
+    def _add_bulk_tasks_from_image_request(
+        self,
+        request: str,
+        titles: list[str],
+        reference_time: datetime | None = None,
+    ) -> str:
+        caption = _bulk_image_task_caption(request)
+        shared_intent = extract_intent(
+            f"Add task {titles[0]} {caption}",
+            now=reference_time,
+        )
+        metadata = shared_intent.get("metadata") or {}
+        if not metadata.get("tags"):
+            metadata = dict(metadata)
+            metadata["tags"] = _bulk_image_fallback_tags(request)
+        notes = _set_note_tags(None, metadata.get("tags") or [])
+        created_tasks: list[dict[str, Any]] = []
+        failures: list[str] = []
+
+        for title in titles:
+            response = self.tools.create_task(
+                title=title,
+                notes=notes,
+                due=shared_intent.get("due"),
+                metadata=metadata,
+            )
+            if response["status"] != "ok":
+                failures.append(f"{title}: {response['message']}")
+                continue
+            task = response.get("data", {}).get("task", {})
+            if task:
+                created_tasks.append(dict(task))
+
+        if created_tasks:
+            self.last_created_task = dict(created_tasks[-1])
+            undo_tasks = [task for task in created_tasks if task.get("id")]
+            if undo_tasks:
+                self.undo_stack.append(
+                    {
+                        "action": "delete_tasks",
+                        "tasks": undo_tasks,
+                        "task_list_id": DEFAULT_TASK_LIST_ID,
+                    },
+                )
+
+        if failures and not created_tasks:
+            message = "Could not create image tasks:\n" + "\n".join(f"- {failure}" for failure in failures)
+            print(message)
+            return message
+
+        message = f"Created {len(created_tasks)} tasks from the image."
+        if failures:
+            message += "\nSome entries failed:\n" + "\n".join(f"- {failure}" for failure in failures)
         print(message)
         return message
 
@@ -992,6 +1143,26 @@ class FamilyTasksClaw:
                 if response["status"] == "ok"
                 else response["message"]
             )
+            print(message)
+            return message
+
+        if undo.get("action") == "delete_tasks":
+            tasks = [item for item in undo.get("tasks", []) if item.get("id")]
+            failed = []
+            for undo_task in tasks:
+                response = self.tools.delete_task(
+                    task_id=undo_task.get("id"),
+                    task_list_id=task_list_id,
+                    confirmed=True,
+                )
+                if response["status"] != "ok":
+                    failed.append(response["message"])
+            if failed:
+                message = "Some image-created tasks could not be deleted:\n" + "\n".join(
+                    f"- {failure}" for failure in failed
+                )
+            else:
+                message = f"Undid image task creation: deleted {len(tasks)} tasks."
             print(message)
             return message
 

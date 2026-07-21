@@ -228,6 +228,7 @@ export type InboundMediaFacts = {
   contentType?: string;
   kind?: "image" | "video" | "audio" | "document" | "unknown";
   transcribed?: boolean;
+  preflighted?: boolean;
   messageId?: string;
 };
 

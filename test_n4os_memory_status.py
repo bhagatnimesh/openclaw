@@ -50,8 +50,8 @@ class N4OSMemoryStatusTest(unittest.TestCase):
                     [
                         "# Family Observations - 2026-07",
                         "## 2026-07-21",
-                        "### Nysha",
-                        "- Observation: likes teaching",
+                        "### [[family/Nysha|Nysha]]",
+                        "- Observation: likes [[Reading|teaching]]",
                         "  Source: Google Docs",
                         "## 2026-07-21",
                         "### Navya",

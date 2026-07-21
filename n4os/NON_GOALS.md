@@ -1,3 +1,14 @@
+---
+tags:
+  - "n4os/core"
+  - "n4os/decision"
+links:
+  - "[[PRIORITIES]]"
+  - "[[PRINCIPLES]]"
+  - "[[playbooks/Career|Career]]"
+  - "[[DECISION_FILTER]]"
+---
+
 # Non-Goals
 
 I am intentionally not optimizing for:

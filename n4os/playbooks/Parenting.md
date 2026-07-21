@@ -1,15 +1,30 @@
+---
+tags:
+  - "n4os/playbook"
+  - "n4os/family"
+  - "n4os/parenting"
+links:
+  - "[[family/Nysha|Nysha]]"
+  - "[[family/Navya|Navya]]"
+  - "[[family/FamilyValues|Family Values]]"
+  - "[[Reading]]"
+  - "[[Confidence]]"
+  - "[[School Transition]]"
+  - "[[FAMILY_DECISIONS_GUIDE]]"
+---
+
 # Parenting Playbook
 
 ## Objective
 
-Raise Nysha and Navya into capable, kind, curious, resilient, confident, emotionally intelligent women who love learning and build meaningful lives.
+Raise [[family/Nysha|Nysha]] and [[family/Navya|Navya]] into capable, kind, curious, resilient, confident, emotionally intelligent women who love learning and build meaningful lives.
 
 ## Success Measures
 
 - strong values
 - strong habits
 - emotional awareness
-- kindness and confidence
+- kindness and [[Confidence|confidence]]
 - love of learning
 - logical reasoning
 - curiosity
@@ -33,4 +48,3 @@ Raise Nysha and Navya into capable, kind, curious, resilient, confident, emotion
 When work competes with family, ask:
 
 "Will my kids remember my presence or this work output?"
-

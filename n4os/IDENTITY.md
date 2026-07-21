@@ -1,3 +1,16 @@
+---
+tags:
+  - "n4os/core"
+  - "n4os/identity"
+links:
+  - "[[SOUL]]"
+  - "[[MISSION]]"
+  - "[[VISION]]"
+  - "[[PRIORITIES]]"
+  - "[[PRINCIPLES]]"
+  - "[[PERSONAL_MODEL]]"
+---
+
 # Identity
 
 I am a father, husband, builder, learner, and leader.
@@ -17,4 +30,3 @@ I strive to be calm under pressure, ambitious without ego, demanding with kindne
 I believe the future is created, not predicted.
 
 Whenever N4OS has to make decisions, this layer wins.
-

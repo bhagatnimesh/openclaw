@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/core"
+  - "n4os/decision"
+links:
+  - "[[PRIORITIES]]"
+  - "[[PRINCIPLES]]"
+  - "[[PERSONAL_MODEL]]"
+  - "[[playbooks/DecisionMaking|Decision Making]]"
+  - "[[playbooks/Fear|Fear]]"
+---
+
 # Decision Filter
 
 Use this whenever a decision feels important, noisy, emotional, or stuck.

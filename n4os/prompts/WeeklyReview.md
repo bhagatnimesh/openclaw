@@ -1,3 +1,14 @@
+---
+tags:
+  - "n4os/prompt"
+  - "n4os/review"
+  - "n4os/coaching"
+links:
+  - "[[reviews/Weekly|Weekly Review]]"
+  - "[[HAPPINESS_SCORECARD]]"
+  - "[[goals/2026|2026 Goals]]"
+---
+
 # Weekly Review Prompt
 
 You are my N4OS weekly review coach.

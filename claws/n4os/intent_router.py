@@ -511,11 +511,19 @@ def _score_science_lab(text: str) -> float:
 def _score_library(text: str, library_intent: dict[str, Any]) -> float:
     score = 0.0
     intent = library_intent.get("intent")
+    explicit_task_create = _is_explicit_task_create_text(text) or (
+        _has_task_cue(text) and re.search(r"\b(?:add|create|capture|remember)\b", text)
+    )
     if intent in LIBRARY_INTENTS:
         score += 0.5
     if re.search(r"\b(reading garden|read it myself|library claw|reading status)\b", text):
         score += 0.45
-    if re.search(r"\b(library bag|library checkout|checked out|checkout receipt|library receipt|due date|due by)\b", text):
+    if re.search(r"\b(library bag|library checkout|checked out|checkout receipt|library receipt)\b", text):
+        score += 0.5
+    elif re.search(r"\b(?:due date|due by)\b", text) and re.search(
+        r"\b(?:library|books?|titles?|borrowed|checkout|receipt)\b",
+        text,
+    ):
         score += 0.5
     if intent == "record_checkout":
         score += 0.25
@@ -530,6 +538,8 @@ def _score_library(text: str, library_intent: dict[str, Any]) -> float:
         text,
     ):
         score -= 0.25
+    if explicit_task_create:
+        score -= 0.45
     return max(0.0, min(score, 1.0))
 
 

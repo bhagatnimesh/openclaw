@@ -1,3 +1,15 @@
+---
+tags:
+  - "n4os/archive"
+  - "n4os/source"
+links:
+  - "[[README]]"
+  - "[[IDENTITY]]"
+  - "[[MISSION]]"
+  - "[[PRIORITIES]]"
+  - "[[PERSONAL_MODEL]]"
+---
+
 Goals, values and principles
 
 I am going paste some notes on my thinking. I want to embed this into me N4OS in the claw. 
