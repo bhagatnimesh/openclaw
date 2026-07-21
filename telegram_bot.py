@@ -41,9 +41,12 @@ else:
 from claws.n4os.claw import N4OSClaw
 from claws.n4os.input_normalizer import improve_entered_text
 from n4os_capture import (
+    CaptureIngestResult,
+    format_capture_undo_reply,
     format_capture_reply,
     ingest_capture_notes,
     is_capture_message,
+    undo_capture_ingest,
 )
 from n4os_memory_status import (
     format_memory_status,
@@ -229,6 +232,12 @@ class RouterResult:
     response: str
     route: str
     elapsed_ms: float
+
+
+@dataclass(frozen=True)
+class TelegramUndoEntry:
+    kind: str
+    capture_result: CaptureIngestResult | None = None
 
 
 def _extract_response_text(payload: dict[str, Any]) -> str:
@@ -461,6 +470,30 @@ def _pending_capture_request(claw: N4OSClaw, text: str) -> str | None:
     return request if isinstance(request, str) and request.strip() else None
 
 
+def _is_undo_message(text: str) -> bool:
+    normalized = " ".join(text.lower().strip(" .!?").split())
+    return normalized in {
+        "undo",
+        "undo that",
+        "undo last",
+        "undo the last thing",
+        "revert",
+        "revert that",
+        "revert last",
+        "cancel",
+        "cancel that",
+        "cancel last",
+        "nevermind",
+        "never mind",
+    }
+
+
+def _n4os_mutation_depth(claw: Any) -> int:
+    route_context = getattr(claw, "route_context", None)
+    stack = getattr(route_context, "mutation_route_stack", None)
+    return len(stack) if isinstance(stack, list) else 0
+
+
 class N4OSTelegramBot:
     def __init__(
         self,
@@ -477,15 +510,19 @@ class N4OSTelegramBot:
             config.voice_transcribe_command,
         )
         self.image_text_extractor = image_text_extractor or OpenAIImageTextExtractor.from_env_or_none()
+        self.undo_stack: list[TelegramUndoEntry] = []
 
     def route_message(self, text: str) -> RouterResult:
         started = time.perf_counter()
         improved_text = improve_entered_text(text)
         output = StringIO()
+        before_mutation_depth = _n4os_mutation_depth(self.claw)
         # Existing N4OS claws print their user-facing messages; keep the
         # Telegram transport thin by capturing that router output verbatim.
         with redirect_stdout(output):
             decision = self.claw.handle_request(improved_text) or {}
+        if _n4os_mutation_depth(self.claw) > before_mutation_depth:
+            self.undo_stack.append(TelegramUndoEntry(kind="router"))
 
         elapsed_ms = (time.perf_counter() - started) * 1000
         route = str(decision.get("route", "unknown"))
@@ -494,6 +531,24 @@ class N4OSTelegramBot:
             response = str(decision.get("intent_summary") or "Done.")
 
         return RouterResult(response=response, route=route, elapsed_ms=elapsed_ms)
+
+    def undo_last_action(self) -> str | None:
+        if not self.undo_stack:
+            return None
+
+        entry = self.undo_stack.pop()
+        if entry.kind == "capture" and entry.capture_result is not None:
+            result = undo_capture_ingest(entry.capture_result)
+            return format_capture_undo_reply(result)
+
+        if entry.kind == "router":
+            output = StringIO()
+            with redirect_stdout(output):
+                decision = self.claw.handle_request("undo") or {}
+            response = output.getvalue().strip()
+            return response or str(decision.get("intent_summary") or "Undone.")
+
+        return "I do not know how to undo that."
 
     def _authorization_reply(self, user_id: int | None) -> str | None:
         if user_id is None:
@@ -632,6 +687,15 @@ class N4OSTelegramBot:
             self.logger.info("chosen route=unsupported execution_ms=0.00")
             return
 
+        if _is_undo_message(text):
+            started = time.perf_counter()
+            undo_reply = self.undo_last_action()
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if undo_reply is not None:
+                self.logger.info("chosen route=undo execution_ms=%.2f", elapsed_ms)
+                await message.reply_text(undo_reply)
+                return
+
         if is_memory_status_message(text):
             target = parse_memory_status_target(text)
             self.logger.info("chosen route=memory_status target=%s execution_ms=0.00", target)
@@ -672,6 +736,10 @@ class N4OSTelegramBot:
             )
             if pending_capture_text is not None:
                 setattr(self.claw, "pending_route_clarification", None)
+            if result.family.added or result.journal_entries:
+                self.undo_stack.append(
+                    TelegramUndoEntry(kind="capture", capture_result=result),
+                )
             await message.reply_text(format_capture_reply(result))
             return
 

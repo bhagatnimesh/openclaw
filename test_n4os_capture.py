@@ -9,6 +9,7 @@ from n4os_capture import (
     format_capture_reply,
     ingest_capture_notes,
     is_capture_message,
+    undo_capture_ingest,
 )
 
 
@@ -172,9 +173,62 @@ class N4OSCaptureTest(unittest.TestCase):
         reply = format_capture_reply(result)
 
         self.assertIn("Captured.", reply)
+        self.assertIn("Summary: Nysha was nervous. You felt unsure.", reply)
+        self.assertIn("Captured text:", reply)
+        self.assertIn("Nysha was nervous. I felt unsure.", reply)
         self.assertIn("Family observation: Nysha", reply)
         self.assertIn("Journal reflection:", reply)
         self.assertIn("No profiles, playbooks, or goals were promoted", reply)
+
+    def test_capture_reply_summarizes_voice_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            result = ingest_capture_notes(
+                (
+                    "Capture I'm excited about the N4OS work I'm doing, especially how "
+                    "it is evolving into a memory for the family which can compound and "
+                    "grow over a period of time."
+                ),
+                n4os_root=n4os_root,
+                default_date=date(2026, 7, 21),
+            )
+
+        reply = format_capture_reply(result)
+
+        self.assertIn(
+            (
+                "Summary: You're excited that the N4OS work you're doing is becoming "
+                "a family memory that can compound and grow."
+            ),
+            reply,
+        )
+        self.assertIn("Captured text:", reply)
+        self.assertEqual(len(result.family.added), 0)
+        self.assertEqual(len(result.journal_entries), 1)
+        self.assertIn("Journal reflection:", reply)
+        self.assertNotIn("Family observation: Family", reply)
+
+    def test_undo_capture_removes_added_family_and_journal_blocks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            result = ingest_capture_notes(
+                "/capture Nysha was nervous. I felt unsure.",
+                n4os_root=n4os_root,
+                default_date=date(2026, 7, 21),
+            )
+
+            undo = undo_capture_ingest(result, n4os_root=n4os_root)
+            month_text = (n4os_root / "family" / "observations" / "2026-07.md").read_text(
+                encoding="utf-8",
+            )
+            journal_text = (n4os_root / "journal" / "2026-07-21.md").read_text(
+                encoding="utf-8",
+            )
+
+        self.assertEqual(undo.family_observations_removed, 1)
+        self.assertEqual(undo.journal_entries_removed, 1)
+        self.assertNotIn("was nervous", month_text)
+        self.assertNotIn("I felt", journal_text)
 
 
 if __name__ == "__main__":

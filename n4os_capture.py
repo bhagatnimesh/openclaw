@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 import re
@@ -9,6 +9,7 @@ from n4os_memory_inbox import (
     DEFAULT_REPO_ROOT,
     MemoryIngestResult,
     ingest_memory_inbox_notes,
+    undo_memory_observations,
 )
 
 
@@ -27,7 +28,7 @@ PERSON_RE = re.compile(r"\b(nysha|navya)\b", re.I)
 FAMILY_RE = re.compile(r"\b(family|kids|children|both kids|both)\b", re.I)
 FIRST_PERSON_RE = re.compile(
     r"\b("
-    r"i felt|i feel|i was|i am|i noticed|i avoided|i slept|i should|"
+    r"i felt|i feel|i was|i am|i['’]m|i noticed|i avoided|i slept|i should|"
     r"my energy|my body|my mind|work felt|today i|tomorrow i"
     r")\b",
     re.I,
@@ -37,6 +38,8 @@ ACTION_RE = re.compile(
     re.I,
 )
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+CAPTURE_REPLY_SNIPPET_LIMIT = 3
+CAPTURE_REPLY_SNIPPET_CHARS = 180
 
 PEOPLE = {
     "nysha": ("Nysha", "[[family/Nysha|Nysha]]"),
@@ -107,6 +110,7 @@ class CaptureIngestResult:
     family: MemoryIngestResult
     journal_entries: list[JournalEntry]
     skipped_journal_duplicates: list[JournalEntry]
+    notes: list[CaptureNote] = field(default_factory=list)
 
     @property
     def seen(self) -> int:
@@ -166,7 +170,54 @@ def ingest_capture_notes(
         family=family_result,
         journal_entries=added_journal,
         skipped_journal_duplicates=skipped_journal,
+        notes=notes,
     )
+
+
+@dataclass(frozen=True)
+class CaptureUndoResult:
+    family_observations_removed: int
+    journal_entries_removed: int
+
+    @property
+    def removed(self) -> int:
+        return self.family_observations_removed + self.journal_entries_removed
+
+
+def undo_capture_ingest(
+    result: CaptureIngestResult,
+    *,
+    n4os_root: Path = DEFAULT_N4OS_ROOT,
+) -> CaptureUndoResult:
+    family_removed = undo_memory_observations(
+        result.family.added,
+        observations_root=n4os_root / "family" / "observations",
+    )
+    journal_removed = 0
+    for entry in reversed(result.journal_entries):
+        if _remove_journal_entry(n4os_root / "journal", entry):
+            journal_removed += 1
+    return CaptureUndoResult(
+        family_observations_removed=family_removed,
+        journal_entries_removed=journal_removed,
+    )
+
+
+def format_capture_undo_reply(result: CaptureUndoResult) -> str:
+    if result.removed == 0:
+        return "I could not undo that capture; the captured blocks were not found."
+
+    parts = []
+    if result.family_observations_removed:
+        parts.append(_count_label(result.family_observations_removed, "family observation"))
+    if result.journal_entries_removed:
+        parts.append(_count_label(result.journal_entries_removed, "journal entry"))
+    return "Undid capture: removed " + " and ".join(parts) + "."
+
+
+def _count_label(count: int, label: str) -> str:
+    suffix = "" if count == 1 else "s"
+    return f"{count} {label}{suffix}"
 
 
 def format_capture_reply(result: CaptureIngestResult) -> str:
@@ -175,7 +226,16 @@ def format_capture_reply(result: CaptureIngestResult) -> str:
             "No capture notes found. Send /capture followed by anything worth remembering."
         )
 
-    lines = ["Captured.", ""]
+    lines = ["Captured."]
+    summary = _capture_reply_summary(result)
+    if summary:
+        lines.extend(["", f"Summary: {summary}"])
+
+    snippets = _capture_reply_snippets(result)
+    if snippets:
+        lines.extend(["", "Captured text:", *[f"- {snippet}" for snippet in snippets]])
+
+    lines.append("")
     if result.family.added or result.family.skipped_duplicates:
         family_counts: dict[str, int] = {}
         for observation in result.family.added:
@@ -203,6 +263,99 @@ def format_capture_reply(result: CaptureIngestResult) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _capture_reply_summary(result: CaptureIngestResult) -> str:
+    snippets = _capture_reply_snippets(result)
+    if not snippets:
+        return ""
+    if len(snippets) > 1:
+        return f"Saved {len(snippets)} notes: {_second_person_summary(snippets[0])}"
+    return _second_person_summary(snippets[0])
+
+
+def _capture_reply_snippets(result: CaptureIngestResult) -> list[str]:
+    snippets: list[str] = [note.text for note in result.notes]
+    if not snippets:
+        for observation in [*result.family.added, *result.family.skipped_duplicates]:
+            if observation.person == "Family":
+                snippets.append(observation.observation)
+            else:
+                snippets.append(f"{observation.person}: {observation.observation}")
+        for entry in [*result.journal_entries, *result.skipped_journal_duplicates]:
+            snippets.append(entry.text)
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for snippet in snippets:
+        text = _reply_snippet(snippet)
+        key = _normalize_text(text)
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+        if len(cleaned) == CAPTURE_REPLY_SNIPPET_LIMIT:
+            break
+    remaining = max(0, len(snippets) - len(cleaned))
+    if remaining:
+        cleaned.append(f"...and {remaining} more.")
+    return cleaned
+
+
+def _reply_snippet(text: str) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= CAPTURE_REPLY_SNIPPET_CHARS:
+        return compact
+    return compact[: CAPTURE_REPLY_SNIPPET_CHARS - 1].rstrip() + "..."
+
+
+def _second_person_summary(text: str) -> str:
+    summary = _reply_snippet(text)
+    replacements = [
+        (r"\bI['’]m\b", "you are"),
+        (r"\bI am\b", "you are"),
+        (r"\bI['’]ve\b", "you have"),
+        (r"\bI have\b", "you have"),
+        (r"\bI['’]ll\b", "you will"),
+        (r"\bI will\b", "you will"),
+        (r"\bI\b", "you"),
+        (r"\bmy\b", "your"),
+        (r"\bme\b", "you"),
+    ]
+    for pattern, replacement in replacements:
+        summary = re.sub(pattern, replacement, summary, flags=re.I)
+    summary = re.sub(r"\byou are\b", "you're", summary, flags=re.I)
+    summary = re.sub(r"\byourself\b", "yourself", summary, flags=re.I)
+    summary = re.sub(
+        r"(^|[.!?]\s+)(you)\b",
+        lambda match: f"{match.group(1)}You",
+        summary,
+    )
+    summary = _compress_summary(summary)
+    return summary[:1].upper() + summary[1:]
+
+
+def _compress_summary(text: str) -> str:
+    excited_match = re.match(
+        (
+            r"you're excited about (?P<subject>.+?), especially how it is "
+            r"evolving into (?P<object>.+?)(?: which can (?P<capability>.+?))?\.?$"
+        ),
+        text,
+        flags=re.I,
+    )
+    if not excited_match:
+        return text
+
+    subject = excited_match.group("subject")
+    obj = excited_match.group("object")
+    capability = excited_match.group("capability")
+    obj = re.sub(r"\ba memory for the family\b", "a family memory", obj, flags=re.I)
+    parts = [f"you're excited that {subject} is becoming {obj}"]
+    if capability:
+        capability = re.sub(r"\s+over a period of time\b", "", capability, flags=re.I)
+        parts.append(f"that can {capability}")
+    return " ".join(parts).rstrip(".") + "."
 
 
 def _parse_capture_notes(
@@ -268,7 +421,11 @@ def _family_observations(note: CaptureNote) -> list[tuple[str, str]]:
         for key, (person, _) in PEOPLE.items():
             if re.search(rf"\b{re.escape(key)}\b", lowered):
                 observations.append((person, _remove_person_prefix(sentence, person)))
-        if FAMILY_RE.search(sentence) and not PERSON_RE.search(sentence):
+        if (
+            FAMILY_RE.search(sentence)
+            and not PERSON_RE.search(sentence)
+            and not FIRST_PERSON_RE.search(sentence)
+        ):
             observations.append(("Family", sentence))
     return observations
 
@@ -295,10 +452,15 @@ def _append_journal_entry(journal_root: Path, entry: JournalEntry) -> None:
     else:
         _merge_frontmatter_links(path, links)
 
+    with path.open("a", encoding="utf-8") as file:
+        file.write(_journal_entry_block(entry) + "\n")
+
+
+def _journal_entry_block(entry: JournalEntry) -> str:
     linked_text = _link_text(entry.text)
     topic_links = _topic_links(entry.text)
     topic_line = [f"  Topics: {', '.join(topic_links)}"] if topic_links else []
-    block = "\n".join(
+    return "\n".join(
         [
             "",
             "## Captures",
@@ -308,8 +470,19 @@ def _append_journal_entry(journal_root: Path, entry: JournalEntry) -> None:
             f"  Source: {entry.source}",
         ]
     )
-    with path.open("a", encoding="utf-8") as file:
-        file.write(block + "\n")
+
+
+def _remove_journal_entry(journal_root: Path, entry: JournalEntry) -> bool:
+    path = journal_root / f"{entry.captured_on.isoformat()}.md"
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+    block = _journal_entry_block(entry) + "\n"
+    index = text.rfind(block)
+    if index == -1:
+        return False
+    path.write_text(text[:index] + text[index + len(block) :], encoding="utf-8")
+    return True
 
 
 def _journal_header(entry: JournalEntry, links: list[str]) -> str:

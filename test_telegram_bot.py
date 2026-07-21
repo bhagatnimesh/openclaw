@@ -36,6 +36,7 @@ from telegram_bot import (
     load_config,
 )
 from n4os_capture import CaptureIngestResult, JournalEntry
+from n4os_capture import CaptureUndoResult
 from n4os_memory_inbox import MemoryIngestResult, MemoryObservation
 
 
@@ -83,6 +84,32 @@ class FakeClaw:
             "route": "tasks",
             "intent_summary": "Route to family-tasks.",
             "confidence": 0.9,
+        }
+
+
+class UndoableRouterClaw:
+    def __init__(self) -> None:
+        self.requests: list[str] = []
+        self.route_context = type("RouteContext", (), {"mutation_route_stack": []})()
+
+    def handle_request(self, request: str):
+        self.requests.append(request)
+        if request == "undo":
+            if self.route_context.mutation_route_stack:
+                self.route_context.mutation_route_stack.pop()
+            print("Undid Home Board add: removed 1 item(s).")
+            return {
+                "route": "home_board",
+                "intent_summary": "Undid Home Board add: removed 1 item(s).",
+                "confidence": 1.0,
+            }
+
+        self.route_context.mutation_route_stack.append("home_board")
+        print("Added to Today at Home: Family: passports (airport)")
+        return {
+            "route": "home_board",
+            "intent_summary": "Route to home-board for add_item.",
+            "confidence": 0.95,
         }
 
 
@@ -397,6 +424,12 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             [
                 "Captured.\n"
                 "\n"
+                "Summary: Saved 2 notes: Nysha: liked teaching younger kids\n"
+                "\n"
+                "Captured text:\n"
+                "- Nysha: liked teaching younger kids\n"
+                "- I felt proud.\n"
+                "\n"
                 "- Family observation: Nysha (1)\n"
                 "- Journal reflection: Parenting (1)\n"
                 "\n"
@@ -480,6 +513,81 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(claw.pending_route_clarification)
         self.assertEqual(claw.requests, [])
         self.assertIn("Captured.", message.replies[0])
+
+    async def test_undo_after_capture_uses_live_capture_undo_stack(self):
+        claw = FakeClaw()
+        result = CaptureIngestResult(
+            family=MemoryIngestResult(
+                added=[
+                    MemoryObservation(
+                        observed_on=date(2026, 7, 21),
+                        person="Nysha",
+                        observation="liked teaching younger kids",
+                        source="Telegram",
+                    )
+                ],
+                skipped_duplicates=[],
+            ),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 7, 21),
+                    text="I felt proud.",
+                    topics=["Parenting"],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+        )
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        capture_message = FakeMessage("/capture Nysha liked teaching younger kids. I felt proud.")
+        undo_message = FakeMessage("undo")
+
+        with (
+            patch("telegram_bot.ingest_capture_notes", return_value=result),
+            patch(
+                "telegram_bot.undo_capture_ingest",
+                return_value=CaptureUndoResult(
+                    family_observations_removed=1,
+                    journal_entries_removed=1,
+                ),
+            ) as undo,
+        ):
+            await bot.handle_message(FakeUpdate(12345, capture_message), None)
+            await bot.handle_message(FakeUpdate(12345, undo_message), None)
+
+        undo.assert_called_once_with(result)
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(
+            undo_message.replies,
+            ["Undid capture: removed 1 family observation and 1 journal entry."],
+        )
+
+    async def test_undo_after_router_mutation_uses_live_router_undo_stack(self):
+        claw = UndoableRouterClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        add_message = FakeMessage("today at home passports")
+        undo_message = FakeMessage("undo")
+
+        await bot.handle_message(FakeUpdate(12345, add_message), None)
+        await bot.handle_message(FakeUpdate(12345, undo_message), None)
+
+        self.assertEqual(claw.requests, ["today at home passports", "undo"])
+        self.assertEqual(
+            add_message.replies,
+            ["Added to Today at Home: Family: passports (airport)"],
+        )
+        self.assertEqual(
+            undo_message.replies,
+            ["Undid Home Board add: removed 1 item(s)."],
+        )
 
     async def test_authorized_memory_status_reports_without_routing_or_capture(self):
         claw = FakeClaw()

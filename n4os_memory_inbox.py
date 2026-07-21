@@ -151,6 +151,19 @@ def ingest_memory_inbox_notes(
     return MemoryIngestResult(added=added, skipped_duplicates=skipped)
 
 
+def undo_memory_observations(
+    observations: list[MemoryObservation],
+    *,
+    observations_root: Path = DEFAULT_OBSERVATIONS_ROOT,
+) -> int:
+    removed = 0
+    for observation in reversed(observations):
+        path = _month_path(observations_root, observation.observed_on)
+        if _remove_observation_block(path, observation):
+            removed += 1
+    return removed
+
+
 def format_memory_ingest_reply(result: MemoryIngestResult) -> str:
     if result.seen == 0:
         return (
@@ -222,10 +235,15 @@ def _append_observation(observations_root: Path, observation: MemoryObservation)
     else:
         _merge_frontmatter_links(path, links)
 
+    with path.open("a", encoding="utf-8") as file:
+        file.write(_observation_block(observation) + "\n")
+
+
+def _observation_block(observation: MemoryObservation) -> str:
     linked_observation = _link_observation_text(observation.observation)
     concept_links = _infer_concept_links(observation.observation)
     topic_line = [f"  Topics: {', '.join(concept_links)}"] if concept_links else []
-    block = "\n".join(
+    return "\n".join(
         [
             "",
             f"## {observation.observed_on.isoformat()}",
@@ -238,8 +256,18 @@ def _append_observation(observations_root: Path, observation: MemoryObservation)
             "  Confidence: low",
         ]
     )
-    with path.open("a", encoding="utf-8") as file:
-        file.write(block + "\n")
+
+
+def _remove_observation_block(path: Path, observation: MemoryObservation) -> bool:
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8")
+    block = _observation_block(observation) + "\n"
+    index = text.rfind(block)
+    if index == -1:
+        return False
+    path.write_text(text[:index] + text[index + len(block) :], encoding="utf-8")
+    return True
 
 
 def _month_header(observation: MemoryObservation, links: list[str]) -> str:
