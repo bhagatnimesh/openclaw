@@ -106,6 +106,8 @@ docs/internal/
 tmp/
 IDENTITY.md
 USER.md
+# N4OS identity is intentional personal memory, not a throwaway local file.
+!n4os/IDENTITY.md
 # Exception: oc-path real-world test fixtures need to be tracked even
 # though the bare names match the local-untracked rule above.
 !extensions/oc-path/src/oc-path/tests/fixtures/real/IDENTITY.md
