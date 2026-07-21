@@ -1075,6 +1075,23 @@ class IntentRouterTest(unittest.TestCase):
             [("recommend", "list tasks all with tag finance", REFERENCE_TIME)],
         )
 
+    def test_task_slash_view_tag_phrase_recommends_tasks(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            result = claw.handle_request(
+                "/task view all with tag indiatrip",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(result["route"], "tasks")
+        self.assertEqual(result["intent_summary"], "Route to family-tasks for recommend_tasks.")
+        self.assertEqual(
+            tasks.calls,
+            [("recommend", "view tasks all with tag indiatrip", REFERENCE_TIME)],
+        )
+
     def test_tasks_slash_tag_colon_recommends_tasks(self):
         tasks = FakeTasksClaw()
         claw = N4OSClaw(tasks_claw=tasks)
@@ -1345,6 +1362,12 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(
             improve_entered_text("/tasks list all with tag finance"),
             "list tasks all with tag finance",
+        )
+
+    def test_input_improvement_normalizes_task_view_slash_command(self):
+        self.assertEqual(
+            improve_entered_text("/task view all with tag indiatrip"),
+            "view tasks all with tag indiatrip",
         )
 
     def test_input_improvement_normalizes_decisions_slash_command(self):
@@ -1896,7 +1919,7 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(decision["route"], "unknown")
         self.assertIn(
-            "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?",
+            "Should I use Capture, Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?",
             output.getvalue(),
         )
         self.assertEqual(calendar.calls, [])

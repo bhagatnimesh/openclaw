@@ -129,6 +129,16 @@ class FailingClaw:
         raise RuntimeError(f"boom: {request}")
 
 
+class PendingClarificationClaw(FakeClaw):
+    def __init__(self, request: str) -> None:
+        super().__init__()
+        self.pending_route_clarification = type(
+            "Pending",
+            (),
+            {"request": request},
+        )()
+
+
 class FakeVoice:
     mime_type = "audio/ogg"
 
@@ -393,6 +403,83 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
                 "No profiles, playbooks, or goals were promoted automatically."
             ],
         )
+
+    async def test_authorized_bare_voice_capture_is_captured_without_routing(self):
+        claw = FakeClaw()
+        result = CaptureIngestResult(
+            family=MemoryIngestResult(
+                added=[
+                    MemoryObservation(
+                        observed_on=date(2026, 7, 21),
+                        person="Nysha",
+                        observation="asked why we do not travel business class",
+                        source="Telegram",
+                    )
+                ],
+                skipped_duplicates=[],
+            ),
+            journal_entries=[],
+            skipped_journal_duplicates=[],
+        )
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            audio_transcriber=FakeAudioTranscriber(
+                "Capture Nysha asked why we do not travel business class."
+            ),
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        with patch("telegram_bot.ingest_capture_notes", return_value=result) as ingest:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        ingest.assert_called_once_with(
+            "Capture Nysha asked why we do not travel business class.",
+            source="Telegram",
+        )
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies[0], VOICE_TRANSCRIPTION_STARTED_MESSAGE)
+        self.assertEqual(
+            message.replies[1],
+            "Transcribed: Capture Nysha asked why we do not travel business class.",
+        )
+        self.assertIn("Captured.", message.replies[2])
+
+    async def test_capture_clarification_captures_pending_request(self):
+        claw = PendingClarificationClaw("Nysha asked why we do not travel business class.")
+        result = CaptureIngestResult(
+            family=MemoryIngestResult(
+                added=[
+                    MemoryObservation(
+                        observed_on=date(2026, 7, 21),
+                        person="Nysha",
+                        observation="asked why we do not travel business class",
+                        source="Telegram",
+                    )
+                ],
+                skipped_duplicates=[],
+            ),
+            journal_entries=[],
+            skipped_journal_duplicates=[],
+        )
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("a capture")
+
+        with patch("telegram_bot.ingest_capture_notes", return_value=result) as ingest:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        ingest.assert_called_once_with(
+            "Nysha asked why we do not travel business class.",
+            source="Telegram",
+        )
+        self.assertIsNone(claw.pending_route_clarification)
+        self.assertEqual(claw.requests, [])
+        self.assertIn("Captured.", message.replies[0])
 
     async def test_authorized_memory_status_reports_without_routing_or_capture(self):
         claw = FakeClaw()
@@ -674,7 +761,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
                     [
                         "want to add a task for Monday at 4 p.m. to call FUSD "
                         "to follow up on Nysha's school waiting",
-                        "list for Chad Bond. This task is for Namesh. "
+                        "list for Chad Bond. This task is for Nimesh. "
                         "I want Noah to find out FUSD phone number to call",
                         "and the key talking points. I really want",
                         "Nysha to meet Chad Bond from overflow",
@@ -885,8 +972,27 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "Skipping message"):
                 await transcriber.transcribe(message)
 
-    def test_default_audio_transcriber_prefers_local_whisper(self):
-        with patch("telegram_audio._resolve_whisper_command", return_value="/tmp/whisper"):
+    def test_default_audio_transcriber_prefers_openclaw_command(self):
+        with (
+            patch(
+                "telegram_audio._default_openclaw_transcribe_command",
+                return_value=("openclaw", "infer", "audio", "transcribe"),
+            ),
+            patch("telegram_audio._resolve_whisper_command", return_value="/tmp/whisper"),
+        ):
+            transcriber = create_default_audio_transcriber()
+
+        self.assertIsInstance(transcriber, CommandAudioTranscriber)
+        self.assertEqual(
+            transcriber.command,
+            ("openclaw", "infer", "audio", "transcribe"),
+        )
+
+    def test_default_audio_transcriber_uses_local_whisper_as_fallback(self):
+        with (
+            patch("telegram_audio._default_openclaw_transcribe_command", return_value=None),
+            patch("telegram_audio._resolve_whisper_command", return_value="/tmp/whisper"),
+        ):
             transcriber = create_default_audio_transcriber()
 
         self.assertIsInstance(transcriber, WhisperCliAudioTranscriber)

@@ -10,6 +10,7 @@ import logging
 import mimetypes
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Any
@@ -118,16 +119,20 @@ VOICE_TRANSCRIPTION_TIMEOUT_MESSAGE = (
     "Sorry, voice transcription took too long. Please try a shorter voice message."
 )
 VOICE_TRANSCRIPTION_HANDLER_TIMEOUT_SECONDS = 90
+CAPTURE_CLARIFICATION_RE = re.compile(
+    r"^\s*(?:a\s+)?(?:capture|note|memory|remember(?:\s+this)?)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
 HOW_TO_HELP = {
     "capture": (
         "To capture anything worth remembering, send:\n"
-        "/capture Nysha liked teaching younger kids today. I felt proud.\n\n"
+        "capture Nysha liked teaching younger kids today. I felt proud.\n\n"
         "For a batch, send:\n"
-        "/capture\n"
+        "capture\n"
         "2026-07-21\n"
         "Nysha playing games very well\n"
         "I felt scattered after poor sleep\n\n"
-        "Old /mem and /mem-inbox commands still work as capture aliases."
+        "Old /capture, /mem, and /mem-inbox commands still work as capture aliases."
     ),
     "event": (
         "To add an event, speak naturally or use /event:\n"
@@ -447,6 +452,15 @@ def _library_status_alias(text: str) -> str | None:
     return None
 
 
+def _pending_capture_request(claw: N4OSClaw, text: str) -> str | None:
+    if CAPTURE_CLARIFICATION_RE.match(text) is None:
+        return None
+
+    pending = getattr(claw, "pending_route_clarification", None)
+    request = getattr(pending, "request", None)
+    return request if isinstance(request, str) and request.strip() else None
+
+
 class N4OSTelegramBot:
     def __init__(
         self,
@@ -634,10 +648,12 @@ class N4OSTelegramBot:
                 await message.reply_text(status_reply)
                 return
 
-        if is_capture_message(text):
+        pending_capture_text = _pending_capture_request(self.claw, text)
+        capture_text = pending_capture_text or text
+        if pending_capture_text is not None or is_capture_message(capture_text):
             started = time.perf_counter()
             try:
-                result = ingest_capture_notes(text, source="Telegram")
+                result = ingest_capture_notes(capture_text, source="Telegram")
             except Exception:
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 self.logger.exception(
@@ -654,6 +670,8 @@ class N4OSTelegramBot:
                 len(result.journal_entries),
                 elapsed_ms,
             )
+            if pending_capture_text is not None:
+                setattr(self.claw, "pending_route_clarification", None)
             await message.reply_text(format_capture_reply(result))
             return
 

@@ -225,11 +225,15 @@ def create_default_audio_transcriber(
     if command is not None:
         return CommandAudioTranscriber(command)
 
+    openclaw_command = _default_openclaw_transcribe_command()
+    if openclaw_command is not None:
+        return CommandAudioTranscriber(openclaw_command)
+
     whisper = _resolve_whisper_command()
     if whisper is not None:
         return WhisperCliAudioTranscriber(whisper)
 
-    return CommandAudioTranscriber()
+    return CommandAudioTranscriber(openclaw_command)
 
 
 class WhisperCliAudioTranscriber:

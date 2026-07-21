@@ -72,6 +72,13 @@ Use `archive/raw_notes.md` only when nuance is missing.
 - Prefer current-pattern wording such as "currently tends to" over fixed identity wording.
 - When advice depends on family memory, state which N4OS files were used.
 
+## Task Lookup Routing
+
+- When the user asks for "tasks", especially with a tag such as `tasks with tag Indiatrip`, treat that as a lookup in the captured task system first, not as a request to infer tasks from N4OS memory.
+- If a connected task tool is available, query it before answering. Return the matched task titles plus useful metadata such as status, due date, and task list when available.
+- If no task tool is available or the lookup fails, say that clearly and stop. Do not add family-memory, observation-log, capture-loop, or profile-update guidance unless the user explicitly asks for related N4OS memory.
+- Do not convert family observations into new tasks unless the user explicitly asks to create or plan tasks.
+
 ## Non-Goals To Guard Against
 
 Do not optimize me for:

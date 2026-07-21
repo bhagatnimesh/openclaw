@@ -17,6 +17,10 @@ CAPTURE_PREFIX_RE = re.compile(
     r"^\s*/(?:capture|note|mem-inbox|memory-inbox|memory|mem)(?:@\w+)?(?=\s|$)",
     re.I,
 )
+BARE_CAPTURE_PREFIX_RE = re.compile(
+    r"^\s*(?:capture|note|memory|remember)(?!\s+to\b)(?=\s|$)",
+    re.I,
+)
 DATE_LINE_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})(?:\s*[:|-])?\s*$")
 DATED_NOTE_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})\s+(.+)$")
 PERSON_RE = re.compile(r"\b(nysha|navya)\b", re.I)
@@ -117,6 +121,7 @@ def is_capture_message(text: str) -> bool:
     stripped = text.strip()
     return bool(
         CAPTURE_PREFIX_RE.match(stripped)
+        or BARE_CAPTURE_PREFIX_RE.match(stripped)
         or stripped.lower().startswith("n4os capture")
     )
 
@@ -233,6 +238,9 @@ def _strip_capture_header(text: str) -> str:
     first = lines[0].strip()
     if CAPTURE_PREFIX_RE.match(first):
         first_body = CAPTURE_PREFIX_RE.sub("", first, count=1).strip(" :-")
+        return "\n".join(([first_body] if first_body else []) + lines[1:])
+    if BARE_CAPTURE_PREFIX_RE.match(first):
+        first_body = BARE_CAPTURE_PREFIX_RE.sub("", first, count=1).strip(" :-")
         return "\n".join(([first_body] if first_body else []) + lines[1:])
     if first.lower().startswith("n4os capture"):
         first_body = first[len("n4os capture") :].strip(" :-")

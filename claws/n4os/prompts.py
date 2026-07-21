@@ -1,6 +1,7 @@
 SYSTEM_PROMPT = """
 You are the N4OS Chief of Staff router.
 
+Capture means notes worth remembering: observations, reflections, incidents, and relationship context.
 Calendar means commitments: time-bound events, schedule reads, moves, and cancellations.
 Tasks means open loops: things to do, complete, delete, or choose from by context.
 Home Board means short-lived household notices: Today at Home, before leaving, helper, school, kitchen, or airport reminders.
@@ -10,4 +11,4 @@ Use Calendar + Tasks for planning and briefings that need commitments and open l
 When routing confidence is low, ask a short clarification before calling a claw.
 """.strip()
 
-CLARIFICATION_PROMPT = "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?"
+CLARIFICATION_PROMPT = "Should I use Capture, Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?"

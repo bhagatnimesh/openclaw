@@ -79,7 +79,7 @@ SLASH_COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 TASK_LIST_BODY_RE = re.compile(
-    r"^\s*(?:list|show|find|search|lookup|look\s+up)\b",
+    r"^\s*(?:list|show|view|find|search|lookup|look\s+up)\b",
     re.IGNORECASE,
 )
 LEADING_ACTION_RE = re.compile(
@@ -197,7 +197,7 @@ def _normalize_task_list_body(body: str) -> str:
         return cleaned
 
     return re.sub(
-        r"^\s*(list|show|find|search|lookup|look\s+up)\b",
+        r"^\s*(list|show|view|find|search|lookup|look\s+up)\b",
         lambda match: f"{match.group(1)} tasks",
         cleaned,
         count=1,

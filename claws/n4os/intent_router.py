@@ -602,7 +602,7 @@ def _summary(
         return (
             "Route to family-calendar and family-tasks for combined planning or briefing."
         )
-    return "Could not confidently choose Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
+    return "Could not confidently choose Capture, Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
 
 
 def _action_for_route(
@@ -645,7 +645,7 @@ def _frame_summary(frame: N4OSIntentFrame) -> str:
         return f"Route to library for {frame.action}."
     if frame.route == "both":
         return "Route to family-calendar and family-tasks for combined planning or briefing."
-    return frame.clarification_question or "Could not confidently choose Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
+    return frame.clarification_question or "Could not confidently choose Capture, Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
 
 
 def _round_confidence(value: Any) -> float:
@@ -990,7 +990,7 @@ def _rule_intent_frame(
         confidence=round(confidence, 2),
         normalized_request=request,
         clarification_question=(
-            "Should I use Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?"
+            "Should I use Capture, Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?"
             if route == "unknown"
             else None
         ),

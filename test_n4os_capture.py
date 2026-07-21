@@ -15,10 +15,14 @@ from n4os_capture import (
 class N4OSCaptureTest(unittest.TestCase):
     def test_detects_capture_aliases(self):
         self.assertTrue(is_capture_message("/capture Nysha was nervous"))
+        self.assertTrue(is_capture_message("capture Nysha was nervous"))
         self.assertTrue(is_capture_message("/note I felt scattered"))
+        self.assertTrue(is_capture_message("note I felt scattered"))
+        self.assertTrue(is_capture_message("remember Nysha liked teaching"))
         self.assertTrue(is_capture_message("/mem Nysha liked teaching"))
         self.assertTrue(is_capture_message("/mem-inbox\nNysha liked teaching"))
         self.assertFalse(is_capture_message("/status Nysha"))
+        self.assertFalse(is_capture_message("remember to buy milk"))
 
     def test_family_capture_writes_obsidian_observation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -44,6 +48,22 @@ class N4OSCaptureTest(unittest.TestCase):
         self.assertIn("### [[family/Nysha|Nysha]]", month_text)
         self.assertIn("[[School Transition|new classmates]]", month_text)
         self.assertIn("Topics: [[Confidence]], [[School Transition]]", month_text)
+
+    def test_bare_voice_capture_strips_prefix(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            result = ingest_capture_notes(
+                "Capture Nysha asked why we do not travel business class.",
+                n4os_root=n4os_root,
+                default_date=date(2026, 7, 21),
+            )
+
+            month_text = (n4os_root / "family" / "observations" / "2026-07.md").read_text(
+                encoding="utf-8",
+            )
+
+        self.assertEqual(len(result.family.added), 1)
+        self.assertIn("asked why we do not travel business class", month_text)
 
     def test_personal_capture_writes_journal(self):
         with tempfile.TemporaryDirectory() as tmpdir:
