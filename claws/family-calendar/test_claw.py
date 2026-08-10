@@ -92,6 +92,15 @@ class FakeProvider:
         return event
 
 
+class FailingProvider(FakeProvider):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def create_event(self, *args, **kwargs):
+        raise self.error
+
+
 def _fake_event(
     summary,
     start,
@@ -326,6 +335,69 @@ class FamilyCalendarClawTest(unittest.TestCase):
 
         self.assertEqual(message, "Please provide a time for Appointment on Friday, July 3.")
         self.assertEqual(provider.created, [])
+
+    def test_bulk_date_event_request_asks_for_one_time(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "Add events to pay driver for below days\n10/1\n12/1\n2/1\n4/1",
+                reference_time=reference,
+            )
+
+        self.assertEqual(
+            message,
+            "Please provide a time for Pay driver on 4 dates: Oct 1, Dec 1, Feb 1, Apr 1.",
+        )
+        self.assertIsNotNone(claw.pending_action)
+        self.assertEqual(provider.created, [])
+
+    def test_bulk_date_event_request_time_followup_creates_all_events(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add events to pay driver for below days\n10/1\n12/1\n2/1\n4/1",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("9 AM")
+
+        self.assertTrue(handled)
+        self.assertIsNone(claw.pending_action)
+        self.assertEqual(
+            [event["summary"] for event in provider.created],
+            ["Pay driver", "Pay driver", "Pay driver", "Pay driver"],
+        )
+        self.assertEqual(
+            [event["start"]["dateTime"] for event in provider.created],
+            [
+                "2026-10-01T09:00:00-07:00",
+                "2026-12-01T09:00:00-08:00",
+                "2027-02-01T09:00:00-08:00",
+                "2027-04-01T09:00:00-07:00",
+            ],
+        )
+
+    def test_bulk_date_event_request_with_time_creates_all_events(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "Add events at 9 AM to pay driver for below days\n10/1\n12/1\n2/1\n4/1",
+                reference_time=reference,
+            )
+
+        self.assertEqual(
+            message,
+            "Created 4 calendar events for Pay driver: Oct 1, Dec 1, Feb 1, Apr 1.",
+        )
+        self.assertEqual(len(provider.created), 4)
 
     def test_pickup_without_time_asks_for_time_with_parsed_event(self):
         provider = FakeProvider()
@@ -571,6 +643,100 @@ class FamilyCalendarClawTest(unittest.TestCase):
 
         self.assertEqual(provider.list_calls[0]["time_min"], "2026-07-02T12:00:00-07:00")
         self.assertEqual(provider.list_calls[0]["time_max"], "2026-07-09T12:00:00-07:00")
+
+    def test_when_named_school_event_filters_by_text_query(self):
+        provider = FakeProvider()
+        provider.events = [
+            {
+                "id": "first-day",
+                "summary": "First day of school",
+                "start": {"dateTime": "2026-08-11T00:00:00-07:00"},
+                "end": {"dateTime": "2026-08-11T23:59:00-07:00"},
+            },
+            {
+                "id": "minimum-day",
+                "summary": "Minimum Day - 1:30 PM dismissal (Grade 1-3)",
+                "description": "Recurring Wednesday dismissal excluding no-school/break Wednesdays.",
+                "start": {"dateTime": "2026-08-12T13:30:00-07:00"},
+                "end": {"dateTime": "2026-08-12T13:45:00-07:00"},
+            },
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 9, 0, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.list_events_from_request(
+                "When is Nysha's first day of school?",
+                reference_time=reference,
+            )
+
+        self.assertEqual(provider.list_calls[0]["time_min"], "2026-08-09T00:39:00-07:00")
+        self.assertEqual(provider.list_calls[0]["time_max"], "2027-08-09T00:39:00-07:00")
+        self.assertIn("First day of school", message)
+        self.assertNotIn("Minimum Day", message)
+
+    def test_when_holidays_filters_no_school_related_events(self):
+        provider = FakeProvider()
+        provider.events = [
+            {
+                "id": "holiday",
+                "summary": "Holiday - no school",
+                "start": {"dateTime": "2026-09-07T00:00:00-07:00"},
+                "end": {"dateTime": "2026-09-07T23:59:00-07:00"},
+            },
+            {
+                "id": "spring-break",
+                "summary": "Spring Break - no school",
+                "start": {"dateTime": "2027-04-05T00:00:00-07:00"},
+                "end": {"dateTime": "2027-04-05T23:59:00-07:00"},
+            },
+            {
+                "id": "minimum-day",
+                "summary": "Minimum Day - 1:30 PM dismissal (Grade 1-3)",
+                "start": {"dateTime": "2026-08-12T13:30:00-07:00"},
+                "end": {"dateTime": "2026-08-12T13:45:00-07:00"},
+            },
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 9, 0, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.list_events_from_request(
+                "When are Nysha's holidays?",
+                reference_time=reference,
+            )
+
+        self.assertIn("Holiday - no school", message)
+        self.assertIn("Spring Break - no school", message)
+        self.assertNotIn("Minimum Day", message)
+
+    def test_when_spring_break_filters_exact_break(self):
+        provider = FakeProvider()
+        provider.events = [
+            {
+                "id": "fall-break",
+                "summary": "Fall Break - no school",
+                "start": {"dateTime": "2026-11-23T00:00:00-08:00"},
+                "end": {"dateTime": "2026-11-23T23:59:00-08:00"},
+            },
+            {
+                "id": "spring-break",
+                "summary": "Spring Break - no school",
+                "start": {"dateTime": "2027-04-05T00:00:00-07:00"},
+                "end": {"dateTime": "2027-04-05T23:59:00-07:00"},
+            },
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 9, 0, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.list_events_from_request(
+                "When is Nysha's spring break?",
+                reference_time=reference,
+            )
+
+        self.assertIn("Spring Break - no school", message)
+        self.assertNotIn("Fall Break", message)
 
     def test_list_events_filters_dad_responsibility_tomorrow(self):
         provider = FakeProvider()
@@ -1542,6 +1708,42 @@ class MilestoneOneRegressionTest(unittest.TestCase):
         self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-10T12:30:00-07:00")
         self.assertIn("Created calendar event: Leave for SFO flight", message)
         self.assertIn("Friday, July 10 from 11:30 AM to 12:30 PM", message)
+
+    def test_pending_create_accepts_absolute_date_followup(self):
+        now = datetime(2026, 8, 9, 10, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()) as output:
+            first_message = claw.create_event_from_request(
+                "Add event back to school night in Nysha school calendar "
+                "Time: 4:30-5:00 PM Location: Chadbourne MUR",
+                reference_time=now,
+            )
+            handled = claw.handle_pending_response("August 11", reference_time=now)
+
+        self.assertEqual(first_message, "Please provide: date.")
+        self.assertTrue(handled)
+        self.assertIsNone(claw.pending_action)
+        self.assertEqual(provider.created[0]["summary"], "Back to school night")
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-08-11T16:30:00-07:00")
+        self.assertIn("Created calendar event: Back to school night", output.getvalue())
+
+    def test_create_event_reports_expired_google_auth_without_raising(self):
+        provider = FailingProvider(
+            Exception("invalid_grant: Token has been expired or revoked."),
+        )
+        claw = FamilyCalendarClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()) as output:
+            message = claw.create_event_from_request(
+                "Nysha and Navya go to the library at 1 PM today",
+                reference_time=self.now,
+            )
+
+        self.assertIn("Google Calendar needs to be reconnected", message)
+        self.assertIn("python3 get_google_token.py", message)
+        self.assertIn(message, output.getvalue())
 
     def test_real_phrase_delay_great_mall_by_an_hour(self):
         request = "Delay the great mall shopping by an hour"

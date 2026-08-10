@@ -78,6 +78,27 @@ def _missing_response(fields: list[str]) -> ToolResponse:
     }
 
 
+def _provider_error_response(error: Exception) -> ToolResponse:
+    error_text = str(error)
+    is_revoked_google_token = "invalid_grant" in error_text and "expired or revoked" in error_text
+    if is_revoked_google_token:
+        return {
+            "status": "error",
+            "message": (
+                "Google Calendar needs to be reconnected. Run "
+                "python3 get_google_token.py, complete the browser sign-in, "
+                "then restart the Telegram bot."
+            ),
+            "data": {"error": "google_calendar_auth_expired"},
+        }
+
+    return {
+        "status": "error",
+        "message": "Google Calendar could not complete that request. Please try again later.",
+        "data": {"error": "google_calendar_request_failed"},
+    }
+
+
 class CalendarTools:
     """OpenClaw tool layer for the family calendar.
 
@@ -119,16 +140,20 @@ class CalendarTools:
         if missing_fields:
             return _missing_response(missing_fields)
 
-        event = self.provider.create_event(
-            title=cleaned_title,
-            start_time=cleaned_start,
-            end_time=cleaned_end,
-            timezone=_clean_optional(timezone) or DEFAULT_TIMEZONE,
-            description=_clean_optional(description),
-            location=_clean_optional(location),
-            recurrence=recurrence,
-            private_extended_properties=private_extended_properties,
-        )
+        try:
+            event = self.provider.create_event(
+                title=cleaned_title,
+                start_time=cleaned_start,
+                end_time=cleaned_end,
+                timezone=_clean_optional(timezone) or DEFAULT_TIMEZONE,
+                description=_clean_optional(description),
+                location=_clean_optional(location),
+                recurrence=recurrence,
+                private_extended_properties=private_extended_properties,
+            )
+        except Exception as error:
+            return _provider_error_response(error)
+
         return {
             "status": "ok",
             "message": "Calendar event created.",
@@ -153,11 +178,15 @@ class CalendarTools:
         if missing_fields:
             return _missing_response(missing_fields)
 
-        events = self.provider.list_events(
-            time_min=cleaned_min,
-            time_max=cleaned_max,
-            max_results=max_results,
-        )
+        try:
+            events = self.provider.list_events(
+                time_min=cleaned_min,
+                time_max=cleaned_max,
+                max_results=max_results,
+            )
+        except Exception as error:
+            return _provider_error_response(error)
+
         return {
             "status": "ok",
             "message": "Calendar events returned from Google Calendar.",
@@ -169,7 +198,11 @@ class CalendarTools:
         if cleaned_event_id is None:
             return _missing_response(["event_id"])
 
-        self.provider.delete_event(cleaned_event_id)
+        try:
+            self.provider.delete_event(cleaned_event_id)
+        except Exception as error:
+            return _provider_error_response(error)
+
         return {
             "status": "ok",
             "message": "Calendar event deleted.",
@@ -205,16 +238,20 @@ class CalendarTools:
         if missing_fields:
             return _missing_response(missing_fields)
 
-        event = self.provider.update_event(
-            event_id=cleaned_event_id,
-            title=cleaned_title,
-            start_time=cleaned_start,
-            end_time=cleaned_end,
-            timezone=_clean_optional(timezone) or DEFAULT_TIMEZONE,
-            description=_clean_optional(description),
-            location=_clean_optional(location),
-            private_extended_properties=private_extended_properties,
-        )
+        try:
+            event = self.provider.update_event(
+                event_id=cleaned_event_id,
+                title=cleaned_title,
+                start_time=cleaned_start,
+                end_time=cleaned_end,
+                timezone=_clean_optional(timezone) or DEFAULT_TIMEZONE,
+                description=_clean_optional(description),
+                location=_clean_optional(location),
+                private_extended_properties=private_extended_properties,
+            )
+        except Exception as error:
+            return _provider_error_response(error)
+
         return {
             "status": "ok",
             "message": "Calendar event updated.",

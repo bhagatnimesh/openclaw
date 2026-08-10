@@ -18,7 +18,38 @@ class N4OSAdviceTest(unittest.TestCase):
         self.assertTrue(is_n4os_advice_message("/n4os How should we approach reading?"))
         self.assertTrue(is_n4os_advice_message("How should we approach Nysha's reading?"))
         self.assertTrue(is_n4os_advice_message("what should I focus on this week?"))
+        self.assertTrue(is_n4os_advice_message("Run morning check-in."))
+        self.assertTrue(is_n4os_advice_message("Help me plan tomorrow morning."))
         self.assertFalse(is_n4os_advice_message("add home board item buy milk"))
+
+    def test_morning_checkin_is_deterministic_phone_prompt(self):
+        def fail_urlopen(*args, **kwargs):
+            raise AssertionError("morning check-in should not call OpenAI")
+
+        reply = format_n4os_advice(
+            "Run morning check-in.",
+            api_key="test-key",
+            urlopen=fail_urlopen,
+        )
+
+        self.assertIn("Morning check-in", reply)
+        self.assertIn("Energy/body/mind", reply)
+        self.assertIn("Commit to 3 things", reply)
+        self.assertIn("Decision:", reply)
+        self.assertIn("Next action:", reply)
+        self.assertNotIn("Loaded:", reply)
+        self.assertNotIn("**", reply)
+        self.assertLessEqual(len(reply.splitlines()), 16)
+
+    def test_tomorrow_morning_plan_is_deterministic_phone_prompt(self):
+        reply = format_n4os_advice(
+            "Help me plan tomorrow morning.",
+            api_key="",
+        )
+
+        self.assertIn("Tomorrow morning plan", reply)
+        self.assertIn("write the 3 commitments", reply)
+        self.assertNotIn("N4OS Telegram help", reply)
 
     def test_fallback_advice_uses_nysha_reading_memory(self):
         reply = format_n4os_advice(
@@ -140,6 +171,36 @@ class N4OSAdviceTest(unittest.TestCase):
 
         self.assertIn("Journal signals used", reply)
         self.assertIn("I felt scattered because I slept badly", reply)
+
+    def test_fallback_advice_uses_recent_trajectory_signals(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir(parents=True)
+            (n4os_root / "SOUL.md").write_text("Be warm.\n", encoding="utf-8")
+            (n4os_root / "trajectories").mkdir(parents=True)
+            (n4os_root / "trajectories" / "2026-08.md").write_text(
+                "\n".join(
+                    [
+                        "# N4OS Trajectories - 2026-08",
+                        "",
+                        "## 2026-08-08T21:15:00",
+                        "",
+                        "- Mode: ask",
+                        "- Topics: Reading, Parenting",
+                        "- Summary: Nysha reading works better when she can teach back ideas.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            reply = format_n4os_advice(
+                "/ask how should I approach Nysha reading?",
+                n4os_root=n4os_root,
+                api_key="",
+            )
+
+        self.assertIn("Conversation signals used", reply)
+        self.assertIn("teach back", reply)
 
     def test_week_ahead_request_gets_week_plan_not_generic_memory_dump(self):
         operations = {

@@ -1,6 +1,7 @@
 node_modules
 **/node_modules/
 .env
+static/dashboard/uploads/
 docker-compose.override.yml
 docker-compose.extra.yml
 docker-compose.sandbox.yml
@@ -251,6 +252,7 @@ openclaw-path-alias-*/
 /.pi/
 /C:\\openclaw/
 *.log
+.dashboard_server.pid
 *.tmp
 *.heapsnapshot
 *.cpuprofile

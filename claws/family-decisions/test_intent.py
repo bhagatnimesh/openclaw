@@ -142,6 +142,23 @@ class FamilyDecisionIntentTest(unittest.TestCase):
         self.assertEqual(decided["intent"], "record_decision")
         self.assertEqual(decided["outcome"], "choose Camp A")
 
+    def test_classifies_explicit_family_backlog_examples(self):
+        discussion = extract_intent("Discussion: Should we attend the birthday?", now=REFERENCE_TIME)
+        planning = extract_intent("Planning: Camping trip September 12", now=REFERENCE_TIME)
+        decision = extract_intent("Decision: Choose Nysha's school next year", now=REFERENCE_TIME)
+
+        self.assertEqual((discussion["intent"], discussion["kind"]), ("create_backlog_item", "discussion"))
+        self.assertEqual(discussion["title"], "Should we attend the birthday?")
+        self.assertEqual((planning["kind"], planning["title"], planning["due"]), ("planning", "Camping trip", "2026-09-12"))
+        self.assertEqual((decision["kind"], decision["title"]), ("decision", "Choose Nysha's school next year"))
+
+    def test_natural_questions_default_to_discussion_unless_consequential(self):
+        lightweight = extract_intent("Should we go to the birthday this weekend?", now=REFERENCE_TIME)
+        consequential = extract_intent("Should we change Nysha's school?", now=REFERENCE_TIME)
+
+        self.assertEqual(lightweight["kind"], "discussion")
+        self.assertEqual(consequential["kind"], "decision")
+
 
 if __name__ == "__main__":
     unittest.main()

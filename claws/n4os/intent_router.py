@@ -10,10 +10,16 @@ import sys
 from types import ModuleType
 from typing import Any, Callable, Iterator, Literal, Protocol, Union, cast
 
+try:
+    from .prompts import CLARIFICATION_PROMPT
+except ImportError:
+    from prompts import CLARIFICATION_PROMPT
+
 
 Route = Literal[
     "calendar",
     "tasks",
+    "shopping",
     "home_board",
     "decisions",
     "science_lab",
@@ -36,6 +42,7 @@ LOW_CONFIDENCE_THRESHOLD = 0.6
 VALID_ROUTES = {
     "calendar",
     "tasks",
+    "shopping",
     "home_board",
     "decisions",
     "science_lab",
@@ -70,6 +77,17 @@ TASK_INTENTS = {
     "delete_task",
     "run_assistant_help",
 }
+SHOPPING_INTENTS = {
+    "list_lists",
+    "list_items",
+    "add_item",
+    "add_items",
+    "check_item",
+    "uncheck_item",
+    "delete_item",
+    "move_item",
+    "clear_list",
+}
 HOME_BOARD_INTENTS = {
     "add_item",
     "add_items",
@@ -77,6 +95,14 @@ HOME_BOARD_INTENTS = {
     "mark_done",
 }
 DECISION_INTENTS = {
+    "create_backlog_item",
+    "list_backlog",
+    "add_backlog_note",
+    "set_backlog_position",
+    "move_backlog_item",
+    "pin_backlog_item",
+    "park_backlog_item",
+    "close_backlog_item",
     "create_decision",
     "list_decisions",
     "decision_brief",
@@ -87,6 +113,12 @@ DECISION_INTENTS = {
     "bulk_record_decisions",
 }
 DECISION_UPDATE_INTENTS = {
+    "add_backlog_note",
+    "set_backlog_position",
+    "move_backlog_item",
+    "pin_backlog_item",
+    "park_backlog_item",
+    "close_backlog_item",
     "decision_brief",
     "add_option",
     "add_evidence",
@@ -96,6 +128,8 @@ DECISION_UPDATE_INTENTS = {
 LIBRARY_INTENTS = {
     "record_reading",
     "record_checkout",
+    "update_reading",
+    "delete_reading",
     "status",
     "clarify",
     "not_counted",
@@ -116,10 +150,23 @@ CLAW_ROOT = Path(__file__).resolve().parents[1]
 CALENDAR_ROOT = CLAW_ROOT / "family-calendar"
 TASKS_ROOT = CLAW_ROOT / "family-tasks"
 HOME_BOARD_ROOT = CLAW_ROOT / "home-board"
+SHOPPING_ROOT = CLAW_ROOT / "shopping-list"
 DECISIONS_ROOT = CLAW_ROOT / "family-decisions"
 SCIENCE_LAB_ROOT = CLAW_ROOT / "science-lab"
 LIBRARY_ROOT = CLAW_ROOT / "library"
 TASK_CUE_RE = re.compile(r"\b(tasks?|todos?|to-dos?|open loops?)\b")
+SHOPPING_LIST_CUE_RE = re.compile(
+    r"\b(costco|indian(?:\s+grocer(?:y|ies))?|whole\s*foods?|wholefoods|amazon|others?|shopping\s+list|cart)\b",
+    re.IGNORECASE,
+)
+EXPLICIT_SHOPPING_COMMAND_RE = re.compile(
+    r"^\s*/(?:cart|shop|shopping)(?:@[A-Za-z0-9_]+)?(?:\s+|:\s*|$)",
+    re.IGNORECASE,
+)
+EXPLICIT_LIBRARY_TARGET_RE = re.compile(
+    r"^\s*(?:/(?:library|reading)(?:@[A-Za-z0-9_]+)?|add\s+to\s+(?:the\s+)?library|library\b)",
+    re.IGNORECASE,
+)
 EXPLICIT_CLOCK_TIME_RE = re.compile(
     r"\b(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|"
     r"\bat\s+\d{1,2}(?::\d{2})?\b"
@@ -270,6 +317,10 @@ def _home_board_intent_module() -> ModuleType:
     return load_scoped_module("_n4os_home_board_intent", HOME_BOARD_ROOT, "intent.py")
 
 
+def _shopping_intent_module() -> ModuleType:
+    return load_scoped_module("_n4os_shopping_list_intent", SHOPPING_ROOT, "intent.py")
+
+
 def _decisions_intent_module() -> ModuleType:
     return load_scoped_module("_n4os_family_decisions_intent", DECISIONS_ROOT, "intent.py")
 
@@ -281,13 +332,14 @@ def _library_intent_module() -> ModuleType:
 def _extract_intents(
     request: str,
     now: datetime | None,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     calendar_intent = _calendar_intent_module().extract_intent(request, now=now)
     task_intent = _tasks_intent_module().extract_intent(request, now=now)
+    shopping_intent = _shopping_intent_module().extract_intent(request, now=now)
     home_board_intent = _home_board_intent_module().extract_intent(request, now=now)
     decision_intent = _decisions_intent_module().extract_intent(request, now=now)
     library_intent = _library_intent_module().extract_intent(request, now=now)
-    return calendar_intent, task_intent, home_board_intent, decision_intent, library_intent
+    return calendar_intent, task_intent, shopping_intent, home_board_intent, decision_intent, library_intent
 
 
 def _has_time_anchor(text: str) -> bool:
@@ -329,6 +381,10 @@ def _has_explicit_clock_time(text: str) -> bool:
 
 def _has_task_cue(text: str) -> bool:
     return TASK_CUE_RE.search(text) is not None
+
+
+def _has_explicit_home_board_target(text: str) -> bool:
+    return re.search(r"\b(home board|today at home|house board)\b", text) is not None
 
 
 def _has_assistant_help_metadata(task_intent: dict[str, Any]) -> bool:
@@ -389,7 +445,11 @@ def _score_calendar(text: str, calendar_intent: dict[str, Any]) -> float:
     ):
         score += 0.45
 
-    if re.search(r"\b(calendar|schedule|event|appointment|appt|meeting)\b", text):
+    if re.search(
+        r"\b(calendar|schedule|events?|appointment|appt|meeting|school|"
+        r"holidays?|break|vacation|no\s+school|upcoming)\b",
+        text,
+    ):
         score += 0.35
     if re.search(r"\b(dentist|dental|doctor|flight|pickup|dinner|reservation)\b", text):
         score += 0.25
@@ -401,8 +461,9 @@ def _score_calendar(text: str, calendar_intent: dict[str, Any]) -> float:
         and not looks_like_task_capture
     ):
         score += 0.2
-    if re.search(r"^\s*(what|what's|whats|show|list)\b", text) and re.search(
-        r"\b(have|calendar|schedule|coming up)\b",
+    if re.search(r"^\s*(what|what's|whats|when|show|list)\b", text) and re.search(
+        r"\b(have|calendar|schedule|coming up|upcoming|school|day|break|"
+        r"conference|holidays?|vacation|no\s+school)\b",
         text,
     ):
         score += 0.35
@@ -449,18 +510,78 @@ def _score_tasks(text: str, task_intent: dict[str, Any]) -> float:
     return min(score, 1.0)
 
 
+def _score_shopping(text: str, shopping_intent: dict[str, Any]) -> float:
+    score = 0.0
+    intent = shopping_intent.get("intent")
+    explicit_command = EXPLICIT_SHOPPING_COMMAND_RE.search(text) is not None
+    if explicit_command:
+        score += 0.9
+    if intent in SHOPPING_INTENTS and not shopping_intent.get("missing_fields"):
+        score += 0.45
+    elif intent in SHOPPING_INTENTS:
+        score += 0.2
+    if SHOPPING_LIST_CUE_RE.search(text):
+        score += 0.4
+    if re.search(r"\b(shopping|cart|grocer(?:y|ies)|buy)\b", text):
+        score += 0.25
+    if re.search(r"^\s*(?:add|buy|need|get|put|cross\s+off|check\s+off|remove|delete|move|clear|done)\b", text):
+        score += 0.2
+    if SHOPPING_LIST_CUE_RE.search(text) and re.search(r"\b(done|clear)\b", text):
+        score += 0.35
+    if _has_task_cue(text) or re.search(r"\bremind\s+me\s+to\b", text):
+        score -= 0.5
+    if _is_time_bound_store_trip(text):
+        score -= 0.7
+    return max(0.0, min(score, 1.0))
+
+
+def _is_ambiguous_shopping_item_request(text: str, shopping_intent: dict[str, Any]) -> bool:
+    if "#" in text:
+        return False
+    if SHOPPING_LIST_CUE_RE.search(text) or _has_task_cue(text) or _has_time_anchor(text):
+        return False
+    return bool(
+        shopping_intent.get("intent") in {"add_item", "add_items"}
+        and "list_name" in list(shopping_intent.get("missing_fields") or [])
+        and re.search(r"^\s*(?:buy|need|get|add)\b", text)
+    )
+
+
+def _is_multiline_calendar_event_request(text: str) -> bool:
+    if not re.search(r"^\s*(?:add|create|schedule)\b", text, flags=re.IGNORECASE):
+        return False
+    if re.search(r"\b(?:events?|calendar|schedule)\b", text, flags=re.IGNORECASE) is None:
+        return False
+
+    date_lines = [
+        line
+        for line in text.splitlines()
+        if re.match(r"^\s*\d{1,2}/\d{1,2}(?:/\d{2,4})?\s*$", line)
+    ]
+    return len(date_lines) >= 2
+
+
+def _is_time_bound_store_trip(text: str) -> bool:
+    return bool(
+        _has_time_anchor(text)
+        and SHOPPING_LIST_CUE_RE.search(text)
+        and re.search(r"\b(trip|go\s+to|visit|appointment|meeting|pickup|dinner|call)\b", text)
+    )
+
+
 def _score_home_board(text: str, home_board_intent: dict[str, Any]) -> float:
     score = 0.0
     intent = home_board_intent.get("intent")
     if intent in HOME_BOARD_INTENTS:
         score += 0.45
-    if re.search(r"\b(home board|today at home|house board)\b", text):
+    explicit_home_board_target = _has_explicit_home_board_target(text)
+    if explicit_home_board_target:
         score += 0.45
     if re.search(r"\bbefore\b", text) and re.search(r"\b(leaves?|leaving|leave)\b", text):
         score += 0.45
     if re.search(r"\b(helper|nysha|nimesh|dad|mom|family|everyone)\b", text):
         score += 0.25
-    if _is_object_update_request(text):
+    if _is_object_update_request(text) and not explicit_home_board_target:
         score -= 0.35
     if re.search(r"\b(journal|form|payment|fridge|food|passport|lunch|library book|permission slip)\b", text):
         score += 0.25
@@ -481,6 +602,8 @@ def _score_decisions(text: str, decision_intent: dict[str, Any]) -> float:
         score += 0.25
     if re.search(r"\b(decisions?|decide|decided|decision brief)\b", text):
         score += 0.5
+    if re.search(r"^\s*(?:discussion|planning|plan|decision)\s*[:\-]|\bfamily backlog\b|^\s*/?backlog\b", text):
+        score += 0.7
     if re.search(r"\b(options?\s+(?:are|include|includes)|choices?\s+(?:are|include|includes)|add(?:ed)?\s+note|next step|challenges?|concerns?|risks?)\b", text):
         score += 0.25
     if re.search(r"\b(choose|whether|should we|are we going to|did we decide)\b", text):
@@ -516,7 +639,11 @@ def _score_library(text: str, library_intent: dict[str, Any]) -> float:
     )
     if intent in LIBRARY_INTENTS:
         score += 0.5
+    if intent in {"update_reading", "delete_reading"}:
+        score += 0.35
     if re.search(r"\b(reading garden|read it myself|library claw|reading status)\b", text):
+        score += 0.45
+    if re.search(r"\b(?:change|update|edit|fix|correct|delete|remove|undo)\b.*\b(?:reading|book|moment|entry|log)\b", text):
         score += 0.45
     if re.search(r"\b(library bag|library checkout|checked out|checkout receipt|library receipt)\b", text):
         score += 0.5
@@ -527,7 +654,7 @@ def _score_library(text: str, library_intent: dict[str, Any]) -> float:
         score += 0.5
     if intent == "record_checkout":
         score += 0.25
-    if re.search(r"\bnysha\b", text) and re.search(r"\b(read|finished|pages?|minutes?|book)\b", text):
+    if re.search(r"\b(?:nysha|navya|kids|girls|children)\b", text) and re.search(r"\b(read|finished|pages?|minutes?|book)\b", text):
         score += 0.45
     if re.search(r"\b(by herself|herself|independently|i read it myself)\b", text):
         score += 0.25
@@ -538,7 +665,7 @@ def _score_library(text: str, library_intent: dict[str, Any]) -> float:
         text,
     ):
         score -= 0.25
-    if explicit_task_create:
+    if explicit_task_create and intent not in {"update_reading", "delete_reading"}:
         score -= 0.45
     return max(0.0, min(score, 1.0))
 
@@ -548,7 +675,8 @@ def _is_explicit_decision_request(text: str, decision_intent: dict[str, Any]) ->
     if intent not in DECISION_INTENTS:
         return False
     if re.search(
-        r"\b(captured decision|track decision|capture decision|family decision|decision brief|decisions?)\b",
+        r"\b(captured decision|track decision|capture decision|family decision|decision brief|decisions?|family backlog)\b|"
+        r"^\s*(?:discussion|planning|plan|decision)\s*[:\-]|^\s*/?backlog\b",
         text,
     ):
         return True
@@ -581,6 +709,7 @@ def _summary(
     route: Route,
     calendar_intent: dict[str, Any],
     task_intent: dict[str, Any],
+    shopping_intent: dict[str, Any] | None = None,
     decision_intent: dict[str, Any] | None = None,
     library_intent: dict[str, Any] | None = None,
 ) -> str:
@@ -588,6 +717,9 @@ def _summary(
         return f"Route to family-calendar for {calendar_intent.get('intent', 'calendar request')}."
     if route == "tasks":
         return f"Route to family-tasks for {task_intent.get('intent', 'task request')}."
+    if route == "shopping":
+        intent = (shopping_intent or {}).get("intent", "shopping request")
+        return f"Route to shopping-list for {intent}."
     if route == "home_board":
         return "Route to home-board for household notice."
     if route == "decisions":
@@ -602,13 +734,14 @@ def _summary(
         return (
             "Route to family-calendar and family-tasks for combined planning or briefing."
         )
-    return "Could not confidently choose Capture, Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
+    return "Could not confidently choose Capture, Calendar, Tasks, Shopping, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
 
 
 def _action_for_route(
     route: Route,
     calendar_intent: dict[str, Any],
     task_intent: dict[str, Any],
+    shopping_intent: dict[str, Any],
     home_board_intent: dict[str, Any],
     decision_intent: dict[str, Any],
     library_intent: dict[str, Any],
@@ -617,6 +750,8 @@ def _action_for_route(
         return str(calendar_intent.get("intent") or "calendar_request")
     if route == "tasks":
         return str(task_intent.get("intent") or "task_request")
+    if route == "shopping":
+        return str(shopping_intent.get("intent") or "shopping_request")
     if route == "home_board":
         return str(home_board_intent.get("intent") or "home_board_request")
     if route == "decisions":
@@ -635,6 +770,8 @@ def _frame_summary(frame: N4OSIntentFrame) -> str:
         return f"Route to family-calendar for {frame.action}."
     if frame.route == "tasks":
         return f"Route to family-tasks for {frame.action}."
+    if frame.route == "shopping":
+        return f"Route to shopping-list for {frame.action}."
     if frame.route == "home_board":
         return f"Route to home-board for {frame.action}."
     if frame.route == "decisions":
@@ -645,7 +782,7 @@ def _frame_summary(frame: N4OSIntentFrame) -> str:
         return f"Route to library for {frame.action}."
     if frame.route == "both":
         return "Route to family-calendar and family-tasks for combined planning or briefing."
-    return frame.clarification_question or "Could not confidently choose Capture, Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
+    return frame.clarification_question or "Could not confidently choose Capture, Calendar, Tasks, Shopping, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks."
 
 
 def _round_confidence(value: Any) -> float:
@@ -724,6 +861,13 @@ def _should_keep_rule_fallback(
     if fallback.route == "unknown" or fallback.confidence < LOW_CONFIDENCE_THRESHOLD:
         return False
     if frame.confidence < LOW_CONFIDENCE_THRESHOLD:
+        return True
+    if (
+        fallback.route == "library"
+        and fallback.action == "record_reading"
+        and fallback.confidence >= 0.9
+        and frame.route == "shopping"
+    ):
         return True
     if (
         fallback.confidence >= 0.9
@@ -835,6 +979,7 @@ def _rule_intent_frame(
     (
         calendar_intent,
         task_intent,
+        shopping_intent,
         home_board_intent,
         decision_intent,
         library_intent,
@@ -859,6 +1004,88 @@ def _rule_intent_frame(
     if context_frame is not None:
         return context_frame
 
+    library_score = _score_library(text, library_intent)
+    if (
+        EXPLICIT_LIBRARY_TARGET_RE.search(text) is not None
+        and library_score >= LOW_CONFIDENCE_THRESHOLD
+        and library_intent.get("intent") in LIBRARY_INTENTS
+    ):
+        return N4OSIntentFrame(
+            route="library",
+            action=_action_for_route(
+                "library",
+                calendar_intent,
+                task_intent,
+                shopping_intent,
+                home_board_intent,
+                decision_intent,
+                library_intent,
+            ),
+            confidence=round(library_score, 2),
+            normalized_request=request,
+        )
+
+    shopping_score = _score_shopping(text, shopping_intent)
+    if (
+        EXPLICIT_SHOPPING_COMMAND_RE.search(text) is not None
+        or (
+            shopping_score >= LOW_CONFIDENCE_THRESHOLD
+            and not _has_task_cue(text)
+            and not shopping_intent.get("missing_fields")
+            and not _is_time_bound_store_trip(text)
+            and shopping_intent.get("intent") in SHOPPING_INTENTS
+        )
+    ):
+        return N4OSIntentFrame(
+            route="shopping",
+            action=_action_for_route(
+                "shopping",
+                calendar_intent,
+                task_intent,
+                shopping_intent,
+                home_board_intent,
+                decision_intent,
+                library_intent,
+            ),
+            confidence=round(max(shopping_score, 0.92 if EXPLICIT_SHOPPING_COMMAND_RE.search(text) else shopping_score), 2),
+            normalized_request=request,
+            clarification_question=(
+                "Which shopping list: Indian, Costco, Whole Foods, Amazon, or Others?"
+                if shopping_intent.get("missing_fields") == ["list_name"]
+                else None
+            ),
+        )
+
+    if _is_multiline_calendar_event_request(text):
+        return N4OSIntentFrame(
+            route="calendar",
+            action="create_event",
+            confidence=0.9,
+            normalized_request=request,
+        )
+
+    if _is_ambiguous_shopping_item_request(text, shopping_intent):
+        return N4OSIntentFrame(
+            route="unknown",
+            action="unknown",
+            confidence=0.55,
+            missing_fields=["list_name"],
+            normalized_request=request,
+            clarification_question="Which shopping list: Indian, Costco, Whole Foods, Amazon, or Others?",
+        )
+
+    if (
+        _is_tag_update_request(text)
+        and task_intent.get("intent") == "recommend_tasks"
+        and task_intent.get("filters", {}).get("tags")
+    ):
+        return N4OSIntentFrame(
+            route="tasks",
+            action="recommend_tasks",
+            confidence=0.86,
+            normalized_request=request,
+        )
+
     if _is_explicit_decision_request(text, decision_intent):
         return N4OSIntentFrame(
             route="decisions",
@@ -866,6 +1093,7 @@ def _rule_intent_frame(
                 "decisions",
                 calendar_intent,
                 task_intent,
+                shopping_intent,
                 home_board_intent,
                 decision_intent,
                 library_intent,
@@ -879,6 +1107,26 @@ def _rule_intent_frame(
             route="both",
             action="combined_planning",
             confidence=0.88,
+            normalized_request=request,
+        )
+
+    if (
+        _has_explicit_home_board_target(text)
+        and home_board_intent.get("intent") in HOME_BOARD_INTENTS
+        and not home_board_intent.get("missing_fields")
+    ):
+        return N4OSIntentFrame(
+            route="home_board",
+            action=_action_for_route(
+                "home_board",
+                calendar_intent,
+                task_intent,
+                shopping_intent,
+                home_board_intent,
+                decision_intent,
+                library_intent,
+            ),
+            confidence=0.95,
             normalized_request=request,
         )
 
@@ -921,6 +1169,7 @@ def _rule_intent_frame(
                 "library",
                 calendar_intent,
                 task_intent,
+                shopping_intent,
                 home_board_intent,
                 decision_intent,
                 library_intent,
@@ -939,6 +1188,7 @@ def _rule_intent_frame(
                 "tasks",
                 calendar_intent,
                 task_intent,
+                shopping_intent,
                 home_board_intent,
                 decision_intent,
                 library_intent,
@@ -949,6 +1199,7 @@ def _rule_intent_frame(
 
     calendar_score = _score_calendar(text, calendar_intent)
     task_score = _score_tasks(text, task_intent)
+    shopping_score = _score_shopping(text, shopping_intent)
     home_board_score = _score_home_board(text, home_board_intent)
     decision_score = _score_decisions(text, decision_intent)
     science_lab_score = _score_science_lab(text)
@@ -957,6 +1208,7 @@ def _rule_intent_frame(
     scores: dict[Route, float] = {
         "calendar": calendar_score,
         "tasks": task_score,
+        "shopping": shopping_score,
         "home_board": home_board_score,
         "decisions": decision_score,
         "science_lab": science_lab_score,
@@ -983,6 +1235,7 @@ def _rule_intent_frame(
             route,
             calendar_intent,
             task_intent,
+            shopping_intent,
             home_board_intent,
             decision_intent,
             library_intent,
@@ -990,7 +1243,7 @@ def _rule_intent_frame(
         confidence=round(confidence, 2),
         normalized_request=request,
         clarification_question=(
-            "Should I use Capture, Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?"
+            CLARIFICATION_PROMPT
             if route == "unknown"
             else None
         ),

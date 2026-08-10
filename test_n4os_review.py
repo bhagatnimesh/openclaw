@@ -51,6 +51,21 @@ class N4OSReviewTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (n4os_root / "trajectories").mkdir(parents=True)
+            (n4os_root / "trajectories" / "2026-07.md").write_text(
+                "\n".join(
+                    [
+                        "# N4OS Trajectories - 2026-07",
+                        "",
+                        "## 2026-07-21T20:00:00",
+                        "",
+                        "- Mode: chat",
+                        "- Topics: School Transition, Parenting",
+                        "- Summary: Coaching conversation captured a school transition bridge plan.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
             review = format_n4os_review(
                 "week",
@@ -60,6 +75,7 @@ class N4OSReviewTest(unittest.TestCase):
 
         self.assertIn("N4OS week review", review)
         self.assertIn("Repeated signals:", review)
+        self.assertIn("School Transition", review)
         self.assertIn("Promotion candidates:", review)
         self.assertIn("No stable N4OS files were changed", review)
 

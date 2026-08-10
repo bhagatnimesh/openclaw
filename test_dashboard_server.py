@@ -8,7 +8,14 @@ from urllib.request import Request, urlopen
 import dashboard_sources
 from dashboard_data import (
     build_dashboard_data,
+    clear_dashboard_shopping_list,
+    complete_dashboard_decision,
+    complete_dashboard_shopping_item,
     complete_dashboard_task,
+    create_dashboard_backlog_item,
+    delete_dashboard_reading_event,
+    perform_dashboard_backlog_action,
+    update_dashboard_reading_event,
 )
 from dashboard_server import DashboardRequestHandler
 from dashboard_sources import (
@@ -150,12 +157,113 @@ class FakeHomeBoardTools:
 class FakeDecisionTools:
     def __init__(self, decisions=None):
         self.decisions = decisions or []
+        self.decided = []
 
     def list_decisions(self, status=None, include_decided=False):
         return {
             "status": "ok",
             "message": "Family decisions returned.",
             "data": {"decisions": self.decisions},
+        }
+
+    def decide(self, decision_id=None, outcome=None, rationale=None):
+        self.decided.append((decision_id, outcome, rationale))
+        for decision in self.decisions:
+            if decision.get("id") == decision_id:
+                decision["status"] = "decided"
+                decision["outcome"] = outcome
+                return {
+                    "status": "ok",
+                    "message": "Family decision recorded.",
+                    "data": {"decision": decision},
+                }
+        return {
+            "status": "error",
+            "message": "Decision not found.",
+            "data": {"decision_id": decision_id},
+        }
+
+
+class FakeBacklogTools(FakeDecisionTools):
+    def __init__(self, items=None):
+        super().__init__([])
+        self.items = items or []
+        self.calls = []
+
+    def list_backlog_items(self, kind=None, include_closed=False):
+        items = [item for item in self.items if kind is None or item.get("kind") == kind]
+        return {"status": "ok", "message": "Family backlog returned.", "data": {"items": items}}
+
+    def create_backlog_item(self, **kwargs):
+        self.calls.append(("create", kwargs))
+        return {"status": "ok", "message": "Added.", "data": {"item": kwargs}}
+
+    def move_backlog_item(self, item_id, kind, **kwargs):
+        self.calls.append(("move", {"item_id": item_id, "kind": kind, **kwargs}))
+        return {"status": "ok", "message": "Moved.", "data": {"item": {"id": item_id, "kind": kind}}}
+
+
+class FakeShoppingTools:
+    def __init__(self, items_by_list=None):
+        self.items_by_list = items_by_list or {}
+        self.checked = []
+        self.cleared = []
+
+    def list_shopping_lists(self):
+        return {
+            "status": "ok",
+            "message": "Shopping lists returned.",
+            "data": {
+                "lists": [
+                    {"slug": "indian", "name": "Indian"},
+                    {"slug": "costco", "name": "Costco"},
+                    {"slug": "whole-foods", "name": "Whole Foods"},
+                    {"slug": "amazon", "name": "Amazon"},
+                    {"slug": "others", "name": "Others"},
+                ],
+            },
+        }
+
+    def list_items(self, list_slug=None, include_checked=False):
+        items = [
+            item for item in self.items_by_list.get(list_slug, [])
+            if include_checked or not item.get("checked")
+        ]
+        return {
+            "status": "ok",
+            "message": "Shopping items returned.",
+            "data": {"items": items},
+        }
+
+    def set_checked_by_id(self, item_id=None, checked=True, list_slug=None):
+        self.checked.append((item_id, checked, list_slug))
+        for items in self.items_by_list.values():
+            for item in items:
+                if item.get("id") == item_id:
+                    item["checked"] = checked
+                    return {
+                        "status": "ok",
+                        "message": "Shopping item checked off.",
+                        "data": {"item": item},
+                    }
+        return {
+            "status": "error",
+            "message": "Shopping item not found.",
+            "data": {"item_id": item_id},
+        }
+
+    def clear_list(self, list_slug=None):
+        self.cleared.append(list_slug)
+        items = self.items_by_list.get(list_slug, [])
+        cleared = []
+        for item in items:
+            if not item.get("checked"):
+                item["checked"] = True
+                cleared.append(item)
+        return {
+            "status": "ok",
+            "message": f"Cleared {len(cleared)} pending item(s).",
+            "data": {"items": cleared},
         }
 
 
@@ -182,6 +290,8 @@ class FakeReadingGardenTools:
             },
             "current_bag": {"count": 0, "titles": [], "due_date": ""},
         }
+        self.updated = []
+        self.deleted = []
 
     def status(self, now=None):
         return {
@@ -190,8 +300,35 @@ class FakeReadingGardenTools:
             "data": {"summary": self.summary},
         }
 
+    def update_reading(self, **kwargs):
+        self.updated.append(kwargs)
+        event = {
+            "id": kwargs.get("event_id"),
+            "child": kwargs.get("child") or "Nysha",
+            "date": kwargs.get("date") or "2026-07-07",
+            "book": kwargs.get("book") or "Mercy Watson",
+            "minutes": kwargs.get("minutes"),
+            "pages": kwargs.get("pages"),
+            "reaction": kwargs.get("reaction"),
+            "status": kwargs.get("status") or "in_progress",
+            "reading_mode": kwargs.get("reading_mode") or "independent",
+        }
+        return {
+            "status": "ok",
+            "message": "Updated reading moment.",
+            "data": {"event": event},
+        }
 
-def sources(events=None, tasks=None, home_board_items=None, decisions=None, reading_garden=None):
+    def delete_reading(self, **kwargs):
+        self.deleted.append(kwargs)
+        return {
+            "status": "ok",
+            "message": "Deleted reading moment.",
+            "data": {"event": {"id": kwargs.get("event_id")}},
+        }
+
+
+def sources(events=None, tasks=None, home_board_items=None, decisions=None, backlog_items=None, shopping_items=None, reading_garden=None):
     return DashboardSources(
         calendar_tools=FakeCalendarTools(events or []),
         task_tools=FakeTaskTools(tasks or []),
@@ -199,7 +336,8 @@ def sources(events=None, tasks=None, home_board_items=None, decisions=None, read
         read_task_metadata=fallback_task_metadata,
         recommend_task_matches=fallback_recommend_task_matches,
         home_board_tools=FakeHomeBoardTools(home_board_items),
-        decision_tools=FakeDecisionTools(decisions),
+        decision_tools=FakeBacklogTools(backlog_items) if backlog_items is not None else FakeDecisionTools(decisions),
+        shopping_tools=FakeShoppingTools(shopping_items),
         reading_garden_tools=FakeReadingGardenTools(reading_garden),
     )
 
@@ -468,6 +606,56 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(garden["library_visit"]["label"], "Enjoy this library bag.")
         self.assertEqual(garden["current_bag"]["count"], 2)
 
+    def test_dashboard_updates_reading_event(self):
+        reading_tools = FakeReadingGardenTools()
+        active_sources = DashboardSources(
+            calendar_tools=FakeCalendarTools([]),
+            task_tools=FakeTaskTools([]),
+            read_event_metadata=fallback_event_metadata,
+            read_task_metadata=fallback_task_metadata,
+            recommend_task_matches=fallback_recommend_task_matches,
+            home_board_tools=FakeHomeBoardTools(),
+            decision_tools=FakeDecisionTools(),
+            shopping_tools=FakeShoppingTools(),
+            reading_garden_tools=reading_tools,
+        )
+
+        response = update_dashboard_reading_event(
+            "event-1",
+            book="Frog and Toad",
+            date="2026-07-08",
+            pages=12,
+            reading_mode="read_together",
+            sources=active_sources,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["event"]["book"], "Frog and Toad")
+        self.assertEqual(reading_tools.updated[0]["event_id"], "event-1")
+        self.assertEqual(reading_tools.updated[0]["book"], "Frog and Toad")
+        self.assertEqual(reading_tools.updated[0]["date"], "2026-07-08")
+        self.assertEqual(reading_tools.updated[0]["pages"], 12)
+        self.assertEqual(reading_tools.updated[0]["reading_mode"], "read_together")
+
+    def test_dashboard_deletes_reading_event(self):
+        reading_tools = FakeReadingGardenTools()
+        active_sources = DashboardSources(
+            calendar_tools=FakeCalendarTools([]),
+            task_tools=FakeTaskTools([]),
+            read_event_metadata=fallback_event_metadata,
+            read_task_metadata=fallback_task_metadata,
+            recommend_task_matches=fallback_recommend_task_matches,
+            home_board_tools=FakeHomeBoardTools(),
+            decision_tools=FakeDecisionTools(),
+            shopping_tools=FakeShoppingTools(),
+            reading_garden_tools=reading_tools,
+        )
+
+        response = delete_dashboard_reading_event("event-1", sources=active_sources)
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(reading_tools.deleted, [{"event_id": "event-1"}])
+
     def test_complete_dashboard_task_updates_google_task_source(self):
         task_tools = FakeTaskTools(
             [
@@ -499,6 +687,44 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(task_tools.completed, [("@default", "task-1")])
         self.assertEqual(response["data"]["task"]["status"], "completed")
 
+    def test_complete_dashboard_decision_marks_decision_done(self):
+        decision_tools = FakeDecisionTools(
+            [
+                {
+                    "id": "decision-1",
+                    "title": "Summer camp plan",
+                    "status": "inbox",
+                    "owner": "unknown",
+                    "urgency": "normal",
+                    "size": "small",
+                    "due": "",
+                    "options": [],
+                    "evidence": [],
+                    "next_steps": [],
+                },
+            ],
+        )
+        dashboard_sources = DashboardSources(
+            calendar_tools=FakeCalendarTools([]),
+            task_tools=FakeTaskTools([]),
+            read_event_metadata=fallback_event_metadata,
+            read_task_metadata=fallback_task_metadata,
+            recommend_task_matches=fallback_recommend_task_matches,
+            home_board_tools=FakeHomeBoardTools(),
+            decision_tools=decision_tools,
+        )
+
+        response = complete_dashboard_decision(
+            "decision-1",
+            sources=dashboard_sources,
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(decision_tools.decided, [("decision-1", "Marked done from dashboard.", None)])
+        self.assertEqual(response["data"]["decision"]["status"], "decided")
+        self.assertEqual(response["data"]["decision"]["outcome"], "Marked done from dashboard.")
+
     def test_dashboard_includes_today_home_board_items(self):
         data = build_dashboard_data(
             sources(
@@ -522,6 +748,85 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data["summary"]["home_board_count"], 1)
         self.assertEqual(data["home_board"]["today"][0]["person_or_group"], "Nysha")
         self.assertEqual(data["home_board"]["today"][0]["context_label"], "School")
+
+    def test_dashboard_includes_shopping_lists(self):
+        data = build_dashboard_data(
+            sources(
+                shopping_items={
+                    "indian": [
+                        {"id": "item-1", "title": "paneer", "list_slug": "indian", "checked": False},
+                    ],
+                    "costco": [
+                        {"id": "item-2", "title": "milk", "list_slug": "costco", "checked": False},
+                    ],
+                },
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["summary"]["shopping_count"], 2)
+        self.assertEqual(
+            [(item["list_name"], item["title"]) for item in data["shopping"]["pending"]],
+            [("Indian", "paneer"), ("Costco", "milk")],
+        )
+        by_list = {shopping_list["slug"]: shopping_list for shopping_list in data["shopping"]["by_list"]}
+        self.assertEqual(by_list["indian"]["pending_count"], 1)
+        self.assertEqual(by_list["costco"]["items"][0]["title"], "milk")
+
+    def test_complete_dashboard_shopping_item_updates_source(self):
+        shopping_tools = FakeShoppingTools(
+            {
+                "costco": [
+                    {"id": "item-1", "title": "milk", "list_slug": "costco", "checked": False},
+                ],
+            },
+        )
+        dashboard_sources = DashboardSources(
+            calendar_tools=FakeCalendarTools([]),
+            task_tools=FakeTaskTools([]),
+            read_event_metadata=fallback_event_metadata,
+            read_task_metadata=fallback_task_metadata,
+            recommend_task_matches=fallback_recommend_task_matches,
+            home_board_tools=FakeHomeBoardTools(),
+            decision_tools=FakeDecisionTools(),
+            shopping_tools=shopping_tools,
+        )
+
+        response = complete_dashboard_shopping_item(
+            "item-1",
+            list_slug="costco",
+            sources=dashboard_sources,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(shopping_tools.checked, [("item-1", True, "costco")])
+        self.assertTrue(shopping_tools.items_by_list["costco"][0]["checked"])
+
+    def test_clear_dashboard_shopping_list_updates_source(self):
+        shopping_tools = FakeShoppingTools(
+            {
+                "indian": [
+                    {"id": "item-1", "title": "paneer", "list_slug": "indian", "checked": False},
+                    {"id": "item-2", "title": "curry leaves", "list_slug": "indian", "checked": False},
+                ],
+            },
+        )
+        dashboard_sources = DashboardSources(
+            calendar_tools=FakeCalendarTools([]),
+            task_tools=FakeTaskTools([]),
+            read_event_metadata=fallback_event_metadata,
+            read_task_metadata=fallback_task_metadata,
+            recommend_task_matches=fallback_recommend_task_matches,
+            home_board_tools=FakeHomeBoardTools(),
+            decision_tools=FakeDecisionTools(),
+            shopping_tools=shopping_tools,
+        )
+
+        response = clear_dashboard_shopping_list("indian", sources=dashboard_sources)
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(shopping_tools.cleared, ["indian"])
+        self.assertTrue(all(item["checked"] for item in shopping_tools.items_by_list["indian"]))
 
     def test_dashboard_includes_open_family_decisions(self):
         data = build_dashboard_data(
@@ -556,6 +861,92 @@ class DashboardDataTest(unittest.TestCase):
         self.assertIn("owner", decision["missing_fields"])
         self.assertIn("timeline", decision["missing_fields"])
         self.assertIn("next step", decision["missing_fields"])
+
+    def test_dashboard_builds_ranked_backlog_and_link_progress(self):
+        base = {
+            "context": "",
+            "status": "open",
+            "owner": "both",
+            "urgency": "normal",
+            "priority": 0,
+            "pinned": False,
+            "review_on": None,
+            "due": None,
+            "notes": [],
+            "positions": [],
+            "links": [],
+            "options": [],
+            "evidence": [],
+            "next_steps": [],
+            "updated_at": "2026-07-01T09:00:00-07:00",
+        }
+        backlog_items = [
+            {**base, "id": "discussion-1", "kind": "discussion", "title": "Birthday", "pinned": True},
+            {
+                **base,
+                "id": "planning-1",
+                "kind": "planning",
+                "title": "Camping",
+                "status": "preparing",
+                "due": "2026-07-04",
+                "links": [{"id": "link-1", "source_type": "google_task", "external_id": "pack-1", "container_id": "@default", "title": "Pack tent"}],
+            },
+            {**base, "id": "decision-1", "kind": "decision", "title": "Choose school", "status": "inbox", "urgency": "high"},
+        ]
+        completed_task = task("Pack tent", task_id="pack-1")
+        completed_task["status"] = "completed"
+
+        data = build_dashboard_data(
+            sources(tasks=[completed_task], backlog_items=backlog_items),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["backlog"]["counts"], {"discussion": 1, "planning": 1, "decision": 1})
+        self.assertEqual(data["backlog"]["lanes"]["discussion"][0]["id"], "discussion-1")
+        self.assertTrue(data["backlog"]["lanes"]["planning"][0]["ready_to_close"])
+        self.assertTrue(data["backlog"]["lanes"]["planning"][0]["links"][0]["completed"])
+        self.assertLessEqual(len(data["backlog"]["attention"]), 5)
+
+    def test_dashboard_backlog_mutations_use_dashboard_actor_and_confirm_move(self):
+        tools = FakeBacklogTools()
+        active_sources = sources()
+        active_sources = DashboardSources(
+            **{**active_sources.__dict__, "decision_tools": tools},
+        )
+
+        created = create_dashboard_backlog_item(
+            kind="discussion",
+            title="Birthday",
+            owner="mom",
+            date_value="2026-07-05",
+            sources=active_sources,
+        )
+        unconfirmed = perform_dashboard_backlog_action(
+            action="move",
+            item_id="item-1",
+            payload={"kind": "planning"},
+            sources=active_sources,
+        )
+        moved = perform_dashboard_backlog_action(
+            action="move",
+            item_id="item-1",
+            payload={"kind": "planning", "confirmed": True},
+            sources=active_sources,
+        )
+        invalid = perform_dashboard_backlog_action(
+            action="invent",
+            item_id="item-1",
+            sources=active_sources,
+        )
+
+        self.assertEqual(created["status"], "ok")
+        self.assertEqual(tools.calls[0][1]["actor"], "family dashboard")
+        self.assertEqual(tools.calls[0][1]["review_on"], "2026-07-05")
+        self.assertEqual(unconfirmed["status"], "needs_confirmation")
+        self.assertEqual(moved["status"], "ok")
+        self.assertTrue(tools.calls[1][1]["confirmed"])
+        self.assertEqual(tools.calls[1][1]["actor"], "family dashboard")
+        self.assertEqual(invalid["status"], "error")
 
     def test_calendar_failure_preserves_task_and_home_board_data(self):
         data = build_dashboard_data(
@@ -745,16 +1136,22 @@ class DashboardServerRouteTest(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                     self.assertIn("N4OS Family Chief of Staff", body)
                     self.assertNotIn("{{ACTION_TOKEN}}", body)
-                    self.assertIn('href="#decisions"', body)
+                    self.assertIn('href="#backlog"', body)
+                    self.assertIn('href="#shopping"', body)
                     self.assertIn('href="#library"', body)
+                    self.assertIn('id="shopping-list-tabs"', body)
+                    self.assertIn('id="shopping-list-items"', body)
                     self.assertIn('id="library"', body)
                     self.assertIn('id="library-visit-label"', body)
                     self.assertIn('id="library-bag-list"', body)
                     self.assertIn('data-dashboard-card="library-bag"', body)
                     self.assertIn('data-dashboard-card="reading-photos"', body)
-                    self.assertIn('data-dashboard-card="decision-attention"', body)
+                    self.assertIn('data-dashboard-card="backlog-attention"', body)
                     self.assertIn('data-dashboard-card="family-members"', body)
-                    self.assertIn('id="decision-items"', body)
+                    self.assertIn('id="discussion-items"', body)
+                    self.assertIn('id="planning-items"', body)
+                    self.assertIn('id="decision-backlog-items"', body)
+                    self.assertIn('id="backlog-add-dialog"', body)
                     self.assertIn('id="pending-task-items"', body)
                     self.assertIn('id="task-lanes-heading"', body)
                     self.assertLess(body.index('id="tasks"'), body.index('id="library"'))
@@ -762,6 +1159,111 @@ class DashboardServerRouteTest(unittest.TestCase):
                     self.assertIn('id="screen-status"', body)
                     self.assertIn('id="screen-wake-button"', body)
         finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_backlog_api_returns_lanes(self):
+        import dashboard_server
+
+        original_get_dashboard_data = dashboard_server.get_dashboard_data
+        dashboard_server.get_dashboard_data = lambda: {
+            "backlog": {"counts": {"discussion": 1, "planning": 0, "decision": 0}, "lanes": {}}
+        }
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            thread.start()
+            with urlopen(f"http://127.0.0.1:{server.server_port}/api/backlog", timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn('"discussion": 1', body)
+        finally:
+            dashboard_server.get_dashboard_data = original_get_dashboard_data
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_backlog_create_route_requires_token_and_accepts_authorized_request(self):
+        import dashboard_server
+
+        original_create = dashboard_server.create_dashboard_backlog_item
+        calls = []
+
+        def fake_create(**kwargs):
+            calls.append(kwargs)
+            return {"status": "ok", "message": "Added.", "data": {"item": {"id": "item-1"}}}
+
+        dashboard_server.create_dashboard_backlog_item = fake_create
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}/api/backlog/items"
+            unauthorized = Request(url, data=b'{}', headers={"Content-Type": "application/json"}, method="POST")
+            with self.assertRaises(HTTPError) as rejected:
+                urlopen(unauthorized, timeout=5)
+            self.assertEqual(rejected.exception.code, 403)
+            rejected.exception.close()
+
+            authorized = Request(
+                url,
+                data=b'{"kind":"discussion","title":"Birthday","owner":"mom"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(authorized, timeout=5) as response:
+                response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(calls[0]["kind"], "discussion")
+            self.assertEqual(calls[0]["title"], "Birthday")
+        finally:
+            dashboard_server.create_dashboard_backlog_item = original_create
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_backlog_action_route_requires_token_and_uses_closed_action_code(self):
+        import dashboard_server
+
+        original_action = dashboard_server.perform_dashboard_backlog_action
+        calls = []
+
+        def fake_action(**kwargs):
+            calls.append(kwargs)
+            return {"status": "ok", "message": "Pinned.", "data": {}}
+
+        dashboard_server.perform_dashboard_backlog_action = fake_action
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}/api/backlog/actions"
+            unauthorized = Request(url, data=b'{}', headers={"Content-Type": "application/json"}, method="POST")
+            with self.assertRaises(HTTPError) as rejected:
+                urlopen(unauthorized, timeout=5)
+            self.assertEqual(rejected.exception.code, 403)
+            rejected.exception.close()
+
+            authorized = Request(
+                url,
+                data=b'{"action":"pin","item_id":"item-1","pinned":true}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(authorized, timeout=5) as response:
+                response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(calls[0]["action"], "pin")
+            self.assertEqual(calls[0]["item_id"], "item-1")
+        finally:
+            dashboard_server.perform_dashboard_backlog_action = original_action
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
@@ -784,6 +1286,30 @@ class DashboardServerRouteTest(unittest.TestCase):
                 body = response.read().decode("utf-8")
             self.assertEqual(response.status, 200)
             self.assertIn("Summer camp plan", body)
+        finally:
+            dashboard_server.get_dashboard_data = original_get_dashboard_data
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_shopping_api_route_returns_lists(self):
+        import dashboard_server
+
+        original_get_dashboard_data = dashboard_server.get_dashboard_data
+
+        def fake_dashboard_data():
+            return {"shopping": {"pending": [{"title": "paneer"}], "by_list": []}}
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.get_dashboard_data = fake_dashboard_data
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            with urlopen(base_url + "/api/shopping", timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("paneer", body)
         finally:
             dashboard_server.get_dashboard_data = original_get_dashboard_data
             server.shutdown()
@@ -826,6 +1352,208 @@ class DashboardServerRouteTest(unittest.TestCase):
             self.assertEqual(calls, [{"task_id": "task-1", "task_list_id": None}])
         finally:
             dashboard_server.complete_dashboard_task = original_complete_dashboard_task
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_shopping_check_api_route_checks_item(self):
+        import dashboard_server
+
+        original_complete_dashboard_shopping_item = dashboard_server.complete_dashboard_shopping_item
+        calls = []
+
+        def fake_complete_dashboard_shopping_item(item_id=None, list_slug=None):
+            calls.append({"item_id": item_id, "list_slug": list_slug})
+            return {
+                "status": "ok",
+                "message": "Shopping item checked off.",
+                "data": {"item": {"id": item_id, "checked": True}},
+            }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.complete_dashboard_shopping_item = fake_complete_dashboard_shopping_item
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            request = Request(
+                base_url + "/api/shopping/items/check",
+                data=b'{"item_id":"item-1","list_slug":"costco"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("Shopping item checked off", body)
+            self.assertEqual(calls, [{"item_id": "item-1", "list_slug": "costco"}])
+        finally:
+            dashboard_server.complete_dashboard_shopping_item = original_complete_dashboard_shopping_item
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_shopping_clear_api_route_clears_list(self):
+        import dashboard_server
+
+        original_clear_dashboard_shopping_list = dashboard_server.clear_dashboard_shopping_list
+        calls = []
+
+        def fake_clear_dashboard_shopping_list(list_slug=None):
+            calls.append({"list_slug": list_slug})
+            return {
+                "status": "ok",
+                "message": "Cleared 2 pending item(s).",
+                "data": {"items": []},
+            }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.clear_dashboard_shopping_list = fake_clear_dashboard_shopping_list
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            request = Request(
+                base_url + "/api/shopping/lists/clear",
+                data=b'{"list_slug":"indian"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("Cleared 2 pending", body)
+            self.assertEqual(calls, [{"list_slug": "indian"}])
+        finally:
+            dashboard_server.clear_dashboard_shopping_list = original_clear_dashboard_shopping_list
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_library_reading_update_api_route_updates_event(self):
+        import dashboard_server
+
+        original_update_dashboard_reading_event = dashboard_server.update_dashboard_reading_event
+        calls = []
+
+        def fake_update_dashboard_reading_event(event_id=None, **kwargs):
+            calls.append({"event_id": event_id, **kwargs})
+            return {
+                "status": "ok",
+                "message": "Updated reading moment.",
+                "data": {"event": {"id": event_id, "book": kwargs.get("book")}},
+            }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.update_dashboard_reading_event = fake_update_dashboard_reading_event
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            request = Request(
+                base_url + "/api/library/reading/update",
+                data=b'{"event_id":"event-1","book":"Frog and Toad","pages":12}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("Updated reading moment", body)
+            self.assertEqual(calls[0]["event_id"], "event-1")
+            self.assertEqual(calls[0]["book"], "Frog and Toad")
+            self.assertEqual(calls[0]["pages"], 12)
+        finally:
+            dashboard_server.update_dashboard_reading_event = original_update_dashboard_reading_event
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_library_reading_delete_api_route_deletes_event(self):
+        import dashboard_server
+
+        original_delete_dashboard_reading_event = dashboard_server.delete_dashboard_reading_event
+        calls = []
+
+        def fake_delete_dashboard_reading_event(event_id=None):
+            calls.append({"event_id": event_id})
+            return {
+                "status": "ok",
+                "message": "Deleted reading moment.",
+                "data": {"event": {"id": event_id}},
+            }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.delete_dashboard_reading_event = fake_delete_dashboard_reading_event
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            request = Request(
+                base_url + "/api/library/reading/delete",
+                data=b'{"event_id":"event-1"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("Deleted reading moment", body)
+            self.assertEqual(calls, [{"event_id": "event-1"}])
+        finally:
+            dashboard_server.delete_dashboard_reading_event = original_delete_dashboard_reading_event
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_decisions_complete_api_route_marks_decision_done(self):
+        import dashboard_server
+
+        original_complete_dashboard_decision = dashboard_server.complete_dashboard_decision
+        calls = []
+
+        def fake_complete_dashboard_decision(decision_id=None, outcome=None):
+            calls.append({"decision_id": decision_id, "outcome": outcome})
+            return {
+                "status": "ok",
+                "message": "Family decision recorded.",
+                "data": {"decision": {"id": decision_id, "status": "decided"}},
+            }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.complete_dashboard_decision = fake_complete_dashboard_decision
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            request = Request(
+                base_url + "/api/decisions/complete",
+                data=b'{"decision_id":"decision-1"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(request, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("Family decision recorded", body)
+            self.assertEqual(calls, [{"decision_id": "decision-1", "outcome": None}])
+        finally:
+            dashboard_server.complete_dashboard_decision = original_complete_dashboard_decision
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)

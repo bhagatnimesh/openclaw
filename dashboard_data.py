@@ -9,9 +9,19 @@ from dashboard_sources import (
     DEFAULT_TIMEZONE,
     DashboardSources,
     build_default_home_board_tools,
+    build_default_shopping_tools,
     default_sources,
     fallback_recommend_task_matches,
 )
+
+
+SHOPPING_LIST_LABELS = {
+    "indian": "Indian",
+    "costco": "Costco",
+    "whole-foods": "Whole Foods",
+    "amazon": "Amazon",
+    "others": "Others",
+}
 
 
 def _local_now(now: datetime | None = None) -> datetime:
@@ -555,6 +565,197 @@ def _normalize_decision(decision: dict[str, Any], today: date) -> dict[str, Any]
     }
 
 
+def _normalize_backlog_item(
+    item: dict[str, Any],
+    today: date,
+    events_by_id: dict[str, dict[str, Any]],
+    tasks_by_id: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    kind = _clean_text(item.get("kind"), "discussion").lower()
+    target_date = _parse_date(item.get("review_on") if kind == "discussion" else item.get("due"))
+    days_until = (target_date - today).days if target_date is not None else None
+    updated_on = _parse_date(_clean_text(item.get("updated_at")))
+    stale = kind == "discussion" and updated_on is not None and (today - updated_on).days >= 14
+    links = []
+    completed_tasks = 0
+    task_links = 0
+    missing_sources = []
+    for link in item.get("links") or []:
+        source_type = _clean_text(link.get("source_type"))
+        external_id = _clean_text(link.get("external_id"))
+        container_id = _clean_text(link.get("container_id"), "@default")
+        source = None
+        if source_type == "calendar_event":
+            source = events_by_id.get(external_id)
+        elif source_type == "google_task":
+            task_links += 1
+            source = tasks_by_id.get((container_id, external_id)) or tasks_by_id.get(("@default", external_id))
+            if source and source.get("status") == "completed":
+                completed_tasks += 1
+        if source is None:
+            missing_sources.append(_clean_text(link.get("title"), external_id))
+        links.append(
+            {
+                "id": _clean_text(link.get("id")),
+                "source_type": source_type,
+                "external_id": external_id,
+                "container_id": container_id,
+                "title": _clean_text(link.get("title") or (source or {}).get("title"), external_id),
+                "available": source is not None,
+                "completed": bool(source and source.get("status") == "completed"),
+            },
+        )
+
+    status = _clean_text(item.get("status"), "open")
+    blocked = status == "blocked" or bool(missing_sources)
+    ready_to_close = kind == "planning" and (
+        (task_links > 0 and completed_tasks == task_links)
+        or (target_date is not None and days_until is not None and days_until < 0)
+    )
+    notes = item.get("notes") or []
+    positions = item.get("positions") or []
+    options = item.get("options") or []
+    evidence = item.get("evidence") or []
+    open_steps = [step for step in item.get("next_steps") or [] if step.get("status") == "open"]
+    missing_fields = []
+    if kind == "decision":
+        if _clean_text(item.get("owner"), "unknown") == "unknown":
+            missing_fields.append("owner")
+        if not item.get("due"):
+            missing_fields.append("timeline")
+        if not options:
+            missing_fields.append("options")
+        if not open_steps:
+            missing_fields.append("next step")
+    has_calendar_link = any(link["source_type"] == "calendar_event" for link in links)
+    incomplete = bool(missing_fields) or (
+        kind == "planning" and (target_date is None or not has_calendar_link)
+    )
+    owner = _clean_text(item.get("owner"), "unknown")
+    if days_until is None:
+        date_label = "Needs review date" if kind == "discussion" else "Needs date"
+    elif days_until < 0:
+        date_label = f"{abs(days_until)}d overdue"
+    elif days_until == 0:
+        date_label = "Today"
+    elif days_until == 1:
+        date_label = "Tomorrow"
+    else:
+        date_label = f"In {days_until}d"
+    return {
+        "id": _clean_text(item.get("id")),
+        "short_id": _clean_text(item.get("id"))[:8],
+        "kind": kind,
+        "title": _clean_text(item.get("title"), "Untitled item"),
+        "context": _clean_text(item.get("context")),
+        "status": status,
+        "owner": owner,
+        "owner_label": "Unassigned" if owner == "unknown" else owner.title(),
+        "urgency": _clean_text(item.get("urgency"), "normal"),
+        "size": _clean_text(item.get("size"), "small"),
+        "priority": int(item.get("priority") or 0),
+        "pinned": bool(item.get("pinned")),
+        "review_on": _clean_text(item.get("review_on")),
+        "due": _clean_text(item.get("due")),
+        "date_label": date_label,
+        "due_label": date_label,
+        "days_until": days_until,
+        "stale": stale,
+        "blocked": blocked,
+        "incomplete": incomplete,
+        "ready_to_close": ready_to_close,
+        "notes": notes,
+        "positions": positions,
+        "links": links,
+        "missing_sources": missing_sources,
+        "option_count": len(options),
+        "evidence_count": len(evidence),
+        "next_step": _clean_text(
+            (open_steps[0] if open_steps else {}).get("text"),
+            "Assign one clear next step" if kind == "decision" else "",
+        ),
+        "next_step_owner": _clean_text((open_steps[0] if open_steps else {}).get("owner"), "unknown"),
+        "next_step_due": _clean_text((open_steps[0] if open_steps else {}).get("due")),
+        "missing_fields": missing_fields,
+        "outcome": _clean_text(item.get("outcome")),
+        "updated_at": _clean_text(item.get("updated_at")),
+        "tracked": True,
+    }
+
+
+def _backlog_priority_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    days = item.get("days_until")
+    due_attention = days is not None and days <= 7
+    urgency = {"critical": 0, "high": 1, "normal": 2, "low": 3}.get(item["urgency"], 2)
+    return (
+        not item["pinned"],
+        not due_attention,
+        urgency,
+        not item["blocked"],
+        not item["incomplete"],
+        not item["stale"],
+        days is None,
+        days if days is not None else 10_000,
+        -item["priority"],
+        item["title"].lower(),
+    )
+
+
+def _family_backlog(
+    sources: DashboardSources,
+    today: date,
+    events: list[dict[str, Any]],
+    all_tasks: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    empty_lanes = {"discussion": [], "planning": [], "decision": []}
+    tools = getattr(sources, "decision_tools", None)
+    if tools is None:
+        return {"counts": {kind: 0 for kind in empty_lanes}, "attention": [], "lanes": empty_lanes}, []
+    try:
+        if hasattr(tools, "list_backlog_items"):
+            response = tools.list_backlog_items()
+            raw_items = response.get("data", {}).get("items") or []
+        else:
+            response = tools.list_decisions(include_decided=False)
+            raw_items = [{**item, "kind": "decision"} for item in response.get("data", {}).get("decisions") or []]
+    except Exception as error:
+        return {"counts": {kind: 0 for kind in empty_lanes}, "attention": [], "lanes": empty_lanes}, [
+            f"Backlog source unavailable: {error.__class__.__name__}.",
+        ]
+    if response.get("status") != "ok":
+        return {"counts": {kind: 0 for kind in empty_lanes}, "attention": [], "lanes": empty_lanes}, [
+            response.get("message", "Backlog source unavailable."),
+        ]
+
+    events_by_id = {event["id"]: event for event in events}
+    tasks_by_id = {
+        (_clean_text(task.get("task_list_id"), "@default"), task["id"]): task
+        for task in all_tasks
+    }
+    lanes = {kind: [] for kind in empty_lanes}
+    for raw_item in raw_items:
+        item = _normalize_backlog_item(raw_item, today, events_by_id, tasks_by_id)
+        if item["kind"] in lanes:
+            lanes[item["kind"]].append(item)
+    for lane in lanes.values():
+        lane.sort(key=_backlog_priority_key)
+    all_items = [item for kind in ("discussion", "planning", "decision") for item in lanes[kind]]
+    attention = [
+        item for item in sorted(all_items, key=_backlog_priority_key)
+        if item["pinned"] or item["blocked"] or item["stale"] or (item["days_until"] is not None and item["days_until"] <= 0)
+    ][:5]
+    return {
+        "counts": {kind: len(items) for kind, items in lanes.items()},
+        "attention": attention,
+        "review": {
+            "available": True,
+            "callout": today.weekday() in {0, 6},
+            "item_ids": [item["id"] for item in sorted(all_items, key=_backlog_priority_key)],
+        },
+        "lanes": lanes,
+    }, []
+
+
 def _open_decisions(
     sources: DashboardSources,
     today: date,
@@ -790,6 +991,7 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "unassigned_count": 0,
             "home_board_count": 0,
             "open_decision_count": 0,
+            "shopping_count": 0,
         },
         "best_next_action": {
             "title": "No dashboard data yet",
@@ -817,8 +1019,15 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "pending": [],
         },
         "planning": {"items": []},
+        "backlog": {
+            "counts": {"discussion": 0, "planning": 0, "decision": 0},
+            "attention": [],
+            "review": {"available": True, "callout": now.weekday() in {0, 6}, "item_ids": []},
+            "lanes": {"discussion": [], "planning": [], "decision": []},
+        },
         "home_board": {"today": []},
         "decisions": {"open": [], "attention": []},
+        "shopping": {"lists": [], "pending": [], "by_list": []},
         "reading_garden": _empty_reading_garden(now.date()),
         "family": {
             "members": [],
@@ -831,27 +1040,60 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
 
 
 def _empty_reading_garden(today: date) -> dict[str, Any]:
-    del today
+    def child_empty(child: str) -> dict[str, Any]:
+        return {
+            "title": f"{child}'s Reading Garden",
+            "child": child,
+            "today": {"read": False, "label": "Not yet today"},
+            "current_book": "unknown book",
+            "week": {"reading_moments": 0, "reading_days": 0, "pages": 0, "minutes": 0},
+            "weekly_goal": {
+                "target_days": 5,
+                "reading_days": 0,
+                "remaining_days": 5,
+                "progress": 0,
+                "percent": 0,
+                "label": "0 of 5 reading days",
+            },
+            "streaks": {"current": 0, "best": 0, "grace_days": 1},
+            "finished": {"count": 0, "recent_books": []},
+            "favorite_reaction": "",
+            "recent_photos": [],
+            "garden": {"sprouts": 0, "leaves": 0, "flowers": 0, "butterflies": 0},
+            "badges": [],
+            "history": {
+                "heatmap": [],
+                "monthly": {
+                    "reading_days": 0,
+                    "moments": 0,
+                    "pages": 0,
+                    "minutes": 0,
+                    "finished_books": 0,
+                },
+            },
+            "book_collection": [],
+            "recent_events": [],
+            "library_visit": {
+                "has_visit": False,
+                "last_visit_date": "",
+                "days_since_visit": None,
+                "state": "empty",
+                "label": "Paste a library checkout email to start your library bag.",
+                "due_date": "",
+            },
+            "current_bag": {"count": 0, "titles": [], "due_date": ""},
+        }
+
+    by_child = {child: child_empty(child) for child in ("Nysha", "Navya")}
+    family = child_empty("Family")
     return {
-        "title": "Nysha’s Reading Garden: I Read It Myself",
-        "child": "Nysha",
+        **by_child["Nysha"],
+        "title": "Reading Garden",
         "today": {"read": False, "label": "Not yet today"},
-        "current_book": "unknown book",
-        "week": {"reading_moments": 0, "pages": 0, "minutes": 0},
-        "finished": {"count": 0, "recent_books": []},
-        "favorite_reaction": "",
-        "recent_photos": [],
-        "garden": {"sprouts": 0, "leaves": 0, "flowers": 0, "butterflies": 0},
-        "recent_events": [],
-        "library_visit": {
-            "has_visit": False,
-            "last_visit_date": "",
-            "days_since_visit": None,
-            "state": "empty",
-            "label": "Paste a library checkout email to start your library bag.",
-            "due_date": "",
-        },
-        "current_bag": {"count": 0, "titles": [], "due_date": ""},
+        "children": ["Nysha", "Navya"],
+        "by_child": by_child,
+        "family": family,
+        "selected_child": "Nysha",
     }
 
 
@@ -878,6 +1120,76 @@ def _reading_garden_summary(
     return summary, []
 
 
+def _normalize_shopping_item(item: dict[str, Any], list_slug: str, list_name: str) -> dict[str, Any]:
+    title = _clean_text(item.get("title") or item.get("name") or item.get("item"), "Untitled item")
+    return {
+        "id": _clean_text(item.get("id") or item.get("item_id")),
+        "title": title,
+        "quantity": _clean_text(item.get("quantity")),
+        "note": _clean_text(item.get("note")),
+        "category": _clean_text(item.get("category")),
+        "checked": bool(item.get("checked") or item.get("completed") or item.get("is_checked")),
+        "list_slug": _clean_text(item.get("list_slug"), list_slug),
+        "list_name": list_name,
+        "updated_at": _clean_text(item.get("updated_at")),
+    }
+
+
+def _shopping_lists(sources: DashboardSources) -> tuple[dict[str, Any], list[str]]:
+    tools = getattr(sources, "shopping_tools", None)
+    empty = {"lists": [], "pending": [], "by_list": []}
+    if tools is None:
+        return empty, []
+
+    try:
+        list_response = tools.list_shopping_lists()
+    except Exception as error:
+        return empty, [f"Shopping source unavailable: {error.__class__.__name__}."]
+
+    if list_response.get("status") != "ok":
+        return empty, [list_response.get("message", "Shopping source unavailable.")]
+
+    configured_lists = []
+    seen_slugs = set()
+    for row in list_response.get("data", {}).get("lists") or []:
+        slug = _clean_text(row.get("slug") or row.get("id"))
+        if not slug or slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        configured_lists.append(
+            {
+                "slug": slug,
+                "name": _clean_text(row.get("name"), SHOPPING_LIST_LABELS.get(slug, slug)),
+            },
+        )
+    for slug, label in SHOPPING_LIST_LABELS.items():
+        if slug not in seen_slugs:
+            configured_lists.append({"slug": slug, "name": label})
+
+    by_list = []
+    pending = []
+    warnings = []
+    for shopping_list in configured_lists:
+        slug = shopping_list["slug"]
+        name = shopping_list["name"]
+        try:
+            items_response = tools.list_items(slug, include_checked=False)
+        except Exception as error:
+            warnings.append(f"{name} shopping list unavailable: {error.__class__.__name__}.")
+            continue
+        if items_response.get("status") != "ok":
+            warnings.append(items_response.get("message", f"{name} shopping list unavailable."))
+            continue
+        items = [
+            _normalize_shopping_item(item, slug, name)
+            for item in items_response.get("data", {}).get("items") or []
+        ]
+        by_list.append({**shopping_list, "items": items, "pending_count": len(items)})
+        pending.extend(items)
+
+    return {"lists": configured_lists, "pending": pending, "by_list": by_list}, warnings
+
+
 def build_dashboard_data(
     sources: DashboardSources,
     now: datetime | None = None,
@@ -901,7 +1213,7 @@ def build_dashboard_data(
         calendar_response = _source_error_response("Calendar", error)
 
     try:
-        task_response = sources.task_tools.list_tasks(show_completed=False)
+        task_response = sources.task_tools.list_tasks(show_completed=True)
     except Exception as error:
         task_response = _source_error_response("Tasks", error)
 
@@ -916,6 +1228,8 @@ def build_dashboard_data(
         local_now.date(),
     )
     source_warnings.extend(decision_warnings)
+    shopping, shopping_warnings = _shopping_lists(sources)
+    source_warnings.extend(shopping_warnings)
     reading_garden, reading_warnings = _reading_garden_summary(sources, local_now)
     source_warnings.extend(reading_warnings)
 
@@ -940,14 +1254,15 @@ def build_dashboard_data(
         for event in raw_events
     ]
     events.sort(key=lambda event: event["_start_dt"])
-    tasks = [
+    all_tasks = [
         {
             **_normalize_task(task, sources.read_task_metadata, local_now.date()),
+            "task_list_id": _clean_text(task.get("task_list_id"), "@default"),
             "raw": task,
         }
         for task in raw_tasks
-        if task.get("status") != "completed"
     ]
+    tasks = [task for task in all_tasks if task["status"] != "completed"]
     tasks.sort(key=_task_priority_key)
 
     today_events = [event for event in events if _event_overlaps(event, today_start, tomorrow_start)]
@@ -1013,7 +1328,23 @@ def build_dashboard_data(
     )
 
     family = _family_awareness(today_events, tasks)
-    planning_items = _planning_items(events, tasks, local_now.date())
+    backlog, backlog_warnings = _family_backlog(
+        sources,
+        local_now.date(),
+        events,
+        all_tasks,
+    )
+    source_warnings.extend(backlog_warnings)
+    warnings.extend(
+        {"level": "info", "title": "Source warning", "detail": warning}
+        for warning in backlog_warnings
+    )
+    planning_suggestions = _planning_items(events, tasks, local_now.date())
+    planning_items = [
+        *backlog["lanes"]["planning"],
+        *[{**item, "tracked": False} for item in planning_suggestions],
+    ]
+    open_decisions = backlog["lanes"]["decision"]
     unassigned_count = len(family["unassigned"])
     attention_decisions = [
         decision for decision in open_decisions
@@ -1036,6 +1367,7 @@ def build_dashboard_data(
             "unassigned_count": unassigned_count,
             "home_board_count": len(home_board_items),
             "open_decision_count": len(open_decisions),
+            "shopping_count": len(shopping["pending"]),
         },
         "best_next_action": best_next_action,
         "warnings": warnings[:8],
@@ -1064,11 +1396,13 @@ def build_dashboard_data(
             "open_loops": [_public_task(task) for task in open_loops],
         },
         "planning": {"items": planning_items},
+        "backlog": backlog,
         "home_board": {"today": home_board_items},
         "decisions": {
             "open": open_decisions[:12],
             "attention": attention_decisions,
         },
+        "shopping": shopping,
         "reading_garden": reading_garden,
         "family": {
             "members": family["members"],
@@ -1097,6 +1431,7 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
                 recommend_task_matches=lambda tasks, filters, limit: [],
                 home_board_tools=build_default_home_board_tools(),
                 decision_tools=None,
+                shopping_tools=build_default_shopping_tools(),
                 reading_garden_tools=None,
             )
             items, warnings = _home_board_today(
@@ -1104,16 +1439,145 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
                 local_now.date(),
                 local_now,
             )
+            shopping, shopping_warnings = _shopping_lists(home_board_sources)
         except Exception:
             return data
 
         data["home_board"]["today"] = items
         data["summary"]["home_board_count"] = len(items)
+        data["shopping"] = shopping
+        data["summary"]["shopping_count"] = len(shopping["pending"])
         data["warnings"].extend(
             {"level": "info", "title": "Source warning", "detail": warning}
-            for warning in warnings
+            for warning in [*warnings, *shopping_warnings]
         )
         return data
+
+
+def create_dashboard_backlog_item(
+    *,
+    kind: str | None,
+    title: str | None,
+    owner: str | None = None,
+    priority: int | None = None,
+    date_value: str | None = None,
+    sources: DashboardSources | None = None,
+) -> dict[str, Any]:
+    cleaned_kind = _clean_text(kind).lower()
+    cleaned_title = _clean_text(title)
+    if cleaned_kind not in {"discussion", "planning", "decision"} or not cleaned_title:
+        missing = []
+        if cleaned_kind not in {"discussion", "planning", "decision"}:
+            missing.append("kind")
+        if not cleaned_title:
+            missing.append("title")
+        return {
+            "status": "error",
+            "message": "Missing or invalid backlog information: " + ", ".join(missing) + ".",
+            "data": {"missing_fields": missing},
+        }
+    tools = (sources or default_sources()).decision_tools
+    kwargs: dict[str, Any] = {
+        "kind": cleaned_kind,
+        "title": cleaned_title,
+        "owner": _clean_text(owner, "unknown").lower(),
+        "priority": priority or 0,
+        "actor": "family dashboard",
+    }
+    if cleaned_kind == "discussion":
+        kwargs["review_on"] = _clean_text(date_value) or None
+    else:
+        kwargs["due"] = _clean_text(date_value) or None
+    try:
+        return tools.create_backlog_item(**kwargs)
+    except Exception as error:
+        return _source_error_response("Backlog", error)
+
+
+def perform_dashboard_backlog_action(
+    *,
+    action: str | None,
+    item_id: str | None,
+    payload: dict[str, Any] | None = None,
+    sources: DashboardSources | None = None,
+) -> dict[str, Any]:
+    action_code = _clean_text(action).lower()
+    cleaned_item_id = _clean_text(item_id)
+    valid_actions = {
+        "edit",
+        "add_note",
+        "set_position",
+        "move",
+        "pin",
+        "park",
+        "link_event",
+        "link_task",
+        "close",
+    }
+    missing = []
+    if action_code not in valid_actions:
+        missing.append("action")
+    if not cleaned_item_id:
+        missing.append("item_id")
+    if missing:
+        return {
+            "status": "error",
+            "message": "Missing or invalid backlog action information: " + ", ".join(missing) + ".",
+            "data": {"missing_fields": missing},
+        }
+    values = payload if isinstance(payload, dict) else {}
+    tools = (sources or default_sources()).decision_tools
+    actor = "family dashboard"
+    try:
+        if action_code == "edit":
+            allowed = {key: values[key] for key in ("title", "context", "owner", "urgency", "review_on", "due", "priority") if key in values}
+            return tools.update_backlog_item(cleaned_item_id, actor=actor, **allowed)
+        if action_code == "add_note":
+            return tools.add_backlog_note(cleaned_item_id, values.get("text"), actor=actor)
+        if action_code == "set_position":
+            return tools.set_backlog_position(cleaned_item_id, values.get("value"), actor=actor)
+        if action_code == "move":
+            if values.get("confirmed") is not True:
+                return {
+                    "status": "needs_confirmation",
+                    "message": "Confirm moving this backlog item.",
+                    "data": {"item_id": cleaned_item_id, "action": "move"},
+                }
+            return tools.move_backlog_item(cleaned_item_id, values.get("kind"), confirmed=True, actor=actor)
+        if action_code == "pin":
+            return tools.update_backlog_item(cleaned_item_id, pinned=bool(values.get("pinned")), actor=actor)
+        if action_code == "park":
+            return tools.park_backlog_item(cleaned_item_id, actor=actor)
+        if action_code in {"link_event", "link_task"}:
+            return tools.link_backlog_item(
+                cleaned_item_id,
+                source_type="calendar_event" if action_code == "link_event" else "google_task",
+                external_id=values.get("external_id"),
+                container_id=values.get("container_id"),
+                title=values.get("title"),
+                actor=actor,
+            )
+        if values.get("confirmed") is not True:
+            return {
+                "status": "needs_confirmation",
+                "message": "Confirm closing this backlog item.",
+                "data": {"item_id": cleaned_item_id, "action": "close"},
+            }
+        return tools.close_backlog_item(
+            cleaned_item_id,
+            values.get("outcome"),
+            rationale=values.get("rationale"),
+            confirmed=True,
+            actor=actor,
+        )
+    except (TypeError, ValueError) as error:
+        return {
+            "status": "error",
+            "message": f"Invalid backlog action: {error}",
+            "data": {"error_type": error.__class__.__name__},
+        }
+    except Exception as error:
+        return _source_error_response("Backlog", error)
 
 
 def complete_dashboard_task(
@@ -1164,3 +1628,159 @@ def complete_dashboard_task(
             "task": _public_task(normalized_task),
         },
     }
+
+
+def complete_dashboard_decision(
+    decision_id: str | None,
+    outcome: str | None = None,
+    sources: DashboardSources | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    cleaned_decision_id = _clean_text(decision_id)
+    if not cleaned_decision_id:
+        return {
+            "status": "error",
+            "message": "Missing required decision information: decision_id.",
+            "data": {"missing_fields": ["decision_id"]},
+        }
+
+    active_sources = sources or default_sources()
+    tools = active_sources.decision_tools
+    cleaned_outcome = _clean_text(outcome, "Marked done from dashboard.")
+
+    try:
+        response = tools.decide(cleaned_decision_id, cleaned_outcome)
+    except Exception as error:
+        return _source_error_response("Decisions", error)
+
+    if response.get("status") != "ok":
+        return response
+
+    raw_decision = response.get("data", {}).get("decision")
+    if not isinstance(raw_decision, dict):
+        return response
+
+    normalized_decision = _normalize_decision(raw_decision, _local_now(now).date())
+    return {
+        **response,
+        "data": {
+            **response.get("data", {}),
+            "decision": normalized_decision,
+        },
+    }
+
+
+def complete_dashboard_shopping_item(
+    item_id: str | None,
+    list_slug: str | None = None,
+    sources: DashboardSources | None = None,
+) -> dict[str, Any]:
+    cleaned_item_id = _clean_text(item_id)
+    if not cleaned_item_id:
+        return {
+            "status": "error",
+            "message": "Missing required shopping information: item_id.",
+            "data": {"missing_fields": ["item_id"]},
+        }
+
+    active_sources = sources or default_sources()
+    tools = active_sources.shopping_tools
+    try:
+        return tools.set_checked_by_id(
+            item_id=cleaned_item_id,
+            checked=True,
+            list_slug=_clean_text(list_slug) or None,
+        )
+    except Exception as error:
+        return _source_error_response("Shopping", error)
+
+
+def update_dashboard_reading_event(
+    event_id: str | None,
+    *,
+    child: str | None = None,
+    date: str | None = None,
+    book: str | None = None,
+    minutes: int | None = None,
+    pages: int | None = None,
+    reaction: str | None = None,
+    status: str | None = None,
+    reading_mode: str | None = None,
+    clear_minutes: bool = False,
+    clear_pages: bool = False,
+    clear_reaction: bool = False,
+    sources: DashboardSources | None = None,
+) -> dict[str, Any]:
+    cleaned_event_id = _clean_text(event_id)
+    if not cleaned_event_id:
+        return {
+            "status": "error",
+            "message": "Missing required reading information: event_id.",
+            "data": {"missing_fields": ["event_id"]},
+        }
+
+    active_sources = sources or default_sources()
+    tools = active_sources.reading_garden_tools
+    if tools is None:
+        return _source_error_response("Reading Garden", RuntimeError("unavailable"))
+
+    try:
+        return tools.update_reading(
+            event_id=cleaned_event_id,
+            child=_clean_text(child) or None,
+            date=_clean_text(date) or None,
+            book=_clean_text(book) or None,
+            minutes=minutes,
+            pages=pages,
+            reaction=_clean_text(reaction) or None,
+            status=_clean_text(status) or None,
+            reading_mode=_clean_text(reading_mode) or None,
+            clear_minutes=clear_minutes,
+            clear_pages=clear_pages,
+            clear_reaction=clear_reaction,
+        )
+    except Exception as error:
+        return _source_error_response("Reading Garden", error)
+
+
+def delete_dashboard_reading_event(
+    event_id: str | None,
+    sources: DashboardSources | None = None,
+) -> dict[str, Any]:
+    cleaned_event_id = _clean_text(event_id)
+    if not cleaned_event_id:
+        return {
+            "status": "error",
+            "message": "Missing required reading information: event_id.",
+            "data": {"missing_fields": ["event_id"]},
+        }
+
+    active_sources = sources or default_sources()
+    tools = active_sources.reading_garden_tools
+    if tools is None:
+        return _source_error_response("Reading Garden", RuntimeError("unavailable"))
+
+    try:
+        return tools.delete_reading(event_id=cleaned_event_id)
+    except Exception as error:
+        return _source_error_response("Reading Garden", error)
+
+
+def clear_dashboard_shopping_list(
+    list_slug: str | None,
+    sources: DashboardSources | None = None,
+) -> dict[str, Any]:
+    cleaned_list_slug = _clean_text(list_slug)
+    if not cleaned_list_slug:
+        return {
+            "status": "error",
+            "message": "Missing required shopping information: list_name.",
+            "data": {"missing_fields": ["list_name"]},
+        }
+
+    active_sources = sources or default_sources()
+    tools = active_sources.shopping_tools
+    try:
+        return tools.clear_list(cleaned_list_slug)
+    except Exception as error:
+        return _source_error_response("Shopping", error)

@@ -73,7 +73,7 @@ REMEMBER_TO_RE = re.compile(
     re.IGNORECASE,
 )
 SLASH_COMMAND_RE = re.compile(
-    r"^\s*/(?P<command>calendar|calender|event|schedule|tasks?|todos?|decisions?)"
+    r"^\s*/(?P<command>calendar|calender|calnedar|event|schedule|tasks?|todos?|decisions?)"
     r"(?:@[A-Za-z0-9_]+)?"
     r"(?:\s+|:\s*)?(?P<body>.*)$",
     re.IGNORECASE,
@@ -101,8 +101,10 @@ FUZZY_DATE_VOCABULARY = {
 
 PHRASE_REPAIRS = (
     (re.compile(r"\bcalender\b", re.IGNORECASE), "calendar"),
+    (re.compile(r"\bcalnedar\b", re.IGNORECASE), "calendar"),
     (re.compile(r"\bscheduel\b", re.IGNORECASE), "schedule"),
     (re.compile(r"\bevetn\b", re.IGNORECASE), "event"),
+    (re.compile(r"\bupocming\b", re.IGNORECASE), "upcoming"),
     (re.compile(r"\bFebuary\b", re.IGNORECASE), "February"),
     (re.compile(r"\bSeptemeber\b", re.IGNORECASE), "September"),
     (re.compile(r"\bdecision\s+(?:bried|breif|brif)\b", re.IGNORECASE), "decision brief"),
@@ -111,9 +113,12 @@ PHRASE_REPAIRS = (
     (re.compile(r"\bhome\s+bored\b", re.IGNORECASE), "home board"),
     (re.compile(r"\bhouse\s+bored\b", re.IGNORECASE), "home board"),
     (re.compile(r"\bhomeboard\b", re.IGNORECASE), "home board"),
+    (re.compile(r"\bNysha;s\b", re.IGNORECASE), "Nysha's"),
     (re.compile(r"\bNyshas\s+School\b", re.IGNORECASE), "Nysha's school"),
     (re.compile(r"\bNyshas\b", re.IGNORECASE), "Nysha's"),
     (re.compile(r"\bNisha\b", re.IGNORECASE), "Nysha"),
+    (re.compile(r"\bNsyha'(?=\s|$)", re.IGNORECASE), "Nysha's"),
+    (re.compile(r"\bNsyha\b", re.IGNORECASE), "Nysha"),
     (re.compile(r"\bNyshad\b", re.IGNORECASE), "Nysha"),
     (re.compile(r"\bNaavya\b", re.IGNORECASE), "Navya"),
     (re.compile(r"\bNiyaati\b", re.IGNORECASE), "Niyati"),
@@ -177,7 +182,9 @@ def _normalize_slash_command(text: str) -> str:
     command = match.group("command").lower()
     body = match.group("body").strip()
     body_without_action = LEADING_ACTION_RE.sub("", body, count=1).strip()
-    if command in ("calendar", "calender", "event", "schedule"):
+    if command in ("calendar", "calender", "calnedar", "event", "schedule"):
+        if _is_calendar_read_body(body):
+            return f"show calendar {body}".strip()
         suffix = body_without_action or body
         return f"add event {suffix}".strip()
     if command in ("task", "tasks", "todo", "todos"):
@@ -189,6 +196,17 @@ def _normalize_slash_command(text: str) -> str:
         suffix = body or "list pending decisions"
         return f"{command} {suffix}".strip()
     return text
+
+
+def _is_calendar_read_body(body: str) -> bool:
+    return bool(
+        re.search(
+            r"^\s*(?:when|what|what's|whats|show|list|view|find|search|lookup|look\s+up)\b|"
+            r"\b(?:upcoming|upocming|coming\s+up|holidays?|break|vacation|no\s+school)\b",
+            body,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _normalize_task_list_body(body: str) -> str:

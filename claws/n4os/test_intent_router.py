@@ -219,6 +219,25 @@ class FakeTasksClaw:
         return "Undid task action."
 
 
+class FakeShoppingClaw:
+    def __init__(self):
+        self.calls = []
+        self.undo_stack = []
+
+    def handle_request(self, request, reference_time=None):
+        self.calls.append(("handle", request, reference_time))
+        if "add" in request.lower() or "cross off" in request.lower() or "move" in request.lower():
+            self.undo_stack.append({"action": "shopping"})
+        print(f"Shopping handled: {request}")
+        return f"Shopping handled: {request}"
+
+    def undo_last_action(self):
+        self.undo_stack.pop()
+        self.calls.append(("undo", None, None))
+        print("Undid shopping action.")
+        return "Undid shopping action."
+
+
 class FakeHomeBoardClaw:
     def __init__(self):
         self.calls = []
@@ -294,8 +313,8 @@ class FakeLibraryClaw:
     def __init__(self):
         self.calls = []
 
-    def record_from_request(self, request, reference_time=None):
-        self.calls.append(("record", request, reference_time))
+    def record_from_request(self, request, reference_time=None, source="telegram_text", photo_path=None):
+        self.calls.append(("record", request, reference_time, source, photo_path))
         print("Saved. Nysha's Reading Garden grew a new leaf.")
         return "Saved. Nysha's Reading Garden grew a new leaf."
 
@@ -304,8 +323,8 @@ class FakeLibraryClaw:
         print("I read myself today. This week: 1 reading moments, 8 pages, 0 minutes.")
         return "I read myself today. This week: 1 reading moments, 8 pages, 0 minutes."
 
-    def checkout_from_request(self, request, reference_time=None):
-        self.calls.append(("checkout", request, reference_time))
+    def checkout_from_request(self, request, reference_time=None, source="telegram_text"):
+        self.calls.append(("checkout", request, reference_time, source))
         print("Saved this library bag with 2 books at home.")
         return "Saved this library bag with 2 books at home."
 
@@ -527,6 +546,64 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(decision["route"], "calendar")
         self.assertIn("create_event", decision["intent_summary"])
 
+    def test_when_school_date_question_routes_to_calendar_not_home_board(self):
+        calendar = FakeCalendarClaw()
+        home_board = FakeHomeBoardClaw()
+        claw = N4OSClaw(
+            calendar_claw=calendar,
+            tasks_claw=FakeTasksClaw(),
+            home_board_claw=home_board,
+        )
+        reference = datetime(2026, 8, 9, 0, 39, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+        frame = interpret_request(
+            "When is Nysha's first day of school?",
+            now=reference,
+        )
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "When is Nysha's first day of school?",
+                reference_time=reference,
+            )
+
+        self.assertEqual(frame.route, "calendar")
+        self.assertEqual(frame.action, "list_events")
+        self.assertEqual(decision["route"], "calendar")
+        self.assertEqual(
+            calendar.calls,
+            [("list", "When is Nysha's first day of school?", reference)],
+        )
+        self.assertEqual(home_board.calls, [])
+
+    def test_calendar_slash_school_queries_dispatch_to_calendar_list(self):
+        cases = [
+            "/calendar when are Nysha;s holiday?",
+            "/calendar when is nysha's spring break",
+            "/calnedar nysha upocming school events",
+        ]
+        reference = datetime(2026, 8, 9, 0, 39, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+        for request in cases:
+            with self.subTest(request=request):
+                calendar = FakeCalendarClaw()
+                home_board = FakeHomeBoardClaw()
+                claw = N4OSClaw(
+                    calendar_claw=calendar,
+                    tasks_claw=FakeTasksClaw(),
+                    home_board_claw=home_board,
+                )
+                normalized = improve_entered_text(request)
+                frame = interpret_request(normalized, now=reference)
+
+                with redirect_stdout(StringIO()):
+                    decision = claw.handle_request(request, reference_time=reference)
+
+                self.assertEqual(frame.route, "calendar")
+                self.assertEqual(frame.action, "list_events")
+                self.assertEqual(decision["route"], "calendar")
+                self.assertEqual(calendar.calls, [("list", normalized, reference)])
+                self.assertEqual(home_board.calls, [])
+
     def test_contextual_home_board_done_followup_routes_without_ai(self):
         calendar = FakeCalendarClaw()
         tasks = FakeTasksClaw()
@@ -647,6 +724,82 @@ class IntentRouterTest(unittest.TestCase):
                     datetime(2026, 7, 8, 10, 33, tzinfo=ZoneInfo("America/Los_Angeles")),
                 )
             ],
+        )
+
+    def test_default_owner_applies_to_created_task(self):
+        tasks = FakeTasksClaw()
+        interpreter = FakeIntentInterpreter(
+            {
+                "route": "tasks",
+                "action": "create_task",
+                "confidence": 0.95,
+                "normalized_request": "add task buy milk",
+            },
+        )
+        claw = N4OSClaw(tasks_claw=tasks, intent_interpreter=interpreter)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "add task buy milk",
+                reference_time=REFERENCE_TIME,
+                default_owner="mom",
+            )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(
+            tasks.calls,
+            [("create", "add task buy milk\nOwner: mom", REFERENCE_TIME)],
+        )
+
+    def test_explicit_task_owner_wins_over_default_owner(self):
+        tasks = FakeTasksClaw()
+        interpreter = FakeIntentInterpreter(
+            {
+                "route": "tasks",
+                "action": "create_task",
+                "confidence": 0.95,
+                "normalized_request": "add task buy milk owner dad",
+                "metadata": {"owner": "dad"},
+            },
+        )
+        claw = N4OSClaw(tasks_claw=tasks, intent_interpreter=interpreter)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "add task buy milk owner dad",
+                reference_time=REFERENCE_TIME,
+                default_owner="mom",
+            )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(
+            tasks.calls,
+            [("create", "add task buy milk owner dad", REFERENCE_TIME)],
+        )
+
+    def test_default_owner_applies_to_created_event(self):
+        calendar = FakeCalendarClaw()
+        interpreter = FakeIntentInterpreter(
+            {
+                "route": "calendar",
+                "action": "create_event",
+                "confidence": 0.95,
+                "normalized_request": "add event dentist tomorrow at 4 PM",
+            },
+        )
+        claw = N4OSClaw(calendar_claw=calendar, intent_interpreter=interpreter)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "dentist tomorrow at 4",
+                reference_time=REFERENCE_TIME,
+                default_owner="dad",
+            )
+
+        self.assertEqual(decision["route"], "calendar")
+        self.assertEqual(
+            calendar.calls,
+            [("create", "add event dentist tomorrow at 4 PM\nOwner: dad", REFERENCE_TIME)],
         )
 
     def test_ai_normalized_calendar_missing_time_still_asks_for_time(self):
@@ -1358,6 +1511,20 @@ class IntentRouterTest(unittest.TestCase):
             "add event for Tuesday 8 PM to cancel fox 1",
         )
 
+    def test_input_improvement_preserves_calendar_slash_questions(self):
+        self.assertEqual(
+            improve_entered_text("/calendar when are Nysha;s holiday?"),
+            "show calendar when are Nysha's holiday?",
+        )
+        self.assertEqual(
+            improve_entered_text("/calendar when is nysha's spring break"),
+            "show calendar when is nysha's spring break",
+        )
+        self.assertEqual(
+            improve_entered_text("/calnedar nysha upocming school events"),
+            "show calendar nysha upcoming school events",
+        )
+
     def test_input_improvement_normalizes_tasks_list_slash_command(self):
         self.assertEqual(
             improve_entered_text("/tasks list all with tag finance"),
@@ -1387,6 +1554,10 @@ class IntentRouterTest(unittest.TestCase):
             ),
             "assign the task to Nimesh, Nysha, Navya, Niyati and add Noah to help",
         )
+        self.assertEqual(
+            improve_entered_text("Visit Nsyha' school"),
+            "Visit Nysha's school",
+        )
 
     def test_input_improvement_repairs_family_task_dictation(self):
         self.assertEqual(
@@ -1410,6 +1581,40 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(decision["route"], "calendar")
         self.assertGreaterEqual(decision["confidence"], 0.6)
         self.assertIn("family-calendar", decision["intent_summary"])
+
+    def test_routes_multiline_calendar_event_dates_to_calendar(self):
+        request = "Add events to pay driver for below days\n10/1\n12/1\n2/1\n4/1"
+        frame = interpret_request(request, now=REFERENCE_TIME)
+        decision = frame.to_route_decision()
+
+        self.assertEqual(frame.route, "calendar")
+        self.assertEqual(frame.action, "create_event")
+        self.assertEqual(
+            decision["route"],
+            "calendar",
+        )
+        self.assertIn(
+            "family-calendar",
+            decision["intent_summary"],
+        )
+        self.assertGreaterEqual(decision["confidence"], 0.9)
+
+    def test_dispatches_multiline_calendar_event_dates_to_calendar(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = "Add events to pay driver for below days\n10/1\n12/1\n2/1\n4/1"
+
+        decision = claw.handle_request(
+            request,
+            reference_time=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "calendar")
+        self.assertEqual(
+            calendar.calls,
+            [("create", request, REFERENCE_TIME)],
+        )
 
     def test_routes_calendar_slash_command_with_weekday_typo(self):
         decision = route_request(
@@ -1919,7 +2124,7 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(decision["route"], "unknown")
         self.assertIn(
-            "Should I use Capture, Calendar, Tasks, Home Board, Decisions, Science Lab, Library, or Calendar + Tasks?",
+            "I am not sure what you want me to do yet.",
             output.getvalue(),
         )
         self.assertEqual(calendar.calls, [])
@@ -1977,6 +2182,58 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(decision["intent_summary"], "Route to library for record_reading.")
         self.assertGreaterEqual(decision["confidence"], 0.6)
 
+    def test_routes_navya_library_reading_event(self):
+        decision = route_request(
+            "Navya finished Brown Bear yesterday.",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "library")
+        self.assertEqual(decision["intent_summary"], "Route to library for record_reading.")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+
+    def test_routes_library_prefixed_child_reading_as_reading_event(self):
+        decision = route_request(
+            "Library Nysha read 2 series\nImage text:\nBook title: Peppa's Storybook Collection",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "library")
+        self.assertEqual(decision["intent_summary"], "Route to library for record_reading.")
+
+    def test_rule_keeps_parent_reading_photo_from_ai_shopping_route(self):
+        interpreter = FakeIntentInterpreter(
+            {
+                "route": "shopping",
+                "action": "add_items",
+                "confidence": 0.99,
+                "normalized_request": "Dad read the book to Nysha today",
+            },
+        )
+
+        frame = interpret_request(
+            "Dad read the book to Nysha today\n"
+            "Image text:\n"
+            "Book title: Earl & Worm: The Big Mess",
+            now=REFERENCE_TIME,
+            interpreter=interpreter,
+        )
+
+        self.assertEqual(frame.route, "library")
+        self.assertEqual(frame.action, "record_reading")
+
+    def test_routes_add_to_library_family_reading_before_shopping(self):
+        decision = route_request(
+            "Add to library family reading read by Dad\n"
+            "Image text:\n"
+            "Book title: Earl & Worm: The Big Mess and Other Stories\n"
+            "Author: Greg Pizzoli",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "library")
+        self.assertEqual(decision["intent_summary"], "Route to library for record_checkout.")
+
     def test_routes_library_checkout_email_to_library(self):
         request = "\n".join(
             [
@@ -1991,6 +2248,24 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(decision["route"], "library")
         self.assertEqual(decision["intent_summary"], "Route to library for record_checkout.")
+
+    def test_routes_library_reading_update_to_library(self):
+        decision = route_request(
+            "Change Nysha latest reading book to Frog and Toad",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "library")
+        self.assertEqual(decision["intent_summary"], "Route to library for update_reading.")
+
+    def test_routes_library_reading_delete_to_library(self):
+        decision = route_request(
+            "Delete Nysha latest reading entry",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "library")
+        self.assertEqual(decision["intent_summary"], "Route to library for delete_reading.")
 
     def test_dispatches_library_reading_event_to_library_claw(self):
         calendar = FakeCalendarClaw()
@@ -2019,7 +2294,7 @@ class IntentRouterTest(unittest.TestCase):
         self.assertIn("Reading Garden grew", output.getvalue())
         self.assertEqual(
             library.calls,
-            [("record", "Nysha read 8 pages of Mercy Watson by herself.", REFERENCE_TIME)],
+            [("record", "Nysha read 8 pages of Mercy Watson by herself.", REFERENCE_TIME, "telegram_text", None)],
         )
         self.assertEqual(calendar.calls, [])
         self.assertEqual(tasks.calls, [])
@@ -2056,12 +2331,86 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(decision["route"], "library")
         self.assertIn("library bag", output.getvalue())
-        self.assertEqual(library.calls, [("checkout", request, REFERENCE_TIME)])
+        self.assertEqual(library.calls, [("checkout", request, REFERENCE_TIME, "telegram_text")])
         self.assertEqual(calendar.calls, [])
         self.assertEqual(tasks.calls, [])
         self.assertEqual(home_board.calls, [])
         self.assertEqual(decisions.calls, [])
         self.assertEqual(science_lab.calls, [])
+
+    def test_slash_library_reading_bypasses_pending_shopping(self):
+        shopping = FakeShoppingClaw()
+        shopping.pending_action = {"kind": "add"}
+        library = FakeLibraryClaw()
+        claw = N4OSClaw(
+            shopping_claw=shopping,
+            library_claw=library,
+            intent_interpreter=FakeIntentInterpreter(
+                {
+                    "route": "shopping",
+                    "action": "add_items",
+                    "confidence": 0.99,
+                    "normalized_request": "/library Dad read this book to Nysha today",
+                },
+            ),
+        )
+        request = (
+            "/library Dad read this book to Nysha today\n"
+            "Image text:\n"
+            "Book title: Earl & Worm: The Big Mess"
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                request,
+                reference_time=REFERENCE_TIME,
+                source="telegram_photo:dad",
+                photo_path="/static/dashboard/uploads/reading/earl-worm.jpg",
+            )
+
+        self.assertEqual(decision["route"], "library")
+        self.assertIsNone(getattr(shopping, "pending_action", None))
+        self.assertEqual(shopping.calls, [])
+        self.assertEqual(
+            library.calls,
+            [("record", request, REFERENCE_TIME, "telegram_photo:dad", "/static/dashboard/uploads/reading/earl-worm.jpg")],
+        )
+
+    def test_slash_library_add_parent_reading_photo_stays_library(self):
+        shopping = FakeShoppingClaw()
+        library = FakeLibraryClaw()
+        claw = N4OSClaw(
+            shopping_claw=shopping,
+            library_claw=library,
+            intent_interpreter=FakeIntentInterpreter(
+                {
+                    "route": "shopping",
+                    "action": "add_items",
+                    "confidence": 0.99,
+                    "normalized_request": "/library add dad read to nysha",
+                },
+            ),
+        )
+        request = (
+            "/library add dad read to nysha\n"
+            "Image text:\n"
+            "Book title: EARL & WORM THE BIG MESS STORIES Author: GREG PIZZOLI"
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                request,
+                reference_time=REFERENCE_TIME,
+                source="telegram_photo:dad",
+                photo_path="/static/dashboard/uploads/reading/earl-worm.jpg",
+            )
+
+        self.assertEqual(decision["route"], "library")
+        self.assertEqual(shopping.calls, [])
+        self.assertEqual(
+            library.calls,
+            [("record", request, REFERENCE_TIME, "telegram_photo:dad", "/static/dashboard/uploads/reading/earl-worm.jpg")],
+        )
 
     def test_dispatches_image_task_entries_with_due_date_to_tasks_claw(self):
         tasks = FakeTasksClaw()
@@ -2150,6 +2499,25 @@ class IntentRouterTest(unittest.TestCase):
             home_board.calls,
             [("add", "Helper should put the food in the fridge today", REFERENCE_TIME)],
         )
+        self.assertEqual(calendar.calls, [])
+        self.assertEqual(tasks.calls, [])
+
+    def test_time_bound_home_board_target_dispatches_to_home_board_claw(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        home_board = FakeHomeBoardClaw()
+        claw = N4OSClaw(
+            calendar_claw=calendar,
+            tasks_claw=tasks,
+            home_board_claw=home_board,
+        )
+        request = "Add to home board give bag to Avi for tomorrow at 9 AM"
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "home_board")
+        self.assertEqual(home_board.calls, [("add", request, REFERENCE_TIME)])
         self.assertEqual(calendar.calls, [])
         self.assertEqual(tasks.calls, [])
 
@@ -2277,6 +2645,147 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(decision["route"], "tasks")
         self.assertIn("Family Tasks needs the Google Python client libraries", output.getvalue())
         self.assertIsNone(claw.tasks_claw)
+
+    def test_calendar_claw_uses_configured_calendar_id(self):
+        calls = []
+        module = SimpleNamespace(
+            FamilyCalendarClaw=SimpleNamespace(
+                default=lambda calendar_id="primary": calls.append(calendar_id) or "calendar",
+            ),
+        )
+        claw = N4OSClaw()
+
+        with patch.dict(os.environ, {"N4OS_FAMILY_CALENDAR_ID": "nysha-calendar"}, clear=False):
+            with patch("claw._calendar_module", return_value=module):
+                calendar = claw._calendar()
+
+        self.assertEqual(calendar, "calendar")
+        self.assertEqual(calls, ["nysha-calendar"])
+
+    def test_routes_cart_prefix_to_shopping(self):
+        decision = route_request("/cart add milk to Costco", now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "shopping")
+        self.assertIn("add_item", decision["intent_summary"])
+
+    def test_routes_cart_clothing_voice_text_to_shopping(self):
+        decision = route_request(
+            "Add to cart, do other shopping list, need to find shorts to wear, "
+            "add another item to it, need to find night pants which are a bit "
+            "more breathable. Third, need to find full sleeve breathable "
+            "t-shirts for night.",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "shopping")
+        self.assertIn("add_items", decision["intent_summary"])
+
+    def test_routes_cart_prefix_item_store_to_shopping_add(self):
+        decision = route_request("/cart tofu costco", now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "shopping")
+        self.assertIn("add_item", decision["intent_summary"])
+
+    def test_routes_store_targeted_add_to_shopping(self):
+        decision = route_request("add milk to Costco", now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "shopping")
+        self.assertIn("add_item", decision["intent_summary"])
+
+    def test_routes_add_to_cart_store_item_to_shopping(self):
+        decision = route_request("Add to cart Costco tofu", now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "shopping")
+        self.assertIn("add_item", decision["intent_summary"])
+
+    def test_routes_done_store_list_to_shopping_clear(self):
+        decision = route_request("Indian grocery done", now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "shopping")
+        self.assertIn("clear_list", decision["intent_summary"])
+
+    def test_routes_clear_grocery_store_to_shopping_clear(self):
+        decision = route_request("clear grocery Indian", now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "shopping")
+        self.assertIn("clear_list", decision["intent_summary"])
+
+    def test_explicit_task_with_store_name_stays_task(self):
+        decision = route_request(
+            "add task renew Costco membership",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "tasks")
+
+    def test_time_bound_store_trip_does_not_route_to_shopping(self):
+        decision = route_request("add Costco trip tomorrow", now=REFERENCE_TIME)
+
+        self.assertNotEqual(decision["route"], "shopping")
+
+    def test_ambiguous_buy_item_asks_for_list(self):
+        frame = interpret_request("buy milk", now=REFERENCE_TIME)
+
+        self.assertEqual(frame.route, "unknown")
+        self.assertIn("list_name", frame.missing_fields)
+        self.assertIn("Which shopping list", frame.clarification_question)
+
+    def test_dispatches_shopping_to_shopping_claw_and_undo(self):
+        shopping = FakeShoppingClaw()
+        claw = N4OSClaw(
+            calendar_claw=FakeCalendarClaw(),
+            tasks_claw=FakeTasksClaw(),
+            shopping_claw=shopping,
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request("/cart add milk to Costco", reference_time=REFERENCE_TIME)
+            undo = claw.handle_request("undo", reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "shopping")
+        self.assertEqual(undo["route"], "shopping")
+        self.assertEqual(
+            shopping.calls,
+            [
+                ("handle", "/cart add milk to Costco", REFERENCE_TIME),
+                ("undo", None, None),
+            ],
+        )
+
+    def test_explicit_cart_interrupts_pending_calendar_clarification(self):
+        shopping = FakeShoppingClaw()
+        calendar = PendingCalendarClaw()
+        claw = N4OSClaw(
+            calendar_claw=calendar,
+            tasks_claw=FakeTasksClaw(),
+            shopping_claw=shopping,
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "/cart Add to other shopping list, need to find shorts to wear, "
+                "add another item to it, need to find night pants which are a bit "
+                "more breathable. Third, need to find full sleeve breathable "
+                "t-shirts for night.",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "shopping")
+        self.assertEqual(calendar.pending_responses, [])
+        self.assertIsNone(calendar.pending_action)
+        self.assertEqual(
+            shopping.calls,
+            [
+                (
+                    "handle",
+                    "/cart Add to other shopping list, need to find shorts to wear, "
+                    "add another item to it, need to find night pants which are a bit "
+                    "more breathable. Third, need to find full sleeve breathable "
+                    "t-shirts for night.",
+                    REFERENCE_TIME,
+                ),
+            ],
+        )
 
 
 if __name__ == "__main__":

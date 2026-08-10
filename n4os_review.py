@@ -5,6 +5,8 @@ from datetime import date, timedelta
 from pathlib import Path
 import re
 
+from n4os_trajectories import trajectory_review_signals
+
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_N4OS_ROOT = DEFAULT_REPO_ROOT / "n4os"
@@ -51,7 +53,11 @@ def format_n4os_review(
     start = _start_date(normalized_period, today)
     signals = [
         signal
-        for signal in [*_read_journal_signals(n4os_root / "journal"), *_read_family_signals(n4os_root / "family" / "observations")]
+        for signal in [
+            *_read_journal_signals(n4os_root / "journal"),
+            *_read_family_signals(n4os_root / "family" / "observations"),
+            *_read_trajectory_signals(n4os_root / "trajectories", start, today),
+        ]
         if start <= signal.captured_on <= today
     ]
 
@@ -152,6 +158,21 @@ def _read_family_signals(observations_root: Path) -> list[ReviewSignal]:
     return signals
 
 
+def _read_trajectory_signals(
+    trajectories_root: Path,
+    start: date,
+    today: date,
+) -> list[ReviewSignal]:
+    return [
+        ReviewSignal(captured_on, "trajectory", summary, topics)
+        for captured_on, summary, topics in trajectory_review_signals(
+            trajectories_root,
+            start=start,
+            end=today,
+        )
+    ]
+
+
 def _parse_date(value: str) -> date | None:
     try:
         return date.fromisoformat(value)
@@ -197,6 +218,8 @@ def _compounding_lines(topic_counts: dict[str, int]) -> list[str]:
     lines: list[str] = []
     if topic_counts.get("Parenting") or topic_counts.get("Reading"):
         lines.append("- Family learning is being captured instead of disappearing.")
+    if topic_counts.get("School Transition") or topic_counts.get("Confidence"):
+        lines.append("- Coaching conversations are creating reviewable transition signals.")
     if topic_counts.get("Health"):
         lines.append("- Health signals are visible enough to adjust routines.")
     if topic_counts.get("Work") or topic_counts.get("Purpose"):
@@ -228,6 +251,10 @@ def _promotion_candidates(topic_counts: dict[str, int], signals: list[ReviewSign
     if any(signal.source == "journal" for signal in signals) and topic_counts.get("Parenting", 0) >= 2:
         candidates.append(
             "- Consider adding a weekly Parenting review prompt around presence, patience, and repair."
+        )
+    if any(signal.source == "trajectory" for signal in signals) and topic_counts.get("School Transition", 0) >= 2:
+        candidates.append(
+            "- Review N4OS trajectories before changing stable school-transition or child-profile guidance."
         )
     return candidates or ["- None yet. Keep raw captures as signals."]
 

@@ -66,6 +66,18 @@ class HomeBoardIntentTest(unittest.TestCase):
         self.assertEqual(intent["message"], "Put passports by the door")
         self.assertEqual(intent["date"], "2026-07-04")
 
+    def test_strips_add_to_home_board_prefix(self):
+        intent = extract_intent(
+            "Add to home board give bag to Avi for tomorrow at 9 AM",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(intent["intent"], "add_item")
+        self.assertEqual(intent["message"], "Give bag to Avi")
+        self.assertEqual(intent["date"], "2026-07-04")
+        self.assertEqual(intent["context"], "before_leave")
+        self.assertEqual(intent["trigger"], "leave_home")
+
     def test_list_today_at_home_intent(self):
         intent = extract_intent("What's on Today at Home?", now=REFERENCE_TIME)
 
@@ -80,6 +92,14 @@ class HomeBoardIntentTest(unittest.TestCase):
 
     def test_unknown_text_does_not_become_notice(self):
         intent = extract_intent("What should I focus on today?", now=REFERENCE_TIME)
+
+        self.assertEqual(intent["intent"], "unknown")
+
+    def test_question_about_family_member_does_not_become_notice(self):
+        intent = extract_intent(
+            "When is Nysha's first day of school?",
+            now=REFERENCE_TIME,
+        )
 
         self.assertEqual(intent["intent"], "unknown")
 

@@ -179,6 +179,35 @@ class FamilyDecisionsClawTest(unittest.TestCase):
         self.assertIn("- Go to ICC", note_message)
         self.assertIn("- Call FUSD to get the waitlist number", note_message)
 
+    def test_backlog_capture_attributes_sender_and_confirms_move(self):
+        created_message = self.claw.handle_request(
+            "Discussion: Should we attend the birthday?",
+            reference_time=REFERENCE_TIME,
+            source="telegram_text:Niyati",
+            default_owner="mom",
+        )
+        item = self.claw.tools.list_backlog_items()["data"]["items"][0]
+        move_message = self.claw.handle_request(
+            f"move {item['id'][:8]} to planning",
+            reference_time=REFERENCE_TIME,
+            source="telegram_text:Niyati",
+            default_owner="mom",
+        )
+        before = self.claw.tools.read_backlog_item(item["id"])["data"]["item"]
+
+        with redirect_stdout(StringIO()):
+            confirmed = self.claw.handle_pending_response("yes")
+        after = self.claw.tools.read_backlog_item(item["id"])["data"]["item"]
+
+        self.assertIn("Added to Discussion", created_message)
+        self.assertEqual(item["created_by"], "Niyati")
+        self.assertEqual(item["owner"], "mom")
+        self.assertIn("Confirm moving", move_message)
+        self.assertEqual(before["kind"], "discussion")
+        self.assertTrue(confirmed)
+        self.assertEqual(after["id"], item["id"])
+        self.assertEqual(after["kind"], "planning")
+
 
 if __name__ == "__main__":
     unittest.main()

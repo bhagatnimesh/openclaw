@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 from contextlib import contextmanager
 from dataclasses import dataclass
 import importlib
@@ -35,6 +33,7 @@ class DashboardSources:
     recommend_task_matches: TaskRecommender
     home_board_tools: Any | None = None
     decision_tools: Any | None = None
+    shopping_tools: Any | None = None
     reading_garden_tools: Any | None = None
 
 
@@ -76,7 +75,24 @@ class _UnavailableHomeBoardTools(_UnavailableSourceTools):
 
 
 class _UnavailableDecisionTools(_UnavailableSourceTools):
+    def list_backlog_items(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
     def list_decisions(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+
+class _UnavailableShoppingTools(_UnavailableSourceTools):
+    def list_shopping_lists(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+    def list_items(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+    def set_checked_by_id(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+    def clear_list(self, **_kwargs: Any) -> dict[str, Any]:
         return self._response()
 
 
@@ -149,6 +165,11 @@ def build_default_sources() -> DashboardSources:
         decision_tools = _UnavailableDecisionTools("Decisions", error)
 
     try:
+        shopping_tools = build_default_shopping_tools()
+    except Exception as error:
+        shopping_tools = _UnavailableShoppingTools("Shopping", error)
+
+    try:
         reading_garden_tools = build_default_library_tools()
     except Exception as error:
         reading_garden_tools = _UnavailableLibraryTools("Reading Garden", error)
@@ -161,6 +182,7 @@ def build_default_sources() -> DashboardSources:
         recommend_task_matches=recommend_task_matches,
         home_board_tools=home_board_tools,
         decision_tools=decision_tools,
+        shopping_tools=shopping_tools,
         reading_garden_tools=reading_garden_tools,
     )
 
@@ -195,6 +217,13 @@ def build_default_library_tools() -> Any:
         )
 
 
+def build_default_shopping_tools() -> Any:
+    shopping_dir = ROOT / "claws" / "shopping-list"
+    with _isolated_claw_import(shopping_dir):
+        shopping_tools_module = importlib.import_module("tools")
+        return shopping_tools_module.build_default_tools()
+
+
 def default_sources() -> DashboardSources:
     global _DEFAULT_SOURCES
     with _DEFAULT_SOURCES_LOCK:
@@ -214,6 +243,7 @@ def _has_unavailable_source(sources: DashboardSources) -> bool:
             sources.task_tools,
             sources.home_board_tools,
             sources.decision_tools,
+            sources.shopping_tools,
             sources.reading_garden_tools,
         )
     )

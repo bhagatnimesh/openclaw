@@ -292,6 +292,40 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertEqual(metadata["effort_type"], "communication")
         self.assertEqual(metadata["requires"], ["phone"])
 
+    def test_add_task_from_prose_details_uses_readable_title_notes_and_reply(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 8, 9, 10, 20, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "Add a task for Monday. Visit Nysha's school. "
+                "Details add driver, check on school supplies and things to get, "
+                "other dogs and donuts for the first day. Time 9 am\n"
+                "Owner: dad",
+                reference_time=now,
+            )
+
+        self.assertEqual(
+            message,
+            "Created task: Visit Nysha's school\n"
+            "Due: Mon, Aug 10\n"
+            "Details: Add driver, check on school supplies and things to get, "
+            "other dogs and donuts for the first day.\n"
+            "Owner: dad\n"
+            "Task id: task-123",
+        )
+        created = provider.created[0]
+        self.assertEqual(created["title"], "Visit Nysha's school")
+        self.assertEqual(
+            created["notes"],
+            "Add driver, check on school supplies and things to get, "
+            "other dogs and donuts for the first day.",
+        )
+        self.assertEqual(created["due"], "2026-08-10")
+        _, metadata = _task_notes_and_metadata(created)
+        self.assertEqual(metadata["owner"], "dad")
+
     def test_add_task_from_refined_header_and_body(self):
         provider = FakeProvider()
         claw = FamilyTasksClaw.from_provider(provider)

@@ -19,6 +19,37 @@ WEEKDAYS = {
     "sunday": 6,
 }
 
+MONTHS = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
+MONTH_NAME_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(MONTHS, key=len, reverse=True)
+)
+
 WEEKDAY_RRULE_CODES = {
     "monday": "MO",
     "tuesday": "TU",
@@ -472,12 +503,84 @@ def _start_of_day(value: datetime) -> datetime:
     )
 
 
+def _date_for_month_day(
+    month: int,
+    day: int,
+    year_text: str | None,
+    reference: datetime,
+) -> str | None:
+    year = int(year_text) if year_text is not None else reference.year
+    if year < 100:
+        year += 2000
+
+    try:
+        parsed = datetime(year, month, day, tzinfo=reference.tzinfo)
+    except ValueError:
+        return None
+
+    if year_text is None and parsed.date() < reference.date():
+        try:
+            parsed = datetime(reference.year + 1, month, day, tzinfo=reference.tzinfo)
+        except ValueError:
+            return None
+
+    return parsed.date().isoformat()
+
+
+def _strip_absolute_date_text(value: str) -> str:
+    value = re.sub(
+        rf"\b(?:on\s+)?(?:{MONTH_NAME_PATTERN})\.?\s+"
+        r"\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{2,4})?\b",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"(?<!\d)(?:on\s+)?\d{1,2}/\d{1,2}(?:/\d{2,4})?(?!\d)",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
 def _extract_date(user_text: str, reference: datetime) -> tuple[str | None, str]:
     lowered = user_text.lower()
     if "tomorrow" in lowered or "tomorrows" in lowered:
         return (reference + timedelta(days=1)).date().isoformat(), "tomorrow"
     if "today" in lowered:
         return reference.date().isoformat(), "today"
+
+    month_name_match = re.search(
+        rf"\b(?P<month>{MONTH_NAME_PATTERN})\.?\s+"
+        r"(?P<day>\d{1,2})(?:st|nd|rd|th)?"
+        r"(?:,?\s+(?P<year>\d{2,4}))?\b",
+        lowered,
+    )
+    if month_name_match is not None:
+        month = MONTHS[month_name_match.group("month").rstrip(".")]
+        parsed_date = _date_for_month_day(
+            month,
+            int(month_name_match.group("day")),
+            month_name_match.group("year"),
+            reference,
+        )
+        if parsed_date is not None:
+            return parsed_date, month_name_match.group(0)
+
+    numeric_date_match = re.search(
+        r"(?<!\d)(?P<month>\d{1,2})/(?P<day>\d{1,2})"
+        r"(?:/(?P<year>\d{2,4}))?(?!\d)",
+        lowered,
+    )
+    if numeric_date_match is not None:
+        parsed_date = _date_for_month_day(
+            int(numeric_date_match.group("month")),
+            int(numeric_date_match.group("day")),
+            numeric_date_match.group("year"),
+            reference,
+        )
+        if parsed_date is not None:
+            return parsed_date, numeric_date_match.group(0)
 
     for name, weekday in WEEKDAYS.items():
         if re.search(rf"\b{name}\s+next week\b", lowered) or re.search(
@@ -497,8 +600,12 @@ def _extract_list_range(
 ) -> tuple[datetime | None, datetime | None]:
     lowered = user_text.lower()
 
+    if re.search(r"\b(?:this|these)\s+year\b", lowered) or "school year" in lowered:
+        return reference, reference + timedelta(days=365)
     if "next 7 days" in lowered or "next seven days" in lowered:
         return reference, reference + timedelta(days=7)
+    if "upcoming" in lowered or "coming up" in lowered:
+        return reference, reference + timedelta(days=30)
     if "tomorrow" in lowered:
         start = _start_of_day(reference + timedelta(days=1))
         return start, start + timedelta(days=1)
@@ -550,6 +657,51 @@ def _extract_named_person_query(user_text: str) -> str | None:
     return _canonical_person(match.group("person"))
 
 
+def _extract_when_event_query(user_text: str) -> str | None:
+    match = re.match(
+        r"^\s*when\s+(?:is|are|was|were)\s+(?P<query>.+?)\??\s*$",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+
+    query = re.sub(
+        rf"\b(?:{PERSON_ALIAS_PATTERN})'?s?\b",
+        " ",
+        match.group("query"),
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"\b(?:the|a|an)\b", " ", query, flags=re.IGNORECASE)
+    query = " ".join(re.findall(r"[a-z0-9]+", query.lower()))
+    return query or None
+
+
+def _holiday_text_queries(value: str) -> list[str] | None:
+    if re.search(r"\b(?:holidays?|vacations?|breaks?|no\s+school)\b", value, flags=re.IGNORECASE):
+        return ["holiday", "vacation", "break", "no school"]
+    return None
+
+
+def _extract_school_event_text_query(user_text: str) -> str | None:
+    lowered = user_text.lower()
+    if "spring break" in lowered:
+        return "spring break"
+    if "fall break" in lowered:
+        return "fall break"
+    if "winter break" in lowered:
+        return "winter break"
+    if "conference" in lowered:
+        return "conference"
+    if "first day" in lowered and "school" in lowered:
+        return "first day of school"
+    if "last day" in lowered and "school" in lowered:
+        return "last day of school"
+    if "minimum day" in lowered or "minimum days" in lowered:
+        return "minimum day"
+    return None
+
+
 def _extract_list_metadata_filter(user_text: str) -> dict[str, Any]:
     lowered = user_text.lower()
     filters: dict[str, Any] = {}
@@ -588,6 +740,20 @@ def _extract_list_metadata_filter(user_text: str) -> dict[str, Any]:
         filters["person"] = person
         filters["text_query"] = person
 
+    when_query = _extract_when_event_query(user_text)
+    if when_query is not None:
+        filters["text_query"] = when_query
+
+    holiday_queries = _holiday_text_queries(when_query or user_text)
+    if holiday_queries is not None:
+        filters.pop("text_query", None)
+        filters["text_any_queries"] = holiday_queries
+
+    school_query = _extract_school_event_text_query(user_text)
+    if school_query is not None:
+        filters.pop("text_any_queries", None)
+        filters["text_query"] = school_query
+
     return filters
 
 
@@ -597,6 +763,16 @@ def _default_list_range_for_filter(
 ) -> tuple[datetime | None, datetime | None]:
     if not metadata_filter:
         return None, None
+    if (
+        metadata_filter.get("text_query") is not None
+        and set(metadata_filter) == {"text_query"}
+    ):
+        return reference, reference + timedelta(days=365)
+    if (
+        metadata_filter.get("text_any_queries") is not None
+        and set(metadata_filter) == {"text_any_queries"}
+    ):
+        return reference, reference + timedelta(days=365)
 
     return reference, reference + timedelta(days=30)
 
@@ -679,10 +855,31 @@ def _extract_action_time(user_text: str) -> str | None:
     return _time_from_match(match, user_text)
 
 
+def _extract_time_range_start(user_text: str) -> str | None:
+    match = re.search(
+        r"(?:\btime\s*:\s*)?\b(\d{1,2})(?::(\d{2}))?\s*"
+        r"(am|pm|a\.m\.|p\.m\.)?\s*(?:-|–|to)\s*"
+        r"\d{1,2}(?::\d{2})?\s*(am|pm|a\.m\.|p\.m\.)?\b",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "0")
+    meridiem = match.group(3) or match.group(4) or ""
+    return _format_time(hour, minute, meridiem, user_text)
+
+
 def _extract_time(user_text: str) -> str | None:
     action_time = _extract_action_time(user_text)
     if action_time is not None:
         return action_time
+
+    range_start = _extract_time_range_start(user_text)
+    if range_start is not None:
+        return range_start
 
     named_time = _extract_named_time(user_text)
     if named_time is not None:
@@ -1107,6 +1304,7 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
     title = re.sub(r"\bfor\s+(?:next\s+)?\d+\s+weeks?\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bnext\s+\d+\s+(?:mondays|tuesdays|wednesdays|thursdays|fridays|saturdays|sundays)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", " ", title, flags=re.IGNORECASE)
+    title = _strip_absolute_date_text(title)
     title = re.sub(r"\b(?:at|around)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(?:at|around)\s+noon\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b", " ", title, flags=re.IGNORECASE)
@@ -1114,6 +1312,9 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
     title = re.sub(r"\bfor\s+\d+\s*(?:minute|minutes|min|hour|hours|hr|hrs)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bnext\s+(?=monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bnext\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bin\s+.+?\s+calendar\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\btime\s*:\s*.*$", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\blocation\s*:\s*.*$", " ", title, flags=re.IGNORECASE)
     title = re.sub(
         rf"[, ]+\b(?:i|we|both|parents|{OWNER_ALIAS_PATTERN})\b.+?\b"
         rf"(?:will\s+)?(?:{OWNER_ACTION_WORD_PATTERN})\b.*$",
@@ -1144,8 +1345,13 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
 
 def _is_list_request(user_text: str) -> bool:
     lowered = user_text.lower().strip()
-    return lowered.startswith(("what ", "what's ", "whats ", "show ", "list ")) or (
-        "coming up" in lowered
+    return lowered.startswith(
+        ("what ", "what's ", "whats ", "when ", "show ", "list "),
+    ) or bool(
+        re.search(
+            r"\b(?:upcoming|coming\s+up|holidays?|break|vacation|no\s+school)\b",
+            lowered,
+        )
     )
 
 

@@ -32,6 +32,17 @@ VALID_ACTIONS_BY_ROUTE = {
         "delete_task",
         "run_assistant_help",
     },
+    "shopping": {
+        "list_lists",
+        "list_items",
+        "add_item",
+        "add_items",
+        "check_item",
+        "uncheck_item",
+        "delete_item",
+        "move_item",
+        "clear_list",
+    },
     "home_board": {"add_item", "add_items", "list_items", "mark_done"},
     "decisions": {
         "create_decision",
@@ -178,7 +189,9 @@ def _system_prompt() -> str:
         "do not execute actions, call tools, invent external facts, or include secrets. "
         "Allowed routes/actions: calendar(create_event,list_events,update_event,delete_event,"
         "family_briefing,preparation_checklist); tasks(create_task,recommend_tasks,update_task,"
-        "complete_task,delete_task,run_assistant_help); home_board(add_item,add_items,list_items,"
+        "complete_task,delete_task,run_assistant_help); shopping(list_lists,list_items,"
+        "add_item,add_items,check_item,uncheck_item,delete_item,move_item,clear_list); "
+        "home_board(add_item,add_items,list_items,"
         "mark_done); decisions(create_decision,list_decisions,decision_brief,add_option,"
         "add_evidence,add_next_step,record_decision,bulk_record_decisions); "
         "both(combined_planning,calendar_and_tasks); unknown(unknown). "

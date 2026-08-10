@@ -16,8 +16,8 @@
         </section>
         <nav class="portal-nav" aria-label="Dashboard sections">
           <a href="#today">Today</a>
-          <a href="#planning">Planning</a>
-          <a href="#decisions">Decisions</a>
+          <a href="#backlog">Backlog</a>
+          <a href="#shopping">Shopping</a>
           <a href="#tasks">Tasks</a>
           <a href="#library">Library</a>
           <a href="#family">Family</a>
@@ -39,9 +39,9 @@
             <div class="date-summary-row">
               <p id="date-label" class="date-line">Syncing calendar and tasks...</p>
               <div class="summary-strip" aria-label="Dashboard summary">
-                <span id="summary-open"><strong>0</strong> task</span>
                 <span id="summary-prep"><strong>0</strong> prep</span>
                 <span id="summary-decisions"><strong>0</strong> decisions</span>
+                <span id="summary-shopping"><strong>0</strong> shopping</span>
                 <span id="summary-home"><strong>0</strong> home</span>
                 <span id="summary-family"><strong>0</strong> family</span>
               </div>
@@ -69,6 +69,13 @@
                 </div>
                 <div id="home-board-items" class="home-board-list"></div>
               </article>
+              <article class="panel backlog-attention-panel" data-dashboard-card="backlog-attention">
+                <div class="panel-header">
+                  <h3>Backlog Attention</h3>
+                  <span id="backlog-attention-count">0</span>
+                </div>
+                <div id="backlog-attention" class="compact-list"></div>
+              </article>
             </div>
             <article class="panel timeline-panel" data-dashboard-card="timeline">
               <div class="panel-header">
@@ -79,10 +86,6 @@
             </article>
           </div>
           <div class="signal-grid">
-            <article class="signal-card must" data-dashboard-card="open-loops">
-              <p class="eyebrow">Open Loops</p>
-              <div id="open-loops"></div>
-            </article>
             <article class="signal-card should" data-dashboard-card="prep-needed">
               <p class="eyebrow">Prep Needed</p>
               <div id="prep-needed"></div>
@@ -94,30 +97,54 @@
           </div>
         </section>
 
-        <section id="planning" class="section">
-          <div class="section-title">
-            <h2>Planning</h2>
+        <section id="backlog" class="section">
+          <div class="section-title backlog-title-row">
+            <h2>Family Backlog</h2>
             <span></span>
+            <button id="backlog-review-button" class="secondary-action" type="button">Start weekly review</button>
+            <button id="backlog-add-button" class="primary-action" type="button">Add</button>
           </div>
-          <div id="planning-items" class="planning-grid"></div>
+          <div class="backlog-toolbar" aria-label="Backlog filters">
+            <select id="backlog-owner-filter" aria-label="Filter backlog by owner">
+              <option value="all">All owners</option>
+              <option value="dad">Dad</option>
+              <option value="mom">Mom</option>
+              <option value="both">Both</option>
+              <option value="family">Family</option>
+              <option value="unknown">Unassigned</option>
+            </select>
+            <select id="backlog-state-filter" aria-label="Filter backlog by state">
+              <option value="all">All items</option>
+              <option value="attention">Needs attention</option>
+              <option value="pinned">Pinned</option>
+            </select>
+          </div>
+          <p id="backlog-action-status" class="task-action-status" aria-live="polite"></p>
+          <div class="backlog-lanes">
+            <section class="backlog-lane" aria-labelledby="discussion-lane-title">
+              <div class="backlog-lane-header"><h3 id="discussion-lane-title">Discussion</h3><span id="discussion-count">0</span></div>
+              <div id="discussion-items" class="backlog-items"></div>
+            </section>
+            <section class="backlog-lane" aria-labelledby="planning-lane-title">
+              <div class="backlog-lane-header"><h3 id="planning-lane-title">Planning</h3><span id="planning-count">0</span></div>
+              <div id="planning-items" class="backlog-items"></div>
+            </section>
+            <section class="backlog-lane" aria-labelledby="decision-lane-title">
+              <div class="backlog-lane-header"><h3 id="decision-lane-title">Decisions</h3><span id="decision-count">0</span></div>
+              <div id="decision-backlog-items" class="backlog-items"></div>
+            </section>
+          </div>
         </section>
 
-        <section id="decisions" class="section">
+        <section id="shopping" class="section">
           <div class="section-title">
-            <h2>Pending Decisions</h2>
+            <h2>Shopping</h2>
             <span></span>
-            <strong id="decision-count-label" class="section-count">0 open</strong>
+            <strong id="shopping-count-label" class="section-count">0 pending</strong>
           </div>
-          <div class="decisions-layout">
-            <article class="panel decision-summary-panel" data-dashboard-card="decision-attention">
-              <div class="panel-header">
-                <h3>Needs Attention</h3>
-                <span id="decision-attention-count">0</span>
-              </div>
-              <div id="decision-attention" class="compact-list"></div>
-            </article>
-            <div id="decision-items" class="decision-grid"></div>
-          </div>
+          <p id="shopping-action-status" class="task-action-status" aria-live="polite"></p>
+          <div id="shopping-list-tabs" class="shopping-list-tabs" role="tablist" aria-label="Shopping lists"></div>
+          <div id="shopping-list-items" class="shopping-grid"></div>
         </section>
 
         <section id="tasks" class="section">
@@ -163,41 +190,72 @@
           <div id="task-groups" class="task-grid"></div>
         </section>
 
-        <section id="library" class="section">
-          <div class="section-title">
-            <h2>Library</h2>
-            <span></span>
-          </div>
+        <section id="library" class="section library-section">
           <div class="library-page">
-            <article class="reading-hero">
-              <div class="reading-hero-copy">
-                <p class="eyebrow">I Read It Myself</p>
-                <h2 id="reading-garden-title">Nysha’s Reading Garden: I Read It Myself</h2>
-                <p id="reading-hero-message" class="reading-hero-message">Every reading moment helps the garden grow.</p>
-                <div class="reading-hero-actions">
-                  <span id="reading-today-label">Not yet today</span>
-                  <span id="reading-hero-week">0 moments this week</span>
-                </div>
-              </div>
-              <div class="reading-garden-visual" aria-label="Reading Garden visual">
-                <div id="reading-garden-plot" class="reading-garden-plot"></div>
-              </div>
-            </article>
+            <div id="reading-child-tabs" class="reading-child-tabs" role="tablist" aria-label="Reading dashboard child"></div>
 
-            <div class="reading-library-grid">
-              <div class="reading-library-main">
-                <article class="reading-current-card">
-                  <div class="reading-book-cover" aria-hidden="true">
-                    <span>Read</span>
+            <div class="reading-kid-header">
+              <h2 id="reading-garden-title">Reading Garden Kid Dashboard</h2>
+              <div class="reading-hero-actions">
+                <span id="reading-today-label">Not yet today</span>
+                <span id="reading-hero-week">0 moments this week</span>
+                <span id="reading-streak-label">0 day streak</span>
+              </div>
+            </div>
+            <p id="reading-action-status" class="task-action-status" aria-live="polite"></p>
+
+            <div class="reading-dashboard-grid">
+              <article class="panel reading-goal-card">
+                <h3>Weekly Goal</h3>
+                <div class="reading-week-ring" aria-label="Weekly reading goal">
+                  <div id="reading-week-ring-fill" class="reading-week-ring-fill">
+                    <strong id="reading-week-ring-percent">0%</strong>
+                    <span id="reading-week-ring-label">0 of 5 days</span>
                   </div>
-                  <div>
-                    <p class="reading-current-label">Current adventure</p>
-                    <h3 id="reading-current-book">unknown book</h3>
-                    <p id="reading-favorite-reaction" class="reading-reaction"></p>
-                    <div class="reading-current-progress">
-                      <span id="reading-current-detail">Latest independent reading book</span>
-                      <div class="reading-progress-bar" aria-hidden="true"><div id="reading-progress-fill"></div></div>
+                </div>
+                <p>Reading goal: 5 days a week</p>
+              </article>
+
+              <article class="panel reading-current-card">
+                <div id="reading-current-cover" class="reading-book-cover" aria-hidden="true">
+                  <span>Read</span>
+                </div>
+                <div>
+                  <p class="reading-current-label">Current adventure</p>
+                  <h3 id="reading-current-book">unknown book</h3>
+                  <p id="reading-favorite-reaction" class="reading-reaction"></p>
+                  <div class="reading-current-progress">
+                    <span id="reading-current-detail">Latest independent reading book</span>
+                    <div class="reading-progress-bar" aria-hidden="true"><div id="reading-progress-fill"></div></div>
+                  </div>
+                </div>
+              </article>
+
+              <article class="panel reading-streak-panel" data-dashboard-card="reading-streaks">
+                <div class="panel-header">
+                  <h3>Badges</h3>
+                  <span id="reading-badge-count">0 earned</span>
+                </div>
+                <div id="reading-badges" class="reading-badges"></div>
+                <div class="reading-streak-grid">
+                  <div><strong id="reading-current-streak">0</strong><span>Current streak</span></div>
+                  <div><strong id="reading-best-streak">0</strong><span>Best streak</span></div>
+                </div>
+              </article>
+            </div>
+
+            <div class="reading-story-grid">
+              <div class="reading-story-main">
+                <article class="panel reading-garden-card">
+                  <div class="panel-header">
+                    <div>
+                      <h3>Reading Garden</h3>
+                      <p id="reading-hero-message" class="reading-hero-message">Every book adds a sprout.</p>
                     </div>
+                    <span>This week</span>
+                  </div>
+                  <div class="reading-garden-visual" aria-label="Reading Garden visual">
+                    <div id="reading-garden-plot" class="reading-garden-plot"></div>
                   </div>
                 </article>
 
@@ -221,9 +279,34 @@
                   </div>
                   <div id="reading-recent-events" class="reading-event-list"></div>
                 </article>
+
+                <article class="panel reading-collection-panel" data-dashboard-card="reading-collection">
+                  <div class="panel-header">
+                    <h3>My Book Collection</h3>
+                    <span id="reading-collection-count">0 books</span>
+                  </div>
+                  <div id="reading-book-collection" class="reading-book-collection"></div>
+                </article>
+
+                <article class="panel reading-history-panel" data-dashboard-card="reading-history">
+                  <div class="panel-header">
+                    <h3>Reading History</h3>
+                    <span id="reading-month-summary">0 reading days this month</span>
+                  </div>
+                  <div id="reading-heatmap" class="reading-heatmap" aria-label="Reading history heatmap"></div>
+                  <p id="reading-heatmap-detail" class="reading-heatmap-detail">Tap a day to see reading details.</p>
+                </article>
               </div>
 
-              <aside class="reading-library-side">
+              <aside class="reading-story-side">
+                <article class="panel reading-photos-panel" data-dashboard-card="reading-photos">
+                  <div class="panel-header">
+                    <h3>Book Snaps</h3>
+                    <span id="reading-photo-count">0</span>
+                  </div>
+                  <div id="reading-photo-list" class="reading-photo-grid"></div>
+                </article>
+
                 <article class="panel reading-visit-panel">
                   <div class="panel-header">
                     <h3>Library Visit</h3>
@@ -248,24 +331,8 @@
                   </div>
                   <div id="reading-finished-books" class="reading-mini-list"></div>
                 </article>
-
-                <article class="panel reading-photos-panel" data-dashboard-card="reading-photos">
-                  <div class="panel-header">
-                    <h3>Book Snaps</h3>
-                    <span id="reading-photo-count">0</span>
-                  </div>
-                  <div id="reading-photo-list" class="reading-photo-grid"></div>
-                </article>
               </aside>
             </div>
-
-            <article class="panel reading-collection-panel" data-dashboard-card="reading-collection">
-              <div class="panel-header">
-                <h3>My Book Collection</h3>
-                <span id="reading-collection-count">0 books</span>
-              </div>
-              <div id="reading-book-collection" class="reading-book-collection"></div>
-            </article>
           </div>
         </section>
 
@@ -307,6 +374,29 @@
         </section>
       </main>
     </div>
+
+    <dialog id="backlog-add-dialog" class="backlog-dialog">
+      <form id="backlog-add-form" method="dialog">
+        <div class="dialog-header">
+          <h2>Add backlog item</h2>
+          <button id="backlog-dialog-close" class="icon-action" type="button" aria-label="Close">&#215;</button>
+        </div>
+        <fieldset class="backlog-kind-control">
+          <legend>Type</legend>
+          <label><input type="radio" name="kind" value="discussion" checked><span>Discussion</span></label>
+          <label><input type="radio" name="kind" value="planning"><span>Planning</span></label>
+          <label><input type="radio" name="kind" value="decision"><span>Decision</span></label>
+        </fieldset>
+        <label class="form-field">Title<input id="backlog-title-input" name="title" required maxlength="180"></label>
+        <div class="backlog-form-grid">
+          <label class="form-field">Owner
+            <select name="owner"><option value="unknown">Unassigned</option><option value="dad">Dad</option><option value="mom">Mom</option><option value="both">Both</option><option value="family">Family</option></select>
+          </label>
+          <label class="form-field"><span id="backlog-date-label">Review date</span><input name="date" type="date"></label>
+        </div>
+        <div class="dialog-actions"><button class="secondary-action" id="backlog-dialog-cancel" type="button">Cancel</button><button class="primary-action" type="submit">Add item</button></div>
+      </form>
+    </dialog>
 
     <script src="/static/dashboard/dashboard.js?v={{ASSET_VERSION}}"></script>
   </body>

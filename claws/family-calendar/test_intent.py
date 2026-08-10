@@ -184,6 +184,28 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(intent["intent"], "create_event")
         self.assertIn("date", intent["missing_fields"])
 
+    def test_absolute_month_name_date(self):
+        now = datetime(2026, 8, 9, 10, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Add back to school night August 11 at 4:30 PM", now=now)
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Back to school night")
+        self.assertEqual(intent["date"], "2026-08-11")
+        self.assertEqual(intent["start_time"], "16:30")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_numeric_slash_date(self):
+        now = datetime(2026, 8, 9, 10, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Add back to school night 8/11 at 4:30 PM", now=now)
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Back to school night")
+        self.assertEqual(intent["date"], "2026-08-11")
+        self.assertEqual(intent["start_time"], "16:30")
+        self.assertEqual(intent["missing_fields"], [])
+
     def test_list_tomorrow_intent(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
@@ -192,6 +214,53 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(intent["intent"], "list_events")
         self.assertEqual(intent["start"], "2026-07-03T00:00:00-07:00")
         self.assertEqual(intent["end"], "2026-07-04T00:00:00-07:00")
+        self.assertEqual(intent["metadata_filter"], {})
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_when_named_school_event_uses_text_query(self):
+        now = datetime(2026, 8, 9, 0, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("When is Nysha's first day of school?", now=now)
+
+        self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(intent["start"], "2026-08-09T00:39:00-07:00")
+        self.assertEqual(intent["end"], "2027-08-09T00:39:00-07:00")
+        self.assertEqual(intent["metadata_filter"], {"text_query": "first day of school"})
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_when_spring_break_uses_school_break_query(self):
+        now = datetime(2026, 8, 9, 0, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("when is Nysha's spring break", now=now)
+
+        self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(intent["start"], "2026-08-09T00:39:00-07:00")
+        self.assertEqual(intent["end"], "2027-08-09T00:39:00-07:00")
+        self.assertEqual(intent["metadata_filter"], {"text_query": "spring break"})
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_when_holidays_uses_no_school_queries(self):
+        now = datetime(2026, 8, 9, 0, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("when are Nysha's holidays?", now=now)
+
+        self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(intent["start"], "2026-08-09T00:39:00-07:00")
+        self.assertEqual(intent["end"], "2027-08-09T00:39:00-07:00")
+        self.assertEqual(
+            intent["metadata_filter"],
+            {"text_any_queries": ["holiday", "vacation", "break", "no school"]},
+        )
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_upcoming_school_events_uses_default_upcoming_range(self):
+        now = datetime(2026, 8, 9, 0, 39, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Nysha upcoming school events", now=now)
+
+        self.assertEqual(intent["intent"], "list_events")
+        self.assertEqual(intent["start"], "2026-08-09T00:39:00-07:00")
+        self.assertEqual(intent["end"], "2026-09-08T00:39:00-07:00")
         self.assertEqual(intent["metadata_filter"], {})
         self.assertEqual(intent["missing_fields"], [])
 

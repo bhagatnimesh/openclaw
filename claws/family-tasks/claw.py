@@ -97,6 +97,36 @@ def _task_url(task: dict[str, Any]) -> str | None:
 def _format_created_task_message(task: dict[str, Any]) -> str:
     title = task.get("title") or "Untitled task"
     task_url = _task_url(task)
+    notes, metadata = _task_notes_and_metadata(task)
+    owner = str(metadata.get("owner") or "unknown")
+    due = task.get("due")
+    normalized_notes = notes.strip().lower()
+    has_readable_notes = bool(
+        notes
+        and not normalized_notes.startswith("tags:")
+        and not normalized_notes.startswith("assistant help:")
+    )
+    has_readable_metadata = has_readable_notes
+    if has_readable_metadata:
+        lines = [f"Created task: {title}"]
+        if due:
+            try:
+                due_date = datetime.fromisoformat(str(due)[:10])
+                lines.append(f"Due: {due_date.strftime('%a, %b %-d')}")
+            except ValueError:
+                lines.append(f"Due: {due}")
+        if has_readable_notes:
+            lines.append(f"Details: {notes}")
+        if owner != "unknown":
+            lines.append(f"Owner: {owner}")
+        if task_url:
+            lines.append(f"Open: {task_url}")
+        else:
+            task_id = task.get("id")
+            if task_id:
+                lines.append(f"Task id: {task_id}")
+        return "\n".join(lines)
+
     if task_url:
         return f"Created task: {title} (open: {task_url})."
 

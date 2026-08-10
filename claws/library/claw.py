@@ -28,6 +28,8 @@ class LibraryClaw:
             "record_reading_garden_event": self.tools.record_reading,
             "record_library_checkout": self.tools.record_checkout,
             "reading_garden_status": self.tools.status,
+            "update_reading_garden_event": self.tools.update_reading,
+            "delete_reading_garden_event": self.tools.delete_reading,
         }
 
     def record_from_request(

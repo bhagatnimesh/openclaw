@@ -110,6 +110,28 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["title"], "Call builder")
         self.assertEqual(intent["notes"], "Ask whether the solar response came in.")
 
+    def test_prose_details_time_and_owner_create_readable_task(self):
+        now = datetime(2026, 8, 9, 10, 20, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add a task for Monday. Visit Nysha's school. "
+            "Details add driver, check on school supplies and things to get, "
+            "other dogs and donuts for the first day. Time 9 am\n"
+            "Owner: dad",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Visit Nysha's school")
+        self.assertEqual(intent["due"], "2026-08-10")
+        self.assertEqual(
+            intent["notes"],
+            "Add driver, check on school supplies and things to get, "
+            "other dogs and donuts for the first day.",
+        )
+        self.assertEqual(intent["metadata"]["owner"], "dad")
+        self.assertEqual(intent["missing_fields"], [])
+
     def test_below_email_followup_creates_readable_title_and_notes(self):
         now = datetime(2026, 7, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 

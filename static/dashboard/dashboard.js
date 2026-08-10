@@ -9,6 +9,12 @@
   var keepAliveFrameTimer = null;
   var keepAliveFrame = 0;
   var lastTasksData = {};
+  var lastReadingData = {};
+  var lastShoppingData = {};
+  var lastBacklogData = {};
+  var backlogReviewIndex = -1;
+  var selectedReadingChild = "Nysha";
+  var selectedShoppingList = "all";
 
   function byId(id) {
     return document.getElementById(id);
@@ -41,11 +47,17 @@
     var node = byId(id);
     if (!node) return;
     var count = Number(value || 0);
-    node.innerHTML = "<strong>" + count + "</strong> " + escapeHtml(count === 1 ? singular : plural);
+    node.innerHTML =
+      "<strong>" + count + "</strong> " + escapeHtml(count === 1 ? singular : plural);
   }
 
   function classToken(value, fallback) {
-    return text(value, fallback).toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || fallback;
+    return (
+      text(value, fallback)
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "") || fallback
+    );
   }
 
   function empty(label) {
@@ -68,7 +80,19 @@
 
   function closestActionTarget(target) {
     while (target && target !== document) {
-      if (target.getAttribute("data-task-complete") !== null || target.getAttribute("data-task-tag-filter") !== null) {
+      if (
+        target.getAttribute("data-task-complete") !== null ||
+        target.getAttribute("data-task-tag-filter") !== null ||
+        target.getAttribute("data-reading-child") !== null ||
+        target.getAttribute("data-reading-heatmap-day") !== null ||
+        target.getAttribute("data-reading-update") !== null ||
+        target.getAttribute("data-reading-delete") !== null ||
+        target.getAttribute("data-decision-complete") !== null ||
+        target.getAttribute("data-backlog-action") !== null ||
+        target.getAttribute("data-shopping-tab") !== null ||
+        target.getAttribute("data-shopping-check") !== null ||
+        target.getAttribute("data-shopping-clear") !== null
+      ) {
         return target;
       }
       target = target.parentNode;
@@ -107,7 +131,12 @@
   }
 
   function normalizeTag(value) {
-    return text(value).trim().replace(/^#/, "").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+    return text(value)
+      .trim()
+      .replace(/^#/, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "");
   }
 
   function selectedTaskTag() {
@@ -149,6 +178,20 @@
     var date = new Date(value + "T00:00:00");
     if (Number.isNaN(date.getTime())) return value;
     return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+
+  function formatWeekday(value) {
+    if (!value) return "";
+    var date = new Date(value + "T00:00:00");
+    if (Number.isNaN(date.getTime())) return value.slice(0, 3).toUpperCase();
+    return date.toLocaleDateString(undefined, { weekday: "short" }).toUpperCase();
+  }
+
+  function isoDateKey(date) {
+    var year = date.getFullYear();
+    var month = String(date.getMonth() + 1).padStart(2, "0");
+    var day = String(date.getDate()).padStart(2, "0");
+    return year + "-" + month + "-" + day;
   }
 
   function parseWakeLockPolicy() {
@@ -271,7 +314,8 @@
   async function startVideoKeepAlive() {
     var video = ensureKeepAliveVideo();
     if (!video) {
-      var label = window.isSecureContext === false ? "Screen wake needs HTTPS" : "Screen wake unsupported";
+      var label =
+        window.isSecureContext === false ? "Screen wake needs HTTPS" : "Screen wake unsupported";
       setWakeLockStatus(label, "unsupported");
       return false;
     }
@@ -350,9 +394,11 @@
       node.innerHTML = "<span>Fits the current moment</span>";
       return;
     }
-    node.innerHTML = reasons.map(function (reason) {
-      return "<span>" + escapeHtml(reason) + "</span>";
-    }).join("");
+    node.innerHTML = reasons
+      .map(function (reason) {
+        return "<span>" + escapeHtml(reason) + "</span>";
+      })
+      .join("");
   }
 
   function renderTimeline(events) {
@@ -364,18 +410,20 @@
       node.innerHTML = "";
       return;
     }
-    node.innerHTML = events.map(function (event) {
-      var detail = [event.person, event.owner_label, event.location].filter(Boolean).join(" | ");
-      return (
-        '<div class="timeline-item"><p class="timeline-time">' +
-        escapeHtml(event.time_label) +
-        '</p><p class="timeline-title">' +
-        escapeHtml(event.title) +
-        '</p><p class="timeline-detail">' +
-        escapeHtml(detail) +
-        "</p></div>"
-      );
-    }).join("");
+    node.innerHTML = events
+      .map(function (event) {
+        var detail = [event.person, event.owner_label, event.location].filter(Boolean).join(" | ");
+        return (
+          '<div class="timeline-item"><p class="timeline-time">' +
+          escapeHtml(event.time_label) +
+          '</p><p class="timeline-title">' +
+          escapeHtml(event.title) +
+          '</p><p class="timeline-detail">' +
+          escapeHtml(detail) +
+          "</p></div>"
+        );
+      })
+      .join("");
   }
 
   function renderHomeBoard(items) {
@@ -396,49 +444,159 @@
       grouped[person].push(item);
     });
 
-    node.innerHTML = Object.keys(grouped).sort().map(function (person) {
-      var rows = grouped[person].map(function (item) {
-        var priority = classToken(item.priority, "medium");
+    node.innerHTML = Object.keys(grouped)
+      .sort()
+      .map(function (person) {
+        var rows = grouped[person]
+          .map(function (item) {
+            var priority = classToken(item.priority, "medium");
+            return (
+              '<div class="home-board-item priority-' +
+              escapeHtml(priority) +
+              '"><span class="home-board-check" aria-hidden="true"></span><div><strong>' +
+              escapeHtml(item.message) +
+              "</strong><span>" +
+              escapeHtml(item.context_label || "General") +
+              "</span></div></div>"
+            );
+          })
+          .join("");
         return (
-          '<div class="home-board-item priority-' +
-          escapeHtml(priority) +
-          '"><span class="home-board-check" aria-hidden="true"></span><div><strong>' +
-          escapeHtml(item.message) +
-          '</strong><span>' +
-          escapeHtml(item.context_label || "General") +
-          "</span></div></div>"
+          '<section class="home-board-group"><h4>' +
+          escapeHtml(person) +
+          '</h4><div class="home-board-group-items">' +
+          rows +
+          "</div></section>"
         );
-      }).join("");
-      return (
-        '<section class="home-board-group"><h4>' +
-        escapeHtml(person) +
-        '</h4><div class="home-board-group-items">' +
-        rows +
-        "</div></section>"
-      );
-    }).join("");
+      })
+      .join("");
   }
 
-  function gardenToken(className, label) {
-    return '<span class="garden-token ' + escapeHtml(className) + '" aria-label="' + escapeHtml(label) + '"></span>';
-  }
+  function readingGardenWeekDays(history, recentEvents, fallbackActiveDays, readToday) {
+    var countByDate = {};
+    (history.heatmap || []).forEach(function (day) {
+      if (day.date) countByDate[day.date] = Number(day.count || 0);
+    });
+    recentEvents.forEach(function (event) {
+      if (event.date && !countByDate[event.date]) countByDate[event.date] = 0;
+      if (event.date) countByDate[event.date] += 1;
+    });
 
-  function gardenTokens(count, className, label, maxCount) {
-    var total = Math.max(0, Math.min(Number(count || 0), maxCount));
-    var html = "";
-    for (var index = 0; index < total; index += 1) {
-      html += gardenToken(className, label);
+    var today = new Date();
+    var days = [];
+    for (var offset = 6; offset >= 0; offset -= 1) {
+      var date = new Date(today);
+      date.setDate(today.getDate() - offset);
+      var key = isoDateKey(date);
+      days.push({
+        date: key,
+        label: formatWeekday(key),
+        count: Number(countByDate[key] || 0),
+        today: offset === 0,
+      });
     }
-    return html;
+
+    if (readToday && !days[days.length - 1].count) {
+      days[days.length - 1].count = 1;
+    }
+
+    var hasReadingDays = days.some(function (day) {
+      return day.count > 0;
+    });
+    var activeDays = Math.max(0, Math.min(Number(fallbackActiveDays || 0), days.length));
+    if (!hasReadingDays && activeDays > 0) {
+      days.slice(days.length - activeDays).forEach(function (day) {
+        day.count = 1;
+      });
+    }
+    return days;
+  }
+
+  function renderReadingGardenPlot(history, recentEvents, fallbackActiveDays, readToday) {
+    var plot = byId("reading-garden-plot");
+    if (!plot) return;
+    var days = readingGardenWeekDays(
+      history || {},
+      recentEvents || [],
+      fallbackActiveDays,
+      readToday,
+    );
+    plot.innerHTML = days
+      .map(function (day) {
+        var count = Number(day.count || 0);
+        var level = count >= 3 ? 3 : count >= 2 ? 2 : count >= 1 ? 1 : 0;
+        return (
+          '<div class="reading-garden-day' +
+          (day.today ? " is-today" : "") +
+          '" data-level="' +
+          level +
+          '" title="' +
+          escapeHtml(
+            formatPlainDate(day.date) + ": " + count + (count === 1 ? " moment" : " moments"),
+          ) +
+          '"><span class="reading-growth" aria-hidden="true"></span><strong>' +
+          escapeHtml(day.label) +
+          "</strong></div>"
+        );
+      })
+      .join("");
+  }
+
+  function readingBadgeIconClass(label) {
+    var normalized = text(label).toLowerCase();
+    if (normalized.indexOf("explorer") !== -1 || normalized.indexOf("look") !== -1)
+      return "is-explorer";
+    if (normalized.indexOf("reader") !== -1 || normalized.indexOf("star") !== -1)
+      return "is-reader";
+    if (normalized.indexOf("streak") !== -1) return "is-streak";
+    return "is-sprout";
   }
 
   function readingEventDetail(event) {
     var parts = [];
+    if (event.date) parts.push(formatPlainDate(event.date));
     if (event.pages) parts.push(event.pages + " pages");
     if (event.minutes) parts.push(event.minutes + " minutes");
+    if (event.reading_mode === "read_together") parts.push("read together");
+    if (event.reading_mode === "read_aloud") parts.push("read aloud");
     if (event.status === "completed") parts.push("finished");
     if (!parts.length) parts.push("reading moment");
     return parts.join(" | ");
+  }
+
+  function selectedReadingSummary(data) {
+    data = data || {};
+    var byChild = data.by_child || {};
+    var childKeys = Object.keys(byChild);
+    if (selectedReadingChild === "Family" && data.family) return data.family;
+    if (byChild[selectedReadingChild]) return byChild[selectedReadingChild];
+    if (childKeys.length) {
+      selectedReadingChild = childKeys[0];
+      return byChild[selectedReadingChild];
+    }
+    return data;
+  }
+
+  function renderReadingChildTabs(data) {
+    var node = byId("reading-child-tabs");
+    if (!node) return;
+    var byChild = data.by_child || {};
+    var children = (data.children || Object.keys(byChild)).slice();
+    if (data.family) children.push("Family");
+    node.innerHTML = children
+      .map(function (child) {
+        var active = child === selectedReadingChild ? " is-active" : "";
+        return (
+          '<button class="reading-child-tab' +
+          active +
+          '" type="button" data-reading-child="' +
+          escapeHtml(child) +
+          '">' +
+          escapeHtml(child) +
+          "</button>"
+        );
+      })
+      .join("");
   }
 
   function readingCollectionBooks(data) {
@@ -452,6 +610,9 @@
       seen[key] = true;
       books.push({ title: cleaned, status: status });
     }
+    (data.book_collection || []).forEach(function (book) {
+      addBook(book.title, book.status || "Reading");
+    });
     addBook(data.current_book, "Current");
     (finished.recent_books || []).forEach(function (book) {
       addBook(book, "Finished");
@@ -475,110 +636,203 @@
       node.innerHTML = "";
       return;
     }
-    node.innerHTML = books.slice(0, 10).map(function (book, index) {
-      var initial = book.title.slice(0, 1).toUpperCase();
-      var tone = index % 3 === 0 ? "is-primary" : index % 3 === 1 ? "is-secondary" : "is-tertiary";
-      return (
-        '<div class="reading-book-tile"><div class="reading-book-mini-cover ' +
-        tone +
-        '"><span>' +
-        escapeHtml(initial) +
-        '</span></div><strong>' +
-        escapeHtml(book.title) +
-        '</strong><span>' +
-        escapeHtml(book.status) +
-        "</span></div>"
-      );
-    }).join("");
+    node.innerHTML = books
+      .slice(0, 10)
+      .map(function (book, index) {
+        var initial = book.title.slice(0, 1).toUpperCase();
+        var tone =
+          index % 3 === 0 ? "is-primary" : index % 3 === 1 ? "is-secondary" : "is-tertiary";
+        return (
+          '<div class="reading-book-tile"><div class="reading-book-mini-cover ' +
+          tone +
+          '"><span>' +
+          escapeHtml(initial) +
+          "</span></div><strong>" +
+          escapeHtml(book.title) +
+          "</strong><span>" +
+          escapeHtml(book.status) +
+          "</span></div>"
+        );
+      })
+      .join("");
   }
 
   function renderReadingGarden(data) {
     data = data || {};
+    lastReadingData = data;
+    renderReadingChildTabs(data);
+    data = selectedReadingSummary(data);
     var today = data.today || {};
     var week = data.week || {};
     var finished = data.finished || {};
-    var garden = data.garden || {};
+    var weeklyGoal = data.weekly_goal || {};
+    var streaks = data.streaks || {};
+    var history = data.history || {};
     var recentEvents = data.recent_events || [];
+    var photos = data.recent_photos || [];
     var currentBook = data.current_book || "unknown book";
     var momentCount = Number(week.reading_moments || 0);
     var pageCount = Number(week.pages || 0);
     var minuteCount = Number(week.minutes || 0);
-    setText("reading-garden-title", data.title || "Nysha’s Reading Garden: I Read It Myself");
+    var readingDays = Number(week.reading_days || weeklyGoal.reading_days || 0);
+    var inferredReadingDays = readingDays || (momentCount > 0 ? 1 : 0);
+    var weeklyTarget = Number(weeklyGoal.target_days || 5);
+    var inferredRingPercent =
+      weeklyTarget > 0 ? Math.round(Math.min(1, inferredReadingDays / weeklyTarget) * 100) : 0;
+    setText(
+      "reading-garden-title",
+      selectedReadingChild === "Family" ? "Family Reading Garden" : "Reading Garden Kid Dashboard",
+    );
     setText("reading-today-label", today.label || "Not yet today");
-    setText("reading-hero-week", momentCount + (momentCount === 1 ? " moment this week" : " moments this week"));
+    setText(
+      "reading-hero-week",
+      weeklyGoal.label || inferredReadingDays + " reading days this week",
+    );
+    setText(
+      "reading-streak-label",
+      Number(streaks.current || 0) +
+        (Number(streaks.current || 0) === 1 ? " day streak" : " day streak"),
+    );
     setText(
       "reading-hero-message",
       today.read
         ? "Your garden grew today. Every page counts."
-        : "A reading moment can grow the garden today."
+        : "A reading moment can grow the garden today.",
     );
     setText("reading-current-book", currentBook);
-    setText("reading-current-detail", currentBook === "unknown book" ? "Waiting for the next independent read" : "Latest independent reading book");
+    setText(
+      "reading-current-detail",
+      currentBook === "unknown book"
+        ? "Waiting for the next independent read"
+        : "Latest independent reading book",
+    );
     setText("reading-week-moments", momentCount);
     setText("reading-week-pages", pageCount);
     setText("reading-week-minutes", minuteCount);
     setText("reading-finished-count", finished.count || 0);
-    setText("reading-moment-count", recentEvents.length + (recentEvents.length === 1 ? " moment" : " moments"));
+    setText(
+      "reading-moment-count",
+      recentEvents.length + (recentEvents.length === 1 ? " moment" : " moments"),
+    );
     setText("reading-bloomed-count", finished.count || 0);
-    var progress = Math.max(8, Math.min(100, (momentCount * 18) + (pageCount > 0 ? 18 : 0) + (minuteCount > 0 ? 14 : 0)));
+    setText("reading-current-streak", streaks.current || 0);
+    setText("reading-best-streak", streaks.best || 0);
+    var progress = Math.max(
+      8,
+      Math.min(100, momentCount * 18 + (pageCount > 0 ? 18 : 0) + (minuteCount > 0 ? 14 : 0)),
+    );
     var progressFill = byId("reading-progress-fill");
     if (progressFill) {
       progressFill.style.width = progress + "%";
     }
+    var ringPercent = Number(weeklyGoal.percent || inferredRingPercent);
+    var ring = byId("reading-week-ring-fill");
+    if (ring) {
+      ring.style.setProperty(
+        "--reading-ring-percent",
+        Math.max(0, Math.min(100, ringPercent)) + "%",
+      );
+    }
+    setText("reading-week-ring-percent", inferredReadingDays + " of " + weeklyTarget + " days");
+    setText("reading-week-ring-label", "Weekly progress");
+
+    var coverNode = byId("reading-current-cover");
+    var coverPhoto = photos.length ? photos[0] : null;
+    if (coverNode) {
+      if (coverPhoto && coverPhoto.path) {
+        coverNode.style.backgroundImage =
+          'url("' + String(coverPhoto.path).replace(/"/g, "%22") + '")';
+        coverNode.classList.add("has-photo");
+      } else {
+        coverNode.style.backgroundImage = "";
+        coverNode.classList.remove("has-photo");
+      }
+    }
 
     var reactionNode = byId("reading-favorite-reaction");
     if (reactionNode) {
-      reactionNode.textContent = data.favorite_reaction ? "Favorite discovery: " + data.favorite_reaction : "";
+      reactionNode.textContent = data.favorite_reaction
+        ? "Favorite discovery: " + data.favorite_reaction
+        : "";
       reactionNode.hidden = !data.favorite_reaction;
     }
 
-    var plot = byId("reading-garden-plot");
-    if (plot) {
-      var plotHtml = [
-        gardenTokens(garden.sprouts, "is-sprout", "reading day sprout", 8),
-        gardenTokens(garden.leaves, "is-leaf", "five page leaf", 10),
-        gardenTokens(garden.flowers, "is-flower", "finished book flower", 8),
-        gardenTokens(garden.butterflies, "is-butterfly", "favorite discovery butterfly", 6),
-      ].join("");
-      plot.innerHTML = plotHtml || '<span class="garden-token is-soil" aria-label="garden soil"></span>';
-    }
+    renderReadingGardenPlot(history, recentEvents, inferredReadingDays, !!today.read);
 
     var finishedNode = byId("reading-finished-books");
     var recentBooks = finished.recent_books || [];
     setCardHidden("reading-bloomed", !recentBooks.length);
     if (finishedNode) {
       finishedNode.innerHTML = recentBooks.length
-        ? recentBooks.slice(0, 4).map(function (book) {
-            return (
-              '<div class="reading-bloomed-item"><span class="garden-token is-flower" aria-hidden="true"></span><div><strong>' +
-              escapeHtml(book) +
-              '</strong><span>I read it myself</span></div></div>'
-            );
-          }).join("")
+        ? recentBooks
+            .slice(0, 4)
+            .map(function (book) {
+              return (
+                '<div class="reading-bloomed-item"><span class="garden-token is-flower" aria-hidden="true"></span><div><strong>' +
+                escapeHtml(book) +
+                "</strong><span>I read it myself</span></div></div>"
+              );
+            })
+            .join("")
+        : "";
+    }
+
+    var badges = data.badges || [];
+    var earnedBadges = badges.filter(function (badge) {
+      return badge.earned;
+    });
+    setText("reading-badge-count", earnedBadges.length + " earned");
+    var badgeNode = byId("reading-badges");
+    if (badgeNode) {
+      badgeNode.innerHTML = badges.length
+        ? badges
+            .map(function (badge) {
+              var iconClass = readingBadgeIconClass(badge.label || "");
+              var badgeDetail = text(
+                badge.detail ||
+                  (badge.earned ? "Celebrating your reading." : "Keep reading to unlock."),
+              ).slice(0, 84);
+              return (
+                '<div class="reading-badge' +
+                (badge.earned ? " is-earned" : "") +
+                '" title="' +
+                escapeHtml(badge.detail || "") +
+                '"><span class="reading-badge-icon ' +
+                iconClass +
+                '" aria-hidden="true"></span><div><strong>' +
+                escapeHtml(badge.label || "") +
+                "</strong><span>" +
+                escapeHtml(badgeDetail) +
+                "</span></div></div>"
+              );
+            })
+            .join("")
         : "";
     }
 
     var photoNode = byId("reading-photo-list");
-    var photos = data.recent_photos || [];
     setText("reading-photo-count", photos.length);
     setCardHidden("reading-photos", !photos.length);
     if (photoNode) {
       photoNode.innerHTML = photos.length
-        ? photos.slice(0, 6).map(function (photo) {
-            var book = photo.book || "Book photo";
-            if (photo.path) {
-              return (
-                '<div class="reading-photo-item"><img src="' +
-                escapeHtml(photo.path) +
-                '" alt="' +
-                escapeHtml(book) +
-                '"><span>' +
-                escapeHtml(book) +
-                "</span></div>"
-              );
-            }
-            return listItem(book, "");
-          }).join("")
+        ? photos
+            .slice(0, 6)
+            .map(function (photo) {
+              var book = photo.book || "Book photo";
+              if (photo.path) {
+                return (
+                  '<div class="reading-photo-item"><img src="' +
+                  escapeHtml(photo.path) +
+                  '" alt="' +
+                  escapeHtml(book) +
+                  '"><span>' +
+                  escapeHtml(book) +
+                  "</span></div>"
+                );
+              }
+              return listItem(book, "");
+            })
+            .join("")
         : "";
     }
 
@@ -586,21 +840,76 @@
     setCardHidden("reading-moments", !recentEvents.length);
     if (eventsNode) {
       eventsNode.innerHTML = recentEvents.length
-        ? recentEvents.slice(0, 6).map(function (event) {
-            var title = event.book && event.book !== "unknown book" ? event.book : "Reading moment";
-            return (
-              '<div class="reading-event-item"><span class="garden-token is-sprout" aria-hidden="true"></span><div><strong>' +
-              escapeHtml(title) +
-              '</strong><span>' +
-              escapeHtml(readingEventDetail(event)) +
-              "</span></div></div>"
-            );
-          }).join("")
+        ? recentEvents
+            .slice(0, 6)
+            .map(function (event) {
+              var title =
+                event.book && event.book !== "unknown book" ? event.book : "Reading moment";
+              return (
+                '<div class="reading-event-item"><span class="garden-token is-sprout" aria-hidden="true"></span><div><strong>' +
+                escapeHtml(title) +
+                "</strong><span>" +
+                escapeHtml(readingEventDetail(event)) +
+                '</span><span class="reading-event-mode">' +
+                escapeHtml(readingModeLabel(event.reading_mode)) +
+                "</span>" +
+                readingEventEditControls(event) +
+                "</div></div>"
+              );
+            })
+            .join("")
         : "";
     }
 
     renderLibraryBag(data.library_visit || {}, data.current_bag || {});
     renderBookCollection(data);
+    renderReadingHistory(history);
+  }
+
+  function renderReadingHistory(history) {
+    history = history || {};
+    var monthly = history.monthly || {};
+    setText(
+      "reading-month-summary",
+      Number(monthly.reading_days || 0) +
+        (Number(monthly.reading_days || 0) === 1 ? " reading day" : " reading days") +
+        " this month",
+    );
+    var node = byId("reading-heatmap");
+    if (!node) return;
+    var days = history.heatmap || [];
+    setCardHidden("reading-history", !days.length);
+    node.innerHTML = days
+      .map(function (day) {
+        var count = Number(day.count || 0);
+        var level = count >= 3 ? 3 : count >= 2 ? 2 : count >= 1 ? 1 : 0;
+        var label =
+          formatPlainDate(day.date) + ": " + count + (count === 1 ? " moment" : " moments");
+        return (
+          '<button type="button" class="reading-heatmap-day" data-reading-heatmap-day data-date="' +
+          escapeHtml(day.date) +
+          '" data-count="' +
+          count +
+          '" data-level="' +
+          level +
+          '" title="' +
+          escapeHtml(label) +
+          '" aria-label="' +
+          escapeHtml(label) +
+          '"></button>'
+        );
+      })
+      .join("");
+    setText("reading-heatmap-detail", "Tap a day to see reading details.");
+  }
+
+  function showReadingHeatmapDetail(target) {
+    var date = target.getAttribute("data-date") || "";
+    var count = Number(target.getAttribute("data-count") || 0);
+    setText(
+      "reading-heatmap-detail",
+      formatPlainDate(date) + ": " + count + (count === 1 ? " reading moment" : " reading moments"),
+    );
   }
 
   function renderLibraryBag(visit, bag) {
@@ -609,10 +918,15 @@
     var count = Number(bag.count || 0);
     var days = visit.days_since_visit;
     var daysLabel = visit.has_visit
-      ? (days === 0 ? "Today" : days + (days === 1 ? " day ago" : " days ago"))
+      ? days === 0
+        ? "Today"
+        : days + (days === 1 ? " day ago" : " days ago")
       : "Not started";
     setText("library-visit-days", daysLabel);
-    setText("library-visit-label", visit.label || "Paste a library checkout email to start your library bag.");
+    setText(
+      "library-visit-label",
+      visit.label || "Paste a library checkout email to start your library bag.",
+    );
     setText("library-bag-count", count + (count === 1 ? " book" : " books"));
 
     var dueNode = byId("library-due-date");
@@ -627,43 +941,33 @@
     setCardHidden("library-bag", !titles.length);
     if (!listNode) return;
     listNode.innerHTML = titles.length
-      ? titles.slice(0, 12).map(function (title) {
-          return (
-            '<div class="library-bag-item"><span class="garden-token is-leaf" aria-hidden="true"></span><strong>' +
-            escapeHtml(title) +
-            "</strong></div>"
-          );
-        }).join("")
+      ? titles
+          .slice(0, 12)
+          .map(function (title) {
+            return (
+              '<div class="library-bag-item"><span class="garden-token is-leaf" aria-hidden="true"></span><strong>' +
+              escapeHtml(title) +
+              "</strong></div>"
+            );
+          })
+          .join("")
       : "";
   }
 
   function renderSummary(data) {
     var summary = data.summary || {};
     var family = data.family || {};
-    setSummaryChip("summary-open", summary.open_loop_count, "task", "tasks");
     setSummaryChip("summary-prep", summary.prep_needed_count, "prep", "prep");
     setSummaryChip("summary-decisions", summary.open_decision_count, "decision", "decisions");
     setSummaryChip("summary-home", summary.home_board_count, "home", "home");
     setSummaryChip(
       "summary-family",
-      (family.responsibilities || []).length + (family.child_events || []).length + (family.unassigned || []).length,
+      (family.responsibilities || []).length +
+        (family.child_events || []).length +
+        (family.unassigned || []).length,
       "family",
-      "family"
+      "family",
     );
-  }
-
-  function renderOpenLoops(tasks) {
-    var node = byId("open-loops");
-    if (!node) return;
-    tasks = tasks || [];
-    setCardHidden("open-loops", !tasks.length);
-    if (!tasks.length) {
-      node.innerHTML = "";
-      return;
-    }
-    node.innerHTML = tasks.slice(0, 3).map(function (task) {
-      return listItem(task.title, [task.due_label, task.owner_label].join(" | "));
-    }).join("");
   }
 
   function renderPrep(events) {
@@ -675,9 +979,12 @@
       node.innerHTML = "";
       return;
     }
-    node.innerHTML = events.slice(0, 3).map(function (event) {
-      return listItem(event.title, event.preparation_notes || event.day_label);
-    }).join("");
+    node.innerHTML = events
+      .slice(0, 3)
+      .map(function (event) {
+        return listItem(event.title, event.preparation_notes || event.day_label);
+      })
+      .join("");
   }
 
   function renderWarnings(warnings) {
@@ -689,61 +996,19 @@
       node.innerHTML = "";
       return;
     }
-    node.innerHTML = warnings.slice(0, 3).map(function (warning) {
-      return listItem(warning.title, warning.detail);
-    }).join("");
-  }
-
-  function renderPlanning(items) {
-    var node = byId("planning-items");
-    if (!node) return;
-    items = items || [];
-    setContainerHidden("planning-items", !items.length);
-    if (!items.length) {
-      node.innerHTML = "";
-      return;
-    }
-    node.innerHTML = items.map(function (item) {
-      var progress = item.prep_progress;
-      var progressHtml = "";
-      if (progress !== null && progress !== undefined) {
-        progressHtml =
-          '<div class="progress" aria-label="Preparation progress"><div style="width:' +
-          Number(progress) +
-          '%"></div></div>';
-      }
-      var actions = item.action_items && item.action_items.length
-        ? '<div class="mini-list">' + item.action_items.map(function (task) {
-            return listItem(task.title, task.due_label || task.owner_label);
-          }).join("") + "</div>"
-        : empty("No linked action items yet.");
-      return (
-        '<article class="planning-card"><p class="eyebrow">' +
-        escapeHtml(item.days_until === 0 ? "Today" : "In " + item.days_until + " days") +
-        "</p><h3>" +
-        escapeHtml(item.title) +
-        '</h3><div class="meta-row"><span class="chip warm">' +
-        escapeHtml(item.category || "planning") +
-        '</span><span class="chip">' +
-        escapeHtml(item.owner_label) +
-        '</span><span class="chip green">' +
-        escapeHtml(item.date_label) +
-        "</span>" +
-        (item.prep_needed ? '<span class="chip alert">Prep needed</span>' : "") +
-        "</div>" +
-        progressHtml +
-        '<p class="muted">' +
-        escapeHtml(item.prep_notes || "No prep notes available.") +
-        "</p>" +
-        actions +
-        "</article>"
-      );
-    }).join("");
+    node.innerHTML = warnings
+      .slice(0, 3)
+      .map(function (warning) {
+        return listItem(warning.title, warning.detail);
+      })
+      .join("");
   }
 
   function taskBadge(label, tone) {
     if (!label) return "";
-    return '<span class="task-badge ' + escapeHtml(tone || "") + '">' + escapeHtml(label) + "</span>";
+    return (
+      '<span class="task-badge ' + escapeHtml(tone || "") + '">' + escapeHtml(label) + "</span>"
+    );
   }
 
   function taskTagBadge(tag) {
@@ -796,23 +1061,31 @@
       '<button class="task-tag-filter ' +
       (!selectedTag ? "is-active" : "") +
       '" type="button" data-task-tag-filter="">All</button>';
-    var tagButtons = tags.map(function (tag) {
-      return (
-        '<button class="task-tag-filter ' +
-        (tag === selectedTag ? "is-active" : "") +
-        '" type="button" data-task-tag-filter="' +
-        escapeHtml(tag) +
-        '">#' +
-        escapeHtml(tag) +
-        "</button>"
-      );
-    }).join("");
-    var resultLabel = selectedTag ? '<span class="task-tag-result">' + escapeHtml(taskCount) + " shown</span>" : "";
+    var tagButtons = tags
+      .map(function (tag) {
+        return (
+          '<button class="task-tag-filter ' +
+          (tag === selectedTag ? "is-active" : "") +
+          '" type="button" data-task-tag-filter="' +
+          escapeHtml(tag) +
+          '">#' +
+          escapeHtml(tag) +
+          "</button>"
+        );
+      })
+      .join("");
+    var resultLabel = selectedTag
+      ? '<span class="task-tag-result">' + escapeHtml(taskCount) + " shown</span>"
+      : "";
     node.innerHTML = allButton + tagButtons + resultLabel;
   }
 
   function taskTone(task) {
-    if (task.days_until_due !== null && task.days_until_due !== undefined && task.days_until_due < 0) {
+    if (
+      task.days_until_due !== null &&
+      task.days_until_due !== undefined &&
+      task.days_until_due < 0
+    ) {
       return "is-overdue";
     }
     if (task.days_until_due === 0) {
@@ -848,9 +1121,194 @@
     node.dataset.state = state || "";
   }
 
+  function setDecisionActionStatus(message, state) {
+    var node = byId("decision-action-status");
+    if (!node) return;
+    node.textContent = text(message);
+    node.dataset.state = state || "";
+  }
+
+  function setShoppingActionStatus(message, state) {
+    var node = byId("shopping-action-status");
+    if (!node) return;
+    node.textContent = text(message);
+    node.dataset.state = state || "";
+  }
+
+  function setReadingActionStatus(message, state) {
+    var node = byId("reading-action-status");
+    if (!node) return;
+    node.textContent = text(message);
+    node.dataset.state = state || "";
+  }
+
   function actionToken() {
     var node = document.querySelector('meta[name="n4os-dashboard-action-token"]');
     return node ? node.getAttribute("content") || "" : "";
+  }
+
+  function parseOptionalNumber(value) {
+    var cleaned = text(value).trim();
+    if (!cleaned) return null;
+    var parsed = Number(cleaned);
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : null;
+  }
+
+  function readingModeLabel(value) {
+    if (value === "read_together") return "Read together";
+    if (value === "read_aloud") return "Read aloud";
+    if (value === "independent") return "Independent";
+    return "Unknown";
+  }
+
+  function readingEventEditControls(event) {
+    if (!event.id) return "";
+    var pages = event.pages === null || event.pages === undefined ? "" : event.pages;
+    var minutes = event.minutes === null || event.minutes === undefined ? "" : event.minutes;
+    var status = event.status || "in_progress";
+    var mode = event.reading_mode || "unknown";
+    return (
+      '<details class="reading-edit-panel"><summary>Edit</summary>' +
+      '<div class="reading-edit-grid" data-reading-edit-form="' +
+      escapeHtml(event.id) +
+      '">' +
+      '<label>Book<input data-reading-field="book" value="' +
+      escapeHtml(event.book || "") +
+      '"></label>' +
+      '<label>Date<input data-reading-field="date" type="date" value="' +
+      escapeHtml(event.date || "") +
+      '"></label>' +
+      '<label>Pages<input data-reading-field="pages" type="number" min="0" value="' +
+      escapeHtml(String(pages)) +
+      '"></label>' +
+      '<label>Minutes<input data-reading-field="minutes" type="number" min="0" value="' +
+      escapeHtml(String(minutes)) +
+      '"></label>' +
+      '<label>Status<select data-reading-field="status"><option value="in_progress"' +
+      (status === "in_progress" ? " selected" : "") +
+      '>Reading</option><option value="completed"' +
+      (status === "completed" ? " selected" : "") +
+      '>Finished</option><option value="unknown"' +
+      (status === "unknown" ? " selected" : "") +
+      ">Unknown</option></select></label>" +
+      '<label>Mode<select data-reading-field="reading_mode"><option value="independent"' +
+      (mode === "independent" ? " selected" : "") +
+      '>Independent</option><option value="read_together"' +
+      (mode === "read_together" ? " selected" : "") +
+      '>Read together</option><option value="read_aloud"' +
+      (mode === "read_aloud" ? " selected" : "") +
+      '>Read aloud</option><option value="unknown"' +
+      (mode === "unknown" ? " selected" : "") +
+      ">Unknown</option></select></label>" +
+      "</div>" +
+      '<div class="reading-event-actions"><button class="reading-save-button" type="button" data-reading-update="' +
+      escapeHtml(event.id) +
+      '">Save</button><button class="reading-delete-button" type="button" data-reading-delete="' +
+      escapeHtml(event.id) +
+      '">Delete</button></div></details>'
+    );
+  }
+
+  function readingEventPayload(eventId) {
+    var form = null;
+    Array.prototype.some.call(
+      document.querySelectorAll("[data-reading-edit-form]"),
+      function (candidate) {
+        if (candidate.getAttribute("data-reading-edit-form") === eventId) {
+          form = candidate;
+          return true;
+        }
+        return false;
+      },
+    );
+    if (!form) return null;
+    function field(name) {
+      var node = form.querySelector('[data-reading-field="' + name + '"]');
+      return node ? node.value : "";
+    }
+    var pagesRaw = field("pages");
+    var minutesRaw = field("minutes");
+    return {
+      event_id: eventId,
+      book: field("book"),
+      date: field("date"),
+      pages: parseOptionalNumber(pagesRaw),
+      minutes: parseOptionalNumber(minutesRaw),
+      status: field("status"),
+      reading_mode: field("reading_mode"),
+      clear_pages: text(pagesRaw).trim() === "",
+      clear_minutes: text(minutesRaw).trim() === "",
+    };
+  }
+
+  function postReadingUpdate(eventId, button) {
+    var payload = readingEventPayload(eventId);
+    if (!payload) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Saving";
+    }
+    setReadingActionStatus("Updating reading moment...", "pending");
+
+    var request = new XMLHttpRequest();
+    request.open("POST", "/api/library/reading/update", true);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      var response = {};
+      try {
+        response = JSON.parse(request.responseText || "{}");
+      } catch (_error) {
+        response = {};
+      }
+      if (request.status >= 200 && request.status < 300 && response.status === "ok") {
+        setReadingActionStatus("Reading moment updated.", "ok");
+        loadDashboard();
+        return;
+      }
+      setReadingActionStatus(response.message || "Reading update failed.", "error");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Save";
+      }
+    };
+    request.send(JSON.stringify(payload));
+  }
+
+  function postReadingDelete(eventId, button) {
+    if (!eventId) return;
+    if (!window.confirm("Delete this reading moment?")) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Deleting";
+    }
+    setReadingActionStatus("Deleting reading moment...", "pending");
+
+    var request = new XMLHttpRequest();
+    request.open("POST", "/api/library/reading/delete", true);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      var response = {};
+      try {
+        response = JSON.parse(request.responseText || "{}");
+      } catch (_error) {
+        response = {};
+      }
+      if (request.status >= 200 && request.status < 300 && response.status === "ok") {
+        setReadingActionStatus("Reading moment deleted.", "ok");
+        loadDashboard();
+        return;
+      }
+      setReadingActionStatus(response.message || "Reading delete failed.", "error");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Delete";
+      }
+    };
+    request.send(JSON.stringify({ event_id: eventId }));
   }
 
   function taskCompleteButton(task) {
@@ -899,12 +1357,251 @@
     request.send(JSON.stringify({ task_id: taskId }));
   }
 
+  function decisionCompleteButton(decision) {
+    if (!decision.id) return "";
+    return (
+      '<button class="decision-complete-button" type="button" data-decision-complete="' +
+      escapeHtml(decision.id) +
+      '" aria-label="Mark decision done: ' +
+      escapeHtml(decision.title) +
+      '">Done</button>'
+    );
+  }
+
+  function postCompleteDecision(decisionId, button) {
+    if (!decisionId) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Saving";
+    }
+    setDecisionActionStatus("Marking decision done...", "pending");
+
+    var request = new XMLHttpRequest();
+    request.open("POST", "/api/decisions/complete", true);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      var payload = {};
+      try {
+        payload = JSON.parse(request.responseText || "{}");
+      } catch (_error) {
+        payload = {};
+      }
+      if (request.status >= 200 && request.status < 300 && payload.status === "ok") {
+        setDecisionActionStatus("Decision marked done.", "ok");
+        loadDashboard();
+        return;
+      }
+      var message = payload.message || "Decision update failed.";
+      setDecisionActionStatus(message, "error");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Done";
+      }
+    };
+    request.send(JSON.stringify({ decision_id: decisionId }));
+  }
+
+  function shoppingCheckButton(item) {
+    if (!item.id) return "";
+    return (
+      '<button class="shopping-check-button" type="button" data-shopping-check="' +
+      escapeHtml(item.id) +
+      '" data-shopping-list="' +
+      escapeHtml(item.list_slug || "") +
+      '" aria-label="Check off ' +
+      escapeHtml(item.title) +
+      '">Done</button>'
+    );
+  }
+
+  function shoppingClearButton(list) {
+    return (
+      '<button class="shopping-clear-button" type="button" data-shopping-clear="' +
+      escapeHtml(list.slug || "") +
+      '" aria-label="Clear ' +
+      escapeHtml(list.name || "shopping list") +
+      '">Clear</button>'
+    );
+  }
+
+  function postShoppingCheck(itemId, listSlug, button) {
+    if (!itemId) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Saving";
+    }
+    setShoppingActionStatus("Updating shopping item...", "pending");
+
+    var request = new XMLHttpRequest();
+    request.open("POST", "/api/shopping/items/check", true);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      var payload = {};
+      try {
+        payload = JSON.parse(request.responseText || "{}");
+      } catch (_error) {
+        payload = {};
+      }
+      if (request.status >= 200 && request.status < 300 && payload.status === "ok") {
+        setShoppingActionStatus("Shopping item checked off.", "ok");
+        loadDashboard();
+        return;
+      }
+      setShoppingActionStatus(payload.message || "Shopping update failed.", "error");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Done";
+      }
+    };
+    request.send(JSON.stringify({ item_id: itemId, list_slug: listSlug }));
+  }
+
+  function postShoppingClear(listSlug, button) {
+    if (!listSlug) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Clearing";
+    }
+    setShoppingActionStatus("Clearing shopping list...", "pending");
+
+    var request = new XMLHttpRequest();
+    request.open("POST", "/api/shopping/lists/clear", true);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      var payload = {};
+      try {
+        payload = JSON.parse(request.responseText || "{}");
+      } catch (_error) {
+        payload = {};
+      }
+      if (request.status >= 200 && request.status < 300 && payload.status === "ok") {
+        setShoppingActionStatus(payload.message || "Shopping list cleared.", "ok");
+        loadDashboard();
+        return;
+      }
+      setShoppingActionStatus(payload.message || "Shopping clear failed.", "error");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Clear";
+      }
+    };
+    request.send(JSON.stringify({ list_slug: listSlug }));
+  }
+
+  function renderShoppingTabs(lists) {
+    var node = byId("shopping-list-tabs");
+    if (!node) return;
+    lists = lists || [];
+    var selectedExists =
+      selectedShoppingList === "all" ||
+      lists.some(function (list) {
+        return list.slug === selectedShoppingList;
+      });
+    if (!selectedExists) {
+      selectedShoppingList = "all";
+    }
+
+    var allCount = lists.reduce(function (sum, list) {
+      return sum + Number(list.pending_count || 0);
+    }, 0);
+    var tabs = [{ slug: "all", name: "All", pending_count: allCount }].concat(lists);
+    node.innerHTML = tabs
+      .map(function (tab) {
+        var isSelected = tab.slug === selectedShoppingList;
+        return (
+          '<button class="shopping-list-tab' +
+          (isSelected ? " is-active" : "") +
+          '" type="button" role="tab" aria-selected="' +
+          (isSelected ? "true" : "false") +
+          '" data-shopping-tab="' +
+          escapeHtml(tab.slug) +
+          '"><span>' +
+          escapeHtml(tab.name || tab.slug) +
+          "</span><strong>" +
+          escapeHtml(String(tab.pending_count || 0)) +
+          "</strong></button>"
+        );
+      })
+      .join("");
+  }
+
+  function renderShopping(data) {
+    data = data || {};
+    var byList = data.by_list || [];
+    var pending = data.pending || [];
+    var node = byId("shopping-list-items");
+    lastShoppingData = data;
+    setSummaryChip("summary-shopping", pending.length, "item", "items");
+    setText(
+      "shopping-count-label",
+      pending.length + (pending.length === 1 ? " pending" : " pending"),
+    );
+    renderShoppingTabs(byList);
+    if (!node) return;
+    if (!byList.length) {
+      node.innerHTML = empty("Shopping lists are not available yet.");
+      return;
+    }
+
+    var visibleLists =
+      selectedShoppingList === "all"
+        ? byList
+        : byList.filter(function (list) {
+            return list.slug === selectedShoppingList;
+          });
+    node.classList.toggle("is-single-list", selectedShoppingList !== "all");
+    node.innerHTML = visibleLists
+      .map(function (list) {
+        var items = list.items || [];
+        var rows = items.length
+          ? items
+              .map(function (item) {
+                var detail = [item.quantity, item.category, item.note].filter(Boolean).join(" | ");
+                return (
+                  '<div class="shopping-item"><div class="shopping-item-main"><strong>' +
+                  escapeHtml(item.title) +
+                  "</strong><span>" +
+                  escapeHtml(detail || list.name) +
+                  '</span></div><div class="shopping-item-actions">' +
+                  shoppingCheckButton(item) +
+                  "</div></div>"
+                );
+              })
+              .join("")
+          : empty("Nothing pending.");
+        return (
+          '<article class="panel shopping-list-card" role="tabpanel" aria-label="' +
+          escapeHtml(list.name || list.slug) +
+          '"><div class="panel-header"><h3>' +
+          escapeHtml(list.name || list.slug) +
+          '</h3><div class="shopping-list-actions"><span>' +
+          escapeHtml((list.pending_count || 0) + " pending") +
+          "</span>" +
+          shoppingClearButton(list) +
+          '</div></div><div class="shopping-list-card-items">' +
+          rows +
+          "</div></article>"
+        );
+      })
+      .join("");
+  }
+
   function renderPendingTasks(tasks, allTaskCount) {
     var node = byId("pending-task-items");
     tasks = tasks || [];
     allTaskCount = allTaskCount === undefined ? tasks.length : allTaskCount;
     var dueCount = tasks.filter(function (task) {
-      return task.days_until_due !== null && task.days_until_due !== undefined && task.days_until_due <= 0;
+      return (
+        task.days_until_due !== null &&
+        task.days_until_due !== undefined &&
+        task.days_until_due <= 0
+      );
     }).length;
     var unassignedCount = tasks.filter(function (task) {
       return task.owner === "unknown";
@@ -912,7 +1609,10 @@
     var unscheduledCount = tasks.filter(function (task) {
       return task.days_until_due === null || task.days_until_due === undefined;
     }).length;
-    var countLabel = tasks.length === allTaskCount ? tasks.length + " pending" : tasks.length + " of " + allTaskCount + " pending";
+    var countLabel =
+      tasks.length === allTaskCount
+        ? tasks.length + " pending"
+        : tasks.length + " of " + allTaskCount + " pending";
     setText("task-count-label", countLabel);
     setText("pending-task-count", countLabel);
     setText("task-due-count", dueCount);
@@ -925,68 +1625,89 @@
       node.innerHTML = empty("No pending tasks match this tag.");
       return;
     }
-    node.innerHTML = tasks.slice(0, 10).map(function (task) {
-      var context = taskContextLabel(task);
-      var badges = [
-        taskBadge(task.due_label || "No due date", task.days_until_due !== null && task.days_until_due !== undefined && task.days_until_due <= 0 ? "alert" : "warm"),
-        taskBadge(task.owner_label || "Unassigned", task.owner === "unknown" ? "alert" : "green"),
-        task.duration_minutes ? taskBadge(task.duration_minutes + " min", "") : "",
-        context ? taskBadge(context, "") : "",
-      ].concat((task.tags || []).map(taskTagBadge)).join("");
-      return (
-        '<div class="pending-task ' +
-        escapeHtml(taskTone(task)) +
-        '"><div class="pending-task-main"><strong>' +
-        escapeHtml(task.title) +
-        '</strong><div class="pending-task-badges">' +
-        badges +
-        '</div></div><div class="pending-task-actions">' +
-        taskCompleteButton(task) +
-        "</div></div>"
-      );
-    }).join("");
+    node.innerHTML = tasks
+      .slice(0, 10)
+      .map(function (task) {
+        var context = taskContextLabel(task);
+        var badges = [
+          taskBadge(
+            task.due_label || "No due date",
+            task.days_until_due !== null &&
+              task.days_until_due !== undefined &&
+              task.days_until_due <= 0
+              ? "alert"
+              : "warm",
+          ),
+          taskBadge(task.owner_label || "Unassigned", task.owner === "unknown" ? "alert" : "green"),
+          task.duration_minutes ? taskBadge(task.duration_minutes + " min", "") : "",
+          context ? taskBadge(context, "") : "",
+        ]
+          .concat((task.tags || []).map(taskTagBadge))
+          .join("");
+        return (
+          '<div class="pending-task ' +
+          escapeHtml(taskTone(task)) +
+          '"><div class="pending-task-main"><strong>' +
+          escapeHtml(task.title) +
+          '</strong><div class="pending-task-badges">' +
+          badges +
+          '</div></div><div class="pending-task-actions">' +
+          taskCompleteButton(task) +
+          "</div></div>"
+        );
+      })
+      .join("");
   }
 
   function renderTaskGroups(groups, selectedTag) {
     var node = byId("task-groups");
     if (!node) return;
-    var visibleGroups = (groups || []).map(function (group) {
-      var items = group.items || [];
-      if (selectedTag) {
-        items = items.filter(function (recommendation) {
-          return recommendation.task && taskMatchesTag(recommendation.task, selectedTag);
-        });
-      }
-      return {
-        label: group.label,
-        detail: group.detail,
-        items: items,
-      };
-    }).filter(function (group) {
-      return group.items && group.items.length;
-    });
+    var visibleGroups = (groups || [])
+      .map(function (group) {
+        var items = group.items || [];
+        if (selectedTag) {
+          items = items.filter(function (recommendation) {
+            return recommendation.task && taskMatchesTag(recommendation.task, selectedTag);
+          });
+        }
+        return {
+          label: group.label,
+          detail: group.detail,
+          items: items,
+        };
+      })
+      .filter(function (group) {
+        return group.items && group.items.length;
+      });
     setContainerHidden("task-lanes-heading", !visibleGroups.length);
     setContainerHidden("task-groups", !visibleGroups.length);
     if (!visibleGroups.length) {
       node.innerHTML = "";
       return;
     }
-    node.innerHTML = visibleGroups.map(function (group) {
-      var items = group.items.map(function (recommendation) {
-        var task = recommendation.task;
-        var reason = recommendation.reasons && recommendation.reasons.length ? recommendation.reasons[0] : task.due_label;
-        return listItem(task.title, reason);
-      }).join("");
-      return (
-        '<article class="task-card"><h3>' +
-        escapeHtml(group.label) +
-        '</h3><p class="muted">' +
-        escapeHtml(group.detail) +
-        '</p><div class="compact-list">' +
-        items +
-        "</div></article>"
-      );
-    }).join("");
+    node.innerHTML = visibleGroups
+      .map(function (group) {
+        var items = group.items
+          .map(function (recommendation) {
+            var task = recommendation.task;
+            var reason =
+              recommendation.reasons && recommendation.reasons.length
+                ? recommendation.reasons[0]
+                : task.due_label;
+            return listItem(task.title, reason);
+          })
+          .join("");
+        return (
+          '<article class="task-card"><h3>' +
+          escapeHtml(group.label) +
+          '</h3><p class="muted">' +
+          escapeHtml(group.detail) +
+          '</p><div class="compact-list">' +
+          items +
+          "</div></article>"
+        );
+      })
+      .join("");
   }
 
   function renderDecisionChips(decision) {
@@ -1012,12 +1733,15 @@
     var attentionNode = byId("decision-attention");
     if (attentionNode) {
       attentionNode.innerHTML = attention.length
-        ? attention.map(function (decision) {
-            var missing = decision.missing_fields && decision.missing_fields.length
-              ? "Missing " + decision.missing_fields.join(", ")
-              : decision.due_label;
-            return listItem(decision.title, missing);
-          }).join("")
+        ? attention
+            .map(function (decision) {
+              var missing =
+                decision.missing_fields && decision.missing_fields.length
+                  ? "Missing " + decision.missing_fields.join(", ")
+                  : decision.due_label;
+              return listItem(decision.title, missing);
+            })
+            .join("")
         : "";
     }
 
@@ -1028,29 +1752,262 @@
       node.innerHTML = "";
       return;
     }
-    node.innerHTML = open.map(function (decision) {
-      var missing = decision.missing_fields || [];
-      var missingHtml = missing.length
-        ? '<p class="decision-missing">Missing: ' + escapeHtml(missing.join(", ")) + "</p>"
-        : '<p class="decision-ready">Ready for family discussion</p>';
-      return (
-        '<article class="decision-card"><div class="decision-card-top"><p class="eyebrow">' +
-        escapeHtml(decision.short_id || "decision") +
-        "</p>" +
-        renderDecisionChips(decision) +
-        "</div><h3>" +
-        escapeHtml(decision.title) +
-        '</h3><div class="decision-stats"><span>' +
-        escapeHtml((decision.option_count || 0) + " options") +
-        '</span><span>' +
-        escapeHtml((decision.evidence_count || 0) + " notes") +
-        "</span></div>" +
-        missingHtml +
-        '<div class="decision-next"><strong>Next step</strong><span>' +
-        escapeHtml(decision.next_step || "Assign one clear next step") +
-        "</span></div></article>"
+    node.innerHTML = open
+      .map(function (decision) {
+        var missing = decision.missing_fields || [];
+        var missingHtml = missing.length
+          ? '<p class="decision-missing">Missing: ' + escapeHtml(missing.join(", ")) + "</p>"
+          : '<p class="decision-ready">Ready for family discussion</p>';
+        return (
+          '<article class="decision-card"><div class="decision-card-top"><p class="eyebrow">' +
+          escapeHtml(decision.short_id || "decision") +
+          "</p>" +
+          renderDecisionChips(decision) +
+          "</div><h3>" +
+          escapeHtml(decision.title) +
+          '</h3><div class="decision-stats"><span>' +
+          escapeHtml((decision.option_count || 0) + " options") +
+          "</span><span>" +
+          escapeHtml((decision.evidence_count || 0) + " notes") +
+          "</span></div>" +
+          missingHtml +
+          '<div class="decision-next"><strong>Next step</strong><span>' +
+          escapeHtml(decision.next_step || "Assign one clear next step") +
+          '</span></div><div class="decision-actions">' +
+          decisionCompleteButton(decision) +
+          "</div></article>"
+        );
+      })
+      .join("");
+  }
+
+  function backlogNeedsAttention(item) {
+    return !!(
+      item.pinned ||
+      item.blocked ||
+      item.stale ||
+      (item.days_until !== null && item.days_until <= 0)
+    );
+  }
+
+  function backlogFilteredItems(items) {
+    var ownerNode = byId("backlog-owner-filter");
+    var stateNode = byId("backlog-state-filter");
+    var owner = ownerNode ? ownerNode.value : "all";
+    var state = stateNode ? stateNode.value : "all";
+    return (items || []).filter(function (item) {
+      if (owner !== "all" && item.owner !== owner) return false;
+      if (state === "attention" && !backlogNeedsAttention(item)) return false;
+      if (state === "pinned" && !item.pinned) return false;
+      return true;
+    });
+  }
+
+  function backlogActionButton(item, action, label) {
+    return (
+      '<button type="button" class="backlog-action" data-backlog-action="' +
+      escapeHtml(action) +
+      '" data-backlog-id="' +
+      escapeHtml(item.id) +
+      '">' +
+      escapeHtml(label) +
+      "</button>"
+    );
+  }
+
+  function backlogCard(item) {
+    var flags = [];
+    if (item.pinned) flags.push('<span class="chip warm">Pinned</span>');
+    if (item.blocked) flags.push('<span class="chip alert">Blocked</span>');
+    if (item.stale) flags.push('<span class="chip alert">Stale</span>');
+    if (item.ready_to_close) flags.push('<span class="chip green">Ready to close</span>');
+    var reviewIds = (lastBacklogData.review || {}).item_ids || [];
+    var reviewCurrent = backlogReviewIndex >= 0 && reviewIds[backlogReviewIndex] === item.id;
+    var positions = (item.positions || [])
+      .map(function (position) {
+        return (
+          "<span>" + escapeHtml(position.actor) + ": " + escapeHtml(position.value) + "</span>"
+        );
+      })
+      .join("");
+    var links = (item.links || [])
+      .map(function (link) {
+        return (
+          '<span class="backlog-link ' +
+          (link.available ? "" : "is-missing") +
+          '">' +
+          escapeHtml(link.title) +
+          (link.completed ? " (done)" : link.available ? "" : " (missing)") +
+          "</span>"
+        );
+      })
+      .join("");
+    var nextKinds = ["discussion", "planning", "decision"].filter(function (kind) {
+      return kind !== item.kind;
+    });
+    return (
+      '<article class="backlog-item' +
+      (reviewCurrent ? " is-review-current" : "") +
+      '">' +
+      '<div class="backlog-item-top"><span class="backlog-ref">' +
+      escapeHtml(item.short_id) +
+      '</span><div class="chip-row">' +
+      flags.join("") +
+      "</div></div>" +
+      "<h4>" +
+      escapeHtml(item.title) +
+      "</h4>" +
+      '<p class="backlog-meta">' +
+      escapeHtml(item.owner_label) +
+      " | " +
+      escapeHtml(item.date_label) +
+      "</p>" +
+      (item.context ? '<p class="backlog-context">' + escapeHtml(item.context) + "</p>" : "") +
+      (positions ? '<div class="backlog-positions">' + positions + "</div>" : "") +
+      (links ? '<div class="backlog-links">' + links + "</div>" : "") +
+      "<details><summary>Details and actions</summary>" +
+      '<div class="backlog-action-row">' +
+      backlogActionButton(item, "note", "Add note") +
+      (item.kind === "discussion" ? backlogActionButton(item, "position", "Set position") : "") +
+      backlogActionButton(item, "edit", "Edit") +
+      backlogActionButton(item, "pin", item.pinned ? "Unpin" : "Pin") +
+      '</div><div class="backlog-action-row"><select data-backlog-move-kind="' +
+      escapeHtml(item.id) +
+      '" aria-label="Move item to"><option value="">Move to...</option>' +
+      nextKinds
+        .map(function (kind) {
+          return (
+            '<option value="' +
+            kind +
+            '">' +
+            kind.charAt(0).toUpperCase() +
+            kind.slice(1) +
+            "</option>"
+          );
+        })
+        .join("") +
+      "</select>" +
+      backlogActionButton(item, "move", "Move") +
+      backlogActionButton(item, "link_event", "Link event") +
+      backlogActionButton(item, "link_task", "Link task") +
+      backlogActionButton(item, "park", "Park") +
+      backlogActionButton(item, "close", "Close") +
+      (reviewCurrent ? backlogActionButton(item, "keep", "Keep") : "") +
+      "</div></details></article>"
+    );
+  }
+
+  function renderBacklogLane(kind, targetId) {
+    var lane = (lastBacklogData.lanes || {})[kind] || [];
+    var items = backlogFilteredItems(lane);
+    setText(kind + "-count", lane.length);
+    var node = byId(targetId);
+    if (node)
+      node.innerHTML = items.length ? items.map(backlogCard).join("") : empty("No matching items");
+  }
+
+  function renderBacklog(data) {
+    lastBacklogData = data || {};
+    var attention = lastBacklogData.attention || [];
+    setText("backlog-attention-count", attention.length);
+    setCardHidden("backlog-attention", !attention.length);
+    var attentionNode = byId("backlog-attention");
+    if (attentionNode) {
+      attentionNode.innerHTML = attention
+        .map(function (item) {
+          return listItem(item.title, item.date_label + " | " + item.kind);
+        })
+        .join("");
+    }
+    var reviewButton = byId("backlog-review-button");
+    if (reviewButton)
+      reviewButton.classList.toggle("is-called-out", !!(lastBacklogData.review || {}).callout);
+    renderBacklogLane("discussion", "discussion-items");
+    renderBacklogLane("planning", "planning-items");
+    renderBacklogLane("decision", "decision-backlog-items");
+  }
+
+  function setBacklogStatus(message, state) {
+    var node = byId("backlog-action-status");
+    if (!node) return;
+    node.textContent = message || "";
+    node.dataset.state = state || "";
+  }
+
+  function postBacklog(path, payload, done) {
+    var request = new XMLHttpRequest();
+    request.open("POST", path, true);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      var response = {};
+      try {
+        response = JSON.parse(request.responseText || "{}");
+      } catch (_error) {
+        response = {};
+      }
+      if (request.status >= 200 && request.status < 300 && response.status === "ok") {
+        setBacklogStatus(response.message || "Backlog updated.", "ok");
+        if (done) done(response);
+        loadDashboard();
+      } else {
+        setBacklogStatus(response.message || "Backlog update failed.", "error");
+      }
+    };
+    request.send(JSON.stringify(payload));
+  }
+
+  function handleBacklogAction(target) {
+    var action = target.getAttribute("data-backlog-action");
+    var itemId = target.getAttribute("data-backlog-id");
+    var payload = { action: action, item_id: itemId };
+    if (action === "keep") {
+      var reviewIds = (lastBacklogData.review || {}).item_ids || [];
+      backlogReviewIndex = Math.min(backlogReviewIndex + 1, reviewIds.length - 1);
+      if (backlogReviewIndex >= reviewIds.length - 1)
+        setBacklogStatus("Weekly review complete.", "ok");
+      renderBacklog(lastBacklogData);
+      return;
+    }
+    if (action === "note") {
+      payload.action = "add_note";
+      payload.text = window.prompt("Note");
+      if (!payload.text) return;
+    } else if (action === "position") {
+      payload.action = "set_position";
+      payload.value = window.prompt("Position: yes, no, or unsure", "unsure");
+      if (!payload.value) return;
+    } else if (action === "edit") {
+      payload.title = window.prompt("Title");
+      if (!payload.title) return;
+    } else if (action === "pin") {
+      var item = ["discussion", "planning", "decision"].reduce(function (found, kind) {
+        return (
+          found ||
+          ((lastBacklogData.lanes || {})[kind] || []).find(function (row) {
+            return row.id === itemId;
+          })
+        );
+      }, null);
+      payload.pinned = !(item && item.pinned);
+    } else if (action === "move") {
+      var select = document.querySelector('[data-backlog-move-kind="' + itemId + '"]');
+      payload.kind = select ? select.value : "";
+      if (!payload.kind || !window.confirm("Move this item to " + payload.kind + "?")) return;
+      payload.confirmed = true;
+    } else if (action === "link_event" || action === "link_task") {
+      payload.external_id = window.prompt(
+        action === "link_event" ? "Calendar event ID" : "Google Task ID",
       );
-    }).join("");
+      if (!payload.external_id) return;
+      if (action === "link_task") payload.container_id = "@default";
+    } else if (action === "close") {
+      payload.outcome = window.prompt("Recorded outcome");
+      if (!payload.outcome || !window.confirm("Close this backlog item?")) return;
+      payload.confirmed = true;
+    }
+    postBacklog("/api/backlog/actions", payload);
   }
 
   function renderFamily(data) {
@@ -1062,17 +2019,19 @@
     setCardHidden("family-members", !members.length);
     if (memberNode) {
       memberNode.innerHTML = members.length
-        ? members.map(function (member) {
-            return (
-              '<div class="member"><div class="member-avatar">' +
-              escapeHtml(member.name.slice(0, 1)) +
-              '</div><div><strong>' +
-              escapeHtml(member.name) +
-              '</strong><p class="muted">' +
-              escapeHtml(member.responsibility_count + " responsibilities today") +
-              "</p></div></div>"
-            );
-          }).join("")
+        ? members
+            .map(function (member) {
+              return (
+                '<div class="member"><div class="member-avatar">' +
+                escapeHtml(member.name.slice(0, 1)) +
+                "</div><div><strong>" +
+                escapeHtml(member.name) +
+                '</strong><p class="muted">' +
+                escapeHtml(member.responsibility_count + " responsibilities today") +
+                "</p></div></div>"
+              );
+            })
+            .join("")
         : "";
     }
     var responsibilities = byId("responsibilities");
@@ -1080,9 +2039,11 @@
     setCardHidden("responsibilities", !responsibilityItems.length);
     if (responsibilities) {
       responsibilities.innerHTML = responsibilityItems.length
-        ? responsibilityItems.map(function (item) {
-            return listItem(item.title, item.owner + " | " + item.detail);
-          }).join("")
+        ? responsibilityItems
+            .map(function (item) {
+              return listItem(item.title, item.owner + " | " + item.detail);
+            })
+            .join("")
         : "";
     }
     var childEvents = byId("child-events");
@@ -1090,9 +2051,14 @@
     setCardHidden("child-events", !childEventItems.length);
     if (childEvents) {
       childEvents.innerHTML = childEventItems.length
-        ? childEventItems.map(function (event) {
-            return listItem(event.title, [event.person, event.time_label].filter(Boolean).join(" | "));
-          }).join("")
+        ? childEventItems
+            .map(function (event) {
+              return listItem(
+                event.title,
+                [event.person, event.time_label].filter(Boolean).join(" | "),
+              );
+            })
+            .join("")
         : "";
     }
     var unassigned = byId("unassigned");
@@ -1100,9 +2066,11 @@
     setCardHidden("unassigned", !unassignedItems.length);
     if (unassigned) {
       unassigned.innerHTML = unassignedItems.length
-        ? unassignedItems.map(function (item) {
-            return listItem(item.title, item.detail);
-          }).join("")
+        ? unassignedItems
+            .map(function (item) {
+              return listItem(item.title, item.detail);
+            })
+            .join("")
         : "";
     }
   }
@@ -1112,7 +2080,11 @@
     setText("greeting", text(data.greeting, "Hello"));
     setText("date-label", data.date_label);
     setText("source-status", data.source_message || data.source_status);
-    setText("updated-at", "Updated " + new Date(data.generated_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
+    setText(
+      "updated-at",
+      "Updated " +
+        new Date(data.generated_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+    );
 
     var action = data.best_next_action || {};
     setText("best-action-title", action.title);
@@ -1124,13 +2096,12 @@
     renderTimeline(calendar.today || []);
     renderReadingGarden(data.reading_garden || {});
     renderHomeBoard(data.home_board ? data.home_board.today : []);
+    renderShopping(data.shopping || {});
     renderPrep(calendar.prep_needed || []);
     renderWarnings(data.warnings || []);
 
     var tasks = data.tasks || {};
-    renderOpenLoops(tasks.open_loops || []);
-    renderPlanning(data.planning ? data.planning.items : []);
-    renderDecisions(data.decisions || {});
+    renderBacklog(data.backlog || {});
     lastTasksData = tasks;
     renderTasks(tasks);
     renderFamily(data.family || {});
@@ -1170,11 +2141,53 @@
   document.addEventListener("click", function (event) {
     var target = closestActionTarget(event.target);
     if (!target) return;
+    if (target.getAttribute("data-backlog-action") !== null) {
+      handleBacklogAction(target);
+      return;
+    }
     if (target.getAttribute("data-task-tag-filter") !== null) {
       setSelectedTaskTag(target.getAttribute("data-task-tag-filter"));
       renderTasks(lastTasksData);
       updateActiveNav();
       scrollToHashSection();
+      return;
+    }
+    if (target.getAttribute("data-reading-child") !== null) {
+      selectedReadingChild = target.getAttribute("data-reading-child") || selectedReadingChild;
+      renderReadingGarden(lastReadingData);
+      return;
+    }
+    if (target.getAttribute("data-reading-heatmap-day") !== null) {
+      showReadingHeatmapDetail(target);
+      return;
+    }
+    if (target.getAttribute("data-reading-update") !== null) {
+      postReadingUpdate(target.getAttribute("data-reading-update") || "", target);
+      return;
+    }
+    if (target.getAttribute("data-reading-delete") !== null) {
+      postReadingDelete(target.getAttribute("data-reading-delete") || "", target);
+      return;
+    }
+    if (target.getAttribute("data-decision-complete") !== null) {
+      postCompleteDecision(target.getAttribute("data-decision-complete"), target);
+      return;
+    }
+    if (target.getAttribute("data-shopping-tab") !== null) {
+      selectedShoppingList = target.getAttribute("data-shopping-tab") || "all";
+      renderShopping(lastShoppingData);
+      return;
+    }
+    if (target.getAttribute("data-shopping-check") !== null) {
+      postShoppingCheck(
+        target.getAttribute("data-shopping-check"),
+        target.getAttribute("data-shopping-list"),
+        target,
+      );
+      return;
+    }
+    if (target.getAttribute("data-shopping-clear") !== null) {
+      postShoppingClear(target.getAttribute("data-shopping-clear"), target);
       return;
     }
     postCompleteTask(target.getAttribute("data-task-complete"), target);
@@ -1187,5 +2200,63 @@
   var wakeButton = byId("screen-wake-button");
   if (wakeButton) {
     wakeButton.addEventListener("click", syncWakeLock);
+  }
+  ["backlog-owner-filter", "backlog-state-filter"].forEach(function (id) {
+    var filter = byId(id);
+    if (filter)
+      filter.addEventListener("change", function () {
+        renderBacklog(lastBacklogData);
+      });
+  });
+  var backlogDialog = byId("backlog-add-dialog");
+  var backlogAddButton = byId("backlog-add-button");
+  var backlogForm = byId("backlog-add-form");
+  function closeBacklogDialog() {
+    if (backlogDialog && backlogDialog.open) backlogDialog.close();
+  }
+  if (backlogAddButton && backlogDialog) {
+    backlogAddButton.addEventListener("click", function () {
+      backlogDialog.showModal();
+      var titleInput = byId("backlog-title-input");
+      if (titleInput) titleInput.focus();
+    });
+  }
+  ["backlog-dialog-close", "backlog-dialog-cancel"].forEach(function (id) {
+    var button = byId(id);
+    if (button) button.addEventListener("click", closeBacklogDialog);
+  });
+  if (backlogForm) {
+    backlogForm.addEventListener("change", function (event) {
+      if (event.target && event.target.name === "kind") {
+        setText("backlog-date-label", event.target.value === "discussion" ? "Review date" : "Date");
+      }
+    });
+    backlogForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var form = new FormData(backlogForm);
+      postBacklog(
+        "/api/backlog/items",
+        {
+          kind: form.get("kind"),
+          title: form.get("title"),
+          owner: form.get("owner"),
+          date: form.get("date"),
+        },
+        function () {
+          backlogForm.reset();
+          setText("backlog-date-label", "Review date");
+          closeBacklogDialog();
+        },
+      );
+    });
+  }
+  var backlogReviewButton = byId("backlog-review-button");
+  if (backlogReviewButton) {
+    backlogReviewButton.addEventListener("click", function () {
+      var reviewIds = (lastBacklogData.review || {}).item_ids || [];
+      backlogReviewIndex = reviewIds.length ? 0 : -1;
+      setBacklogStatus(reviewIds.length ? "Weekly review started." : "Backlog is clear.", "ok");
+      renderBacklog(lastBacklogData);
+    });
   }
 })();

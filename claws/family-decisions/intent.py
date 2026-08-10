@@ -72,6 +72,17 @@ WEEKDAYS = {
     "saturday": 5,
     "sunday": 6,
 }
+BACKLOG_KINDS = {"discussion", "planning", "decision"}
+BACKLOG_PREFIX_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:add|create|capture|track|open)?\s*"
+    r"(?P<kind>discussion|planning|plan|decision)"
+    r"(?:\s+(?:topic|item))?\s*(?:about|for|on|:|-)\s*(?P<title>.+)$",
+    re.IGNORECASE,
+)
+BACKLOG_IMPORTANT_RE = re.compile(
+    r"\b(school|medical|doctor|childcare|move|house|college|financial|finance|legal)\b",
+    re.IGNORECASE,
+)
 
 
 def _default_now(now: datetime | None) -> datetime:
@@ -133,6 +144,21 @@ def _due_date(text: str, reference: datetime) -> str | None:
             return date.fromisoformat(match.group(1)).isoformat()
         except ValueError:
             return None
+    month_day = re.search(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\b",
+        lowered,
+    )
+    if month_day:
+        try:
+            parsed = datetime.strptime(
+                f"{reference.year} {month_day.group(1)} {month_day.group(2)}",
+                "%Y %B %d",
+            ).date()
+        except ValueError:
+            return None
+        if parsed < reference.date():
+            parsed = parsed.replace(year=parsed.year + 1)
+        return parsed.isoformat()
     return None
 
 
@@ -419,12 +445,135 @@ def _is_brief_request(text: str) -> bool:
     )
 
 
+def _backlog_capture(text: str, reference: datetime) -> dict[str, Any] | None:
+    match = BACKLOG_PREFIX_RE.match(text)
+    if match is not None:
+        raw_kind = match.group("kind").lower()
+        if raw_kind == "decision" and re.match(r"^\s*decision\s*[:\-]", text, re.IGNORECASE) is None:
+            return None
+        kind = "planning" if raw_kind == "plan" else raw_kind
+        raw_title = re.sub(
+            r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?\b",
+            "",
+            match.group("title"),
+            flags=re.IGNORECASE,
+        )
+        title, context = _title_and_context(raw_title)
+        date_value = _due_date(text, reference)
+        return {
+            "intent": "create_backlog_item",
+            "kind": kind,
+            "title": title,
+            "context": context,
+            "owner": _owner(text),
+            "urgency": _urgency(text),
+            "review_on": date_value if kind == "discussion" else None,
+            "due": date_value if kind != "discussion" else None,
+        }
+
+    if re.search(r"\bshould\s+we\b", text, flags=re.IGNORECASE):
+        kind = "decision" if BACKLOG_IMPORTANT_RE.search(text) else "discussion"
+        title, context = _title_and_context(text)
+        date_value = _due_date(text, reference)
+        return {
+            "intent": "create_backlog_item",
+            "kind": kind,
+            "title": title,
+            "context": context,
+            "owner": _owner(text),
+            "urgency": _urgency(text),
+            "review_on": date_value if kind == "discussion" else None,
+            "due": date_value if kind == "decision" else None,
+        }
+    return None
+
+
+def _backlog_action(text: str) -> dict[str, Any] | None:
+    if re.search(r"^\s*/?backlog\s+review\b|\b(?:show|list|review)\s+(?:the\s+)?(?:family\s+)?backlog\b", text, re.IGNORECASE):
+        return {"intent": "list_backlog"}
+
+    move_match = re.match(
+        r"^\s*move\s+(?P<target>.+?)\s+to\s+(?P<kind>discussion|planning|plan|decision)\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if move_match is not None:
+        raw_kind = move_match.group("kind").lower()
+        return {
+            "intent": "move_backlog_item",
+            "item_id": _decision_id(move_match.group("target")),
+            "target": _clean_spaces(move_match.group("target")),
+            "kind": "planning" if raw_kind == "plan" else raw_kind,
+        }
+
+    note_match = re.match(
+        r"^\s*add\s+note\s+to\s+(?P<target>.+?)\s*:\s*(?P<text>.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if note_match is not None:
+        return {
+            "intent": "add_backlog_note",
+            "item_id": _decision_id(note_match.group("target")),
+            "target": _clean_spaces(note_match.group("target")),
+            "text": _clean_spaces(note_match.group("text")),
+        }
+
+    position_match = re.match(
+        r"^\s*(?:set\s+)?(?:my\s+)?position\s+(?:on|for)\s+(?P<target>.+?)\s+(?:is|to)\s+(?P<value>yes|no|unsure)\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if position_match is not None:
+        return {
+            "intent": "set_backlog_position",
+            "item_id": _decision_id(position_match.group("target")),
+            "target": _clean_spaces(position_match.group("target")),
+            "value": position_match.group("value").lower(),
+        }
+
+    if re.match(
+        r"^\s*close\s+(?:all\s+)?(?:the\s+)?decisions?\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
+
+    simple_action = re.match(
+        r"^\s*(?P<action>pin|unpin|park|close)\s+(?:backlog\s+item\s+)?(?P<target>.+?)(?:\s+as\s+(?P<outcome>.+))?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if simple_action is not None:
+        action = simple_action.group("action").lower()
+        return {
+            "intent": {
+                "pin": "pin_backlog_item",
+                "unpin": "pin_backlog_item",
+                "park": "park_backlog_item",
+                "close": "close_backlog_item",
+            }[action],
+            "item_id": _decision_id(simple_action.group("target")),
+            "target": _clean_spaces(simple_action.group("target")),
+            "pinned": action == "pin",
+            "outcome": _clean_spaces(simple_action.group("outcome") or "Done"),
+        }
+    return None
+
+
 def extract_intent(request: str, now: datetime | None = None) -> dict[str, Any]:
     reference = _default_now(now)
     text = normalize_decision_request_text(request)
     lowered = text.lower()
     decision_id = _decision_id(text)
     has_capture_prefix = _has_decision_capture_prefix(text)
+
+    backlog_action = _backlog_action(text)
+    if backlog_action is not None:
+        return backlog_action
+    backlog_capture = _backlog_capture(text, reference)
+    if backlog_capture is not None:
+        return backlog_capture
 
     if _is_bulk_close_request(text):
         return {"intent": "bulk_record_decisions"}

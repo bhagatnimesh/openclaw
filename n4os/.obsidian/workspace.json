@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "family/observations/2026-07.md",
+                "file": "journal/2026-07-22.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "2026-07"
+              "title": "2026-07-22"
             }
           }
         ]
@@ -94,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "family/observations/2026-07.md",
+                "file": "journal/2026-07-22.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for 2026-07"
+              "title": "Backlinks for 2026-07-22"
             }
           },
           {
@@ -113,12 +113,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "family/observations/2026-07.md",
+                "file": "journal/2026-07-22.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Outgoing links from 2026-07"
+              "title": "Outgoing links from 2026-07-22"
             }
           },
           {
@@ -156,13 +156,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "family/observations/2026-07.md",
+                "file": "journal/2026-07-22.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Outline of 2026-07"
+              "title": "Outline of 2026-07-22"
             }
           }
         ]
@@ -186,6 +186,16 @@
   },
   "active": "5f730628704a2614",
   "lastOpenFiles": [
+    "journal/2026-08-09.md",
+    "family/observations/2026-08.md",
+    "trajectories/2026-08.md",
+    "trajectories",
+    "family/Nysha.md",
+    "journal/2026-08-08.md",
+    "journal/2026-07-27.md",
+    "family/FamilyValues.md",
+    "family/observations/2026-07.md",
+    "journal/2026-07-26.md",
     "journal/2026-07-22.md",
     "journal",
     "MISSION.md",
@@ -204,15 +214,6 @@
     "PRINCIPLES.md",
     "School Transition.md",
     "Reading.md",
-    "NON_GOALS.md",
-    "playbooks/Relationships.md",
-    "playbooks/Leadership.md",
-    "playbooks/Fear.md",
-    "PERSONAL_MODEL.md",
-    "IDENTITY.md",
-    "prompts/DailyCoach.md",
-    "PRIORITIES.md",
-    "family/Navya.md",
     "Untitled.canvas"
   ]
 }

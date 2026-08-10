@@ -82,12 +82,32 @@ def _bulk_close_message() -> str:
     )
 
 
+def _actor_from_source(source: str, default_owner: str | None) -> str:
+    if ":" in source:
+        actor = source.rsplit(":", 1)[-1].strip()
+        if actor:
+            return actor
+    return default_owner or "family"
+
+
+def _format_backlog_line(index: int, item: dict[str, Any]) -> str:
+    target_date = item.get("review_on") or item.get("due") or "no date"
+    owner = item.get("owner") or "unknown"
+    pin = " | pinned" if item.get("pinned") else ""
+    return (
+        f"{index}. [{str(item.get('kind') or 'discussion').title()}] {item.get('title')}\n"
+        f"   Owner: {owner} | Date: {target_date} | Status: {item.get('status')}{pin}\n"
+        f"   Ref: {str(item.get('id') or '')[:8]}"
+    )
+
+
 @dataclass
 class FamilyDecisionsClaw:
     """Entry point for N4OS family decision tracking."""
 
     tools: FamilyDecisionTools
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
+    pending_action: dict[str, Any] | None = None
 
     @classmethod
     def from_provider(cls, provider: FamilyDecisionProvider) -> "FamilyDecisionsClaw":
@@ -99,6 +119,13 @@ class FamilyDecisionsClaw:
 
     def tool_map(self) -> dict[str, Any]:
         return {
+            "create_family_backlog_item": self.tools.create_backlog_item,
+            "list_family_backlog": self.tools.list_backlog_items,
+            "update_family_backlog_item": self.tools.update_backlog_item,
+            "add_family_backlog_note": self.tools.add_backlog_note,
+            "set_family_backlog_position": self.tools.set_backlog_position,
+            "move_family_backlog_item": self.tools.move_backlog_item,
+            "close_family_backlog_item": self.tools.close_backlog_item,
             "create_family_decision": self.tools.create_decision,
             "list_family_decisions": self.tools.list_decisions,
             "read_family_decision": self.tools.read_decision,
@@ -115,9 +142,33 @@ class FamilyDecisionsClaw:
         self,
         request: str,
         reference_time: datetime | None = None,
+        source: str = "telegram_text",
+        default_owner: str | None = None,
     ) -> str:
         intent = extract_intent(request, now=reference_time)
         action = intent.get("intent")
+        actor = _actor_from_source(source, default_owner)
+        if action == "create_backlog_item":
+            return self.capture_backlog_from_request(
+                request,
+                reference_time=reference_time,
+                actor=actor,
+                default_owner=default_owner,
+            )
+        if action == "list_backlog":
+            return self.list_backlog_from_request()
+        if action == "add_backlog_note":
+            return self.add_backlog_note_from_request(request, reference_time=reference_time, actor=actor)
+        if action == "set_backlog_position":
+            return self.set_backlog_position_from_request(request, reference_time=reference_time, actor=actor)
+        if action == "move_backlog_item":
+            return self.move_backlog_from_request(request, reference_time=reference_time, actor=actor)
+        if action == "pin_backlog_item":
+            return self.pin_backlog_from_request(request, reference_time=reference_time, actor=actor)
+        if action == "park_backlog_item":
+            return self.park_backlog_from_request(request, reference_time=reference_time, actor=actor)
+        if action == "close_backlog_item":
+            return self.close_backlog_from_request(request, reference_time=reference_time, actor=actor)
         if action == "list_decisions":
             return self.list_decisions_from_request(request)
         if action == "decision_brief":
@@ -135,6 +186,177 @@ class FamilyDecisionsClaw:
         if action == "record_decision":
             return self.record_decision_from_request(request, reference_time=reference_time)
         return self.capture_decision_from_request(request, reference_time=reference_time)
+
+    def handle_pending_response(self, request: str) -> bool:
+        pending = self.pending_action
+        if pending is None:
+            return False
+        lowered = request.strip().lower()
+        if lowered not in {"yes", "y", "confirm", "confirmed", "no", "n", "cancel"}:
+            return False
+        self.pending_action = None
+        if lowered in {"no", "n", "cancel"}:
+            print("Backlog move cancelled.")
+            return True
+        before = self.tools.read_backlog_item(pending.get("item_id"))
+        if pending.get("action") == "close":
+            response = self.tools.close_backlog_item(
+                pending.get("item_id"),
+                pending.get("outcome"),
+                confirmed=True,
+                actor=pending.get("actor") or "family",
+            )
+        else:
+            response = self.tools.move_backlog_item(
+                pending.get("item_id"),
+                pending.get("kind"),
+                confirmed=True,
+                actor=pending.get("actor") or "family",
+            )
+        if before.get("status") == "ok" and response.get("status") == "ok":
+            snapshot = before.get("data", {}).get("item")
+            if snapshot:
+                self.undo_stack.append({"action": "restore_decision", "decision": snapshot})
+        print(response["message"])
+        return True
+
+    def capture_backlog_from_request(
+        self,
+        request: str,
+        *,
+        reference_time: datetime | None = None,
+        actor: str = "family",
+        default_owner: str | None = None,
+    ) -> str:
+        intent = extract_intent(request, now=reference_time)
+        owner = intent.get("owner") or "unknown"
+        if owner == "unknown" and default_owner:
+            owner = default_owner
+        response = self.tools.create_backlog_item(
+            intent.get("title"),
+            kind=intent.get("kind", "discussion"),
+            context=intent.get("context"),
+            owner=owner,
+            urgency=intent.get("urgency", "normal"),
+            review_on=intent.get("review_on"),
+            due=intent.get("due"),
+            actor=actor,
+        )
+        if response["status"] != "ok":
+            print(response["message"])
+            return response["message"]
+        item = response.get("data", {}).get("item", {})
+        if item.get("id"):
+            self.undo_stack.append({"action": "delete_decision", "decision": dict(item)})
+        date_value = item.get("review_on") or item.get("due") or "not set"
+        message = (
+            f"{response['message']} {item.get('title')} ({str(item.get('id') or '')[:8]}).\n"
+            f"Owner: {item.get('owner')}; date: {date_value}."
+        )
+        if item.get("kind") == "planning" and not item.get("due"):
+            message += "\nNeeds date or calendar link before progress can be tracked."
+        print(message)
+        return message
+
+    def list_backlog_from_request(self) -> str:
+        response = self.tools.list_backlog_items()
+        if response["status"] != "ok":
+            print(response["message"])
+            return response["message"]
+        items = response.get("data", {}).get("items", [])
+        if not items:
+            message = "Family backlog is clear."
+        else:
+            lines = [f"Family backlog ({len(items)} open):"]
+            lines.extend(_format_backlog_line(index, item) for index, item in enumerate(items, start=1))
+            message = "\n".join(lines)
+        print(message)
+        return message
+
+    def _resolve_backlog_target(self, intent: dict[str, Any]) -> tuple[str | None, str | None]:
+        item_id = intent.get("item_id")
+        if item_id:
+            response = self.tools.read_backlog_item(item_id)
+            if response["status"] == "ok":
+                return response.get("data", {}).get("item", {}).get("id"), None
+        target = str(intent.get("target") or "").strip().lower()
+        response = self.tools.list_backlog_items()
+        if response["status"] != "ok":
+            return None, response["message"]
+        matches = [
+            item for item in response.get("data", {}).get("items", [])
+            if target and (item.get("title", "").lower() == target or target in item.get("title", "").lower())
+        ]
+        if len(matches) == 1:
+            return matches[0]["id"], None
+        if len(matches) > 1:
+            return None, "More than one backlog item matches. Use the displayed ref."
+        return None, "Backlog item not found. Ask to review the backlog, then use its ref."
+
+    def add_backlog_note_from_request(self, request: str, *, reference_time: datetime | None, actor: str) -> str:
+        intent = extract_intent(request, now=reference_time)
+        item_id, error = self._resolve_backlog_target(intent)
+        response = self.tools.add_backlog_note(item_id, intent.get("text"), actor=actor) if item_id else None
+        message = response["message"] if response is not None else str(error)
+        print(message)
+        return message
+
+    def set_backlog_position_from_request(self, request: str, *, reference_time: datetime | None, actor: str) -> str:
+        intent = extract_intent(request, now=reference_time)
+        item_id, error = self._resolve_backlog_target(intent)
+        response = self.tools.set_backlog_position(item_id, intent.get("value"), actor=actor) if item_id else None
+        message = response["message"] if response is not None else str(error)
+        print(message)
+        return message
+
+    def move_backlog_from_request(self, request: str, *, reference_time: datetime | None, actor: str) -> str:
+        intent = extract_intent(request, now=reference_time)
+        item_id, error = self._resolve_backlog_target(intent)
+        if item_id is None:
+            message = str(error)
+        else:
+            response = self.tools.move_backlog_item(item_id, intent.get("kind"), actor=actor)
+            message = response["message"]
+            if response["status"] == "needs_confirmation":
+                self.pending_action = {
+                    "action": "move",
+                    "item_id": item_id,
+                    "kind": intent.get("kind"),
+                    "actor": actor,
+                }
+        print(message)
+        return message
+
+    def pin_backlog_from_request(self, request: str, *, reference_time: datetime | None, actor: str) -> str:
+        intent = extract_intent(request, now=reference_time)
+        item_id, error = self._resolve_backlog_target(intent)
+        response = self.tools.update_backlog_item(item_id, pinned=intent.get("pinned"), actor=actor) if item_id else None
+        message = response["message"] if response is not None else str(error)
+        print(message)
+        return message
+
+    def park_backlog_from_request(self, request: str, *, reference_time: datetime | None, actor: str) -> str:
+        intent = extract_intent(request, now=reference_time)
+        item_id, error = self._resolve_backlog_target(intent)
+        response = self.tools.park_backlog_item(item_id, actor=actor) if item_id else None
+        message = response["message"] if response is not None else str(error)
+        print(message)
+        return message
+
+    def close_backlog_from_request(self, request: str, *, reference_time: datetime | None, actor: str) -> str:
+        intent = extract_intent(request, now=reference_time)
+        item_id, error = self._resolve_backlog_target(intent)
+        response = self.tools.close_backlog_item(item_id, intent.get("outcome"), actor=actor) if item_id else None
+        message = response["message"] if response is not None else str(error)
+        if response is not None and response["status"] == "needs_confirmation":
+            self.pending_action = {
+                "action": "close",
+                "item_id": item_id,
+                "outcome": intent.get("outcome"),
+                "actor": actor,
+            }
+        print(message)
+        return message
 
     def capture_decision_from_request(
         self,

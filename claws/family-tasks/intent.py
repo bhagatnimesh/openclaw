@@ -319,7 +319,8 @@ TASK_OWNER_NOTE_RE = re.compile(
 )
 TASK_OWNER_ANNOTATION_RE = re.compile(
     rf"\b(?:owner|owned\s+by|assign(?:ed)?(?:\s+the)?\s+task\s+to|"
-    rf"assign(?:ed)?\s+to|(?:this\s+)?task\s+(?:is\s+)?for)\s+"
+    rf"assign(?:ed)?\s+to|(?:this\s+)?task\s+(?:is\s+)?for)"
+    rf"(?:\s+(?:is|to|as)|\s*:)?\s*"
     rf"(?P<owner>{OWNER_ALIAS_PATTERN})\b\.?",
     re.IGNORECASE,
 )
@@ -477,6 +478,13 @@ def _extract_task_detail_notes(user_text: str) -> tuple[str, str | None]:
         lambda match: f"\n{match.group('label')}:",
         user_text,
     )
+    labeled_text = re.sub(
+        r"\b(?P<label>details?|notes?|body)\s+"
+        r"(?=(?:add|bring|buy|call|check|find|get|order|pick|prepare|visit)\b)",
+        lambda match: f"\n{match.group('label')}: ",
+        labeled_text,
+        flags=re.IGNORECASE,
+    )
     lines = [line.strip() for line in labeled_text.splitlines()]
     title_parts: list[str] = []
     leading_parts: list[str] = []
@@ -503,6 +511,9 @@ def _extract_task_detail_notes(user_text: str) -> tuple[str, str | None]:
             current_section = "notes"
             continue
 
+        if TASK_OWNER_ANNOTATION_RE.fullmatch(line):
+            continue
+
         if current_section == "notes":
             note_parts.append(_clean_spaces(line))
         elif current_section == "title":
@@ -514,7 +525,17 @@ def _extract_task_detail_notes(user_text: str) -> tuple[str, str | None]:
         return user_text, None
 
     title_text = " ".join(title_parts or leading_parts).strip()
-    return title_text, "\n".join(note_parts).strip() or None
+    notes = "\n".join(note_parts).strip()
+    notes = re.sub(
+        r"\s+\btime\s*:?\s*\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?\b"
+        r"(?=\s*(?:\n|$))",
+        "",
+        notes,
+        flags=re.IGNORECASE,
+    ).strip()
+    if notes:
+        notes = notes[:1].upper() + notes[1:]
+    return title_text, notes or None
 
 
 def _assistant_metadata(
@@ -1241,8 +1262,24 @@ def _strip_task_annotations(title: str) -> str:
     cleaned = TASK_OWNER_ANNOTATION_RE.sub("", cleaned)
     cleaned = TASK_OWNER_NOTE_RE.sub("", cleaned)
     cleaned = DUE_DATE_ANNOTATION_RE.sub("", cleaned)
+    cleaned = re.sub(
+        r"^\s*(?:for|on|due)\s+"
+        r"(?:(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+        r"(?:\s+next week)?|next\s+"
+        r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))"
+        r"\s*[,.:-]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = TAG_ANNOTATION_RE.sub("", cleaned)
     cleaned = HASHTAG_RE.sub("", cleaned)
+    cleaned = re.sub(
+        r"\btime\s*:?\s*\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(
         r"\s*,?\s*(?:the\s+)?owner\s*(?:is|:)?\s*$",
         "",
@@ -1312,14 +1349,15 @@ def _extract_create_intent(
     reference: datetime,
 ) -> dict[str, Any]:
     task_text, assistant_metadata, assistant_notes = _extract_assistant_help(user_text)
-    intent_text, detail_notes = _extract_task_detail_notes(task_text or user_text)
+    metadata_text = task_text or user_text
+    intent_text, detail_notes = _extract_task_detail_notes(metadata_text)
     due, _ = _extract_due_date(intent_text, reference)
     title = _title_from_request(intent_text)
     missing_fields = []
     if title is None:
         missing_fields.append("title")
 
-    metadata = _infer_metadata(intent_text, due)
+    metadata = _infer_metadata(metadata_text, due)
     metadata.update(assistant_metadata)
 
     return {

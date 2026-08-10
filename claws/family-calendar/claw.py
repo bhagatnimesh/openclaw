@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import re
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -180,10 +180,27 @@ def _event_matches_metadata_filter(
 
     person = metadata_filter.get("person")
     if person is not None and metadata.get("person") != person:
-        text_query = metadata_filter.get("text_query")
-        if text_query is None:
+        if (
+            metadata_filter.get("text_query") is None
+            and metadata_filter.get("text_any_queries") is None
+        ):
             return False
-        if _normalize_match_text(str(text_query)) not in _event_match_text(event):
+
+    text_query = metadata_filter.get("text_query")
+    if text_query is not None:
+        query_tokens = _tokens(str(text_query))
+        event_tokens = _tokens(_event_match_text(event))
+        if not query_tokens.issubset(event_tokens):
+            return False
+
+    text_any_queries = metadata_filter.get("text_any_queries")
+    if text_any_queries is not None:
+        event_tokens = _tokens(str(event.get("summary") or ""))
+        any_match = any(
+            _tokens(str(query)).issubset(event_tokens)
+            for query in text_any_queries
+        )
+        if not any_match:
             return False
 
     return True
@@ -273,6 +290,13 @@ def _event_end(event: dict[str, Any]) -> datetime:
 
     parsed_date = _parse_event_time(end.get("date"))
     return parsed_date or datetime.max
+
+
+def _format_event_date(event: dict[str, Any]) -> str:
+    start = _event_start(event)
+    if start == datetime.max:
+        return ""
+    return start.strftime("%a, %b %-d")
 
 
 def _has_metadata(event: dict[str, Any]) -> bool:
@@ -686,6 +710,158 @@ def _merge_create_intent(
     return merged
 
 
+BULK_DATE_LINE_RE = re.compile(
+    r"^\s*(?P<month>\d{1,2})/(?P<day>\d{1,2})(?:/(?P<year>\d{2,4}))?\s*$",
+)
+
+
+def _parse_bulk_date_line(
+    line: str,
+    reference: datetime,
+    previous: date | None,
+) -> date | None:
+    match = BULK_DATE_LINE_RE.match(line)
+    if match is None:
+        return None
+
+    month = int(match.group("month"))
+    day = int(match.group("day"))
+    year_text = match.group("year")
+    if year_text is None:
+        year = reference.year
+    elif len(year_text) == 2:
+        year = 2000 + int(year_text)
+    else:
+        year = int(year_text)
+
+    try:
+        parsed = date(year, month, day)
+    except ValueError:
+        return None
+
+    if year_text is not None:
+        return parsed
+
+    while parsed < reference.date() or (previous is not None and parsed <= previous):
+        try:
+            parsed = date(parsed.year + 1, month, day)
+        except ValueError:
+            return None
+
+    return parsed
+
+
+def _bulk_base_request(lines: list[str]) -> str:
+    header = " ".join(line for line in lines if BULK_DATE_LINE_RE.match(line) is None)
+    header = re.sub(
+        r"\bfor\s+(?:the\s+)?(?:below|following)\s+(?:days?|dates?|data)\b",
+        " ",
+        header,
+        flags=re.IGNORECASE,
+    )
+    header = re.sub(
+        r"\bon\s+(?:the\s+)?(?:below|following)\s+(?:days?|dates?|data)\b",
+        " ",
+        header,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(header.split())
+
+
+def _bulk_date_labels(dates: list[str]) -> str:
+    labels = []
+    for value in dates:
+        parsed = datetime.fromisoformat(f"{value}T00:00:00")
+        labels.append(parsed.strftime("%b %-d"))
+    return ", ".join(labels)
+
+
+def _extract_bulk_create_intent(
+    request: str,
+    reference_time: datetime | None,
+) -> dict[str, Any] | None:
+    lines = [line.strip() for line in request.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return None
+
+    reference = reference_time
+    if reference is None:
+        reference = datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+    elif reference.tzinfo is None:
+        reference = reference.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+    parsed_dates: list[date] = []
+    previous: date | None = None
+    for line in lines:
+        parsed = _parse_bulk_date_line(line, reference, previous)
+        if parsed is None:
+            continue
+        parsed_dates.append(parsed)
+        previous = parsed
+
+    if len(parsed_dates) < 2:
+        return None
+
+    base_request = _bulk_base_request(lines)
+    base_intent = extract_intent(base_request, now=reference)
+    intents = []
+    for parsed in parsed_dates:
+        intent = deepcopy(base_intent)
+        intent["date"] = parsed.isoformat()
+        intent["missing_fields"] = [
+            field
+            for field in intent.get("missing_fields", [])
+            if field != "date"
+        ]
+        intents.append(intent)
+
+    missing_fields = []
+    if any(intent.get("title") is None for intent in intents):
+        missing_fields.append("title")
+    if any(intent.get("start_time") is None for intent in intents):
+        missing_fields.append("time")
+
+    return {
+        "intent": "create_events",
+        "intents": intents,
+        "dates": [parsed.isoformat() for parsed in parsed_dates],
+        "missing_fields": missing_fields,
+    }
+
+
+def _merge_bulk_create_intent(
+    pending: dict[str, Any],
+    followup: dict[str, Any],
+) -> dict[str, Any]:
+    merged = deepcopy(pending)
+    intents = []
+    for intent in merged.get("intents", []):
+        updated = _merge_create_intent(intent, followup)
+        intents.append(updated)
+    merged["intents"] = intents
+    missing = {
+        field
+        for intent in intents
+        for field in intent.get("missing_fields", [])
+        if field in {"title", "time"}
+    }
+    merged["missing_fields"] = [field for field in ("title", "time") if field in missing]
+    return merged
+
+
+def _format_missing_bulk_create_message(intent: dict[str, Any]) -> str:
+    missing = intent.get("missing_fields", [])
+    if missing == ["time"]:
+        first = next((item for item in intent.get("intents", []) if item.get("title")), {})
+        title = first.get("title") or "these events"
+        return (
+            f"Please provide a time for {title} on "
+            f"{len(intent.get('dates', []))} dates: {_bulk_date_labels(intent.get('dates', []))}."
+        )
+
+    return "Please provide: " + ", ".join(missing) + "."
+
+
 def _extract_preparation_followup(request: str) -> str | None:
     cleaned = request.strip().lstrip("> ").strip().strip(".")
     cleaned = re.sub(r"^(?:please\s+)?(?:also\s+)?add\s+", "", cleaned, flags=re.IGNORECASE)
@@ -1057,6 +1233,17 @@ class FamilyCalendarClaw:
         categorize, remember preferences, or infer missing event details.
         """
 
+        bulk_intent = _extract_bulk_create_intent(request, reference_time)
+        if bulk_intent is not None:
+            missing = bulk_intent.get("missing_fields", [])
+            if missing:
+                self.pending_action = PendingAction(action="create_bulk", payload=bulk_intent)
+                message = _format_missing_bulk_create_message(bulk_intent)
+                print(message)
+                return message
+
+            return self._create_events_from_intents(bulk_intent["intents"])
+
         intent = extract_intent(request, now=reference_time)
         missing = intent.get("missing_fields", [])
         if missing:
@@ -1085,9 +1272,35 @@ class FamilyCalendarClaw:
 
         return self._create_event_from_intent(intent)
 
+    def _create_events_from_intents(
+        self,
+        intents: list[dict[str, Any]],
+    ) -> str:
+        created_messages = []
+        for intent in intents:
+            created_messages.append(self._create_event_from_intent(intent, print_message=False))
+
+        failures = [
+            message
+            for message in created_messages
+            if not message.startswith("Created calendar event:")
+        ]
+        if failures:
+            return "\n".join(failures)
+
+        first_title = intents[0].get("title") or "calendar event"
+        dates = [intent["date"] for intent in intents if intent.get("date")]
+        message = (
+            f"Created {len(created_messages)} calendar events for {first_title}: "
+            f"{_bulk_date_labels(dates)}."
+        )
+        print(message)
+        return message
+
     def _create_event_from_intent(
         self,
         intent: dict[str, Any],
+        print_message: bool = True,
     ) -> str:
         timezone = intent.get("timezone") or DEFAULT_TIMEZONE
         start = datetime.fromisoformat(f"{intent['date']}T{intent['start_time']}:00")
@@ -1127,7 +1340,8 @@ class FamilyCalendarClaw:
             event_link=event_link,
             event_id=event_id,
         )
-        print(message)
+        if print_message:
+            print(message)
         return message
 
     def _add_preparation_to_event(
@@ -1349,6 +1563,15 @@ class FamilyCalendarClaw:
 
         lines = ["Calendar events:"]
         metadata_filter = intent.get("metadata_filter", {})
+        range_start = _parse_event_time(intent.get("start"))
+        range_end = _parse_event_time(intent.get("end"))
+        include_dates = bool(metadata_filter)
+        if (
+            range_start is not None
+            and range_end is not None
+            and range_end - range_start > timedelta(days=1)
+        ):
+            include_dates = True
         for event in events:
             title = event.get("summary") or "Untitled event"
             start_part = event.get("start", {})
@@ -1357,6 +1580,7 @@ class FamilyCalendarClaw:
             end_label = _format_event_time(end_part)
             location = event.get("location")
             location_suffix = f" at {location}" if location else ""
+            date_prefix = f"{_format_event_date(event)}: " if include_dates else ""
             metadata_suffix = ""
             if metadata_filter.get("preparation_needed") is True:
                 _, metadata = read_metadata_from_event(event)
@@ -1364,7 +1588,8 @@ class FamilyCalendarClaw:
                 if preparation_notes:
                     metadata_suffix = f" (prep: {preparation_notes})"
             lines.append(
-                f"- {title}: {start_label} to {end_label}{location_suffix}{metadata_suffix}"
+                f"- {date_prefix}{title}: {start_label} to {end_label}"
+                f"{location_suffix}{metadata_suffix}"
             )
 
         message = "\n".join(lines)
@@ -1722,7 +1947,11 @@ class FamilyCalendarClaw:
             private_extended_properties=_private_extended_properties_for_event(event),
         )
 
-    def handle_pending_response(self, response: str) -> bool:
+    def handle_pending_response(
+        self,
+        response: str,
+        reference_time: datetime | None = None,
+    ) -> bool:
         command = response.strip().lower()
         if self.pending_action is None:
             return False
@@ -1738,7 +1967,7 @@ class FamilyCalendarClaw:
             return True
 
         if pending.action == "create":
-            followup = extract_intent(response)
+            followup = extract_intent(response, now=reference_time)
             merged = _merge_create_intent(pending.payload or {}, followup)
             missing = merged.get("missing_fields", [])
             if missing:
@@ -1748,6 +1977,19 @@ class FamilyCalendarClaw:
 
             self.pending_action = None
             self._create_event_from_intent(merged)
+            return True
+
+        if pending.action == "create_bulk":
+            followup = extract_intent(response, now=reference_time)
+            merged = _merge_bulk_create_intent(pending.payload or {}, followup)
+            missing = merged.get("missing_fields", [])
+            if missing:
+                self.pending_action = PendingAction(action="create_bulk", payload=merged)
+                print(_format_missing_bulk_create_message(merged))
+                return True
+
+            self.pending_action = None
+            self._create_events_from_intents(merged.get("intents", []))
             return True
 
         if pending.choices is not None and command.isdigit():

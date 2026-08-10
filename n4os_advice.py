@@ -9,6 +9,7 @@ import urllib.request
 from typing import Any, Callable
 
 from n4os_review import format_n4os_review
+from n4os_trajectories import read_recent_trajectory_summaries
 
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parent
@@ -17,7 +18,11 @@ OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 DEFAULT_MODEL = "gpt-5.4-mini"
 ADVICE_TRIGGER_RE = re.compile(
     r"^\s*/(?:ask|n4os|coach|advice)(?:@\w+)?(?:\s+|$)|"
-    r"\b(?:n4os|coach me|give me advice|what should|how should|approach)\b",
+    r"\b(?:n4os|coach me|give me advice|what should|how should|approach)\b|"
+    r"\b(?:run|start|do)\s+(?:the\s+)?(?:morning\s+)?check-?in\b|"
+    r"\b(?:morning\s+check-?in|evening\s+(?:reflection|review|check-?in)|daily\s+check-?in)\b|"
+    r"\bhelp\s+me\s+plan\s+(?:tomorrow\s+)?morning\b|"
+    r"\bplan\s+(?:my\s+)?(?:tomorrow\s+)?morning\b",
     re.I,
 )
 
@@ -38,6 +43,10 @@ def format_n4os_advice(
 ) -> str:
     cleaned_request = _strip_advice_prefix(request)
     context = _build_context(cleaned_request, n4os_root)
+    if _is_morning_checkin_request(cleaned_request.lower()):
+        return _fallback_morning_checkin(cleaned_request)
+    if _is_evening_reflection_request(cleaned_request.lower()):
+        return _fallback_evening_reflection()
     if _is_week_ahead_request(cleaned_request.lower()):
         return _fallback_week_ahead(context)
     if _is_school_transition_request(cleaned_request.lower()):
@@ -116,9 +125,18 @@ def _build_context(request: str, n4os_root: Path) -> dict[str, Any]:
         "files": _read_files(n4os_root, files),
         "observations": observations,
         "journal": journal,
+        "trajectories": read_recent_trajectory_summaries(
+            n4os_root / "trajectories",
+            lowered_request=lowered,
+        ),
         "operations": _load_week_ahead_operations(target=week_target) if is_week_ahead else {},
         "target": week_target,
     }
+
+
+def context_labels_from_context(context: dict[str, Any]) -> list[str]:
+    loaded = [str(item.get("path", "")) for item in context.get("files", [])]
+    return _compact_loaded_files(loaded)
 
 
 def _read_files(n4os_root: Path, paths: list[str]) -> list[dict[str, str]]:
@@ -242,6 +260,7 @@ def _try_openai_advice(
                     {
                         "question": request,
                         "memory": context,
+                        "conversation_trajectories": context.get("trajectories") or [],
                         "format": "concise Telegram-friendly answer",
                     },
                     sort_keys=True,
@@ -332,6 +351,7 @@ def _needs_family_capture_loop(text: str, context: dict[str, Any]) -> bool:
 def _fallback_advice(request: str, context: dict[str, Any]) -> str:
     observations = context.get("observations") or []
     journal = context.get("journal") or []
+    trajectories = context.get("trajectories") or []
     loaded = [item["path"] for item in context.get("files", [])]
     if _is_week_ahead_request(request.lower()):
         return _fallback_week_ahead(context)
@@ -380,9 +400,12 @@ def _fallback_advice(request: str, context: dict[str, Any]) -> str:
     if observations and not is_nysha_school_transition:
         lines.extend(["", "Memory signals used:"])
         lines.extend(f"- {item}" for item in observations[-5:])
-    if journal:
+    if journal and not is_nysha_school_transition:
         lines.extend(["", "Journal signals used:"])
         lines.extend(f"- {item}" for item in journal[-5:])
+    if trajectories and not is_nysha_school_transition:
+        lines.extend(["", "Conversation signals used:"])
+        lines.extend(f"- {item}" for item in trajectories[-3:])
     lines.extend(
         [
             "",
@@ -447,6 +470,74 @@ def _is_week_ahead_request(lowered: str) -> bool:
     )
 
 
+def _is_morning_checkin_request(lowered: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:run|start|do)\s+(?:the\s+)?(?:morning\s+)?check-?in\b|"
+            r"\bmorning\s+check-?in\b|"
+            r"\bhelp\s+me\s+plan\s+(?:tomorrow\s+)?morning\b|"
+            r"\bplan\s+(?:my\s+)?(?:tomorrow\s+)?morning\b",
+            lowered,
+        )
+    )
+
+
+def _is_evening_reflection_request(lowered: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:run|start|do)\s+(?:the\s+)?evening\s+(?:reflection|review|check-?in)\b|"
+            r"\bevening\s+(?:reflection|review|check-?in)\b|"
+            r"\bclose\s+(?:the\s+)?loop\b",
+            lowered,
+        )
+    )
+
+
+def _fallback_morning_checkin(request: str) -> str:
+    lowered = request.lower()
+    title = "Tomorrow morning plan" if "tomorrow" in lowered else "Morning check-in"
+    return "\n".join(
+        [
+            f"{title}: keep this simple and concrete.",
+            "",
+            "Answer these:",
+            "1. Energy/body/mind: what state are you starting from?",
+            "2. Priority: what matters most, and what can be ignored?",
+            "3. Family: who needs presence from you today?",
+            "",
+            "Commit to 3 things:",
+            "1.",
+            "2.",
+            "3.",
+            "",
+            "Decision: protect health, family presence, and one highest-leverage action.",
+            "Next action: write the 3 commitments now.",
+            "Review: run evening reflection tonight.",
+        ]
+    )
+
+
+def _fallback_evening_reflection() -> str:
+    return "\n".join(
+        [
+            "Evening reflection: close the loop without judgment.",
+            "",
+            "Answer these:",
+            "1. Did you spend time on the highest priorities?",
+            "2. What gave energy, and what drained it?",
+            "3. What family moment mattered?",
+            "",
+            "Adjustment:",
+            "1. What should stop, replace, or simplify?",
+            "2. What is tomorrow's highest-leverage action?",
+            "",
+            "Decision: carry the lesson, not the guilt.",
+            "Next action: choose tomorrow's one important move.",
+            "Review: save anything worth remembering with capture.",
+        ]
+    )
+
+
 def _is_school_transition_request(lowered: str) -> bool:
     return "nysha" in lowered and ("school" in lowered or "transition" in lowered)
 
@@ -479,11 +570,6 @@ def _fallback_week_ahead(context: dict[str, Any]) -> str:
     lines.append("")
     lines.extend(_week_ahead_summary_lines(operations, target))
 
-    unavailable = operations.get("unavailable") or []
-    if unavailable:
-        lines.extend(["", "Operational context not loaded:"])
-        lines.extend(f"- {item}" for item in unavailable)
-
     lines.extend(["", "Focus tomorrow:"])
     if target == "Nysha":
         lines.extend(
@@ -509,9 +595,9 @@ def _fallback_week_ahead(context: dict[str, Any]) -> str:
                 "3. Decide tomorrow's hard priority tonight.",
             ]
         )
-    if journal:
+    if journal and target is None:
         lines.extend(["", "Personal signal:"])
-        lines.extend(f"- {item}" for item in journal[-2:])
+        lines.extend(f"- {_compact_signal_line(item)}" for item in journal[-2:])
     if observations:
         lines.extend(["", * _family_signal_summary_lines(observations, target)])
 
@@ -532,11 +618,15 @@ def _fallback_week_ahead(context: dict[str, Any]) -> str:
             f"Review/Capture: run /review week and save what worked in {_current_observations_path()}.",
         ]
     )
-    lines.extend(["", "Used: " + ", ".join(_compact_loaded_files(loaded))])
+    lines.append("Used: " + ", ".join(_compact_loaded_files(loaded)))
     return "\n".join(lines)
 
 
 def _week_ahead_summary_lines(operations: dict[str, Any], target: str | None) -> list[str]:
+    unavailable = operations.get("unavailable") or []
+    if unavailable and not _has_any_operations(operations):
+        return ["Calendar/tasks were not available, so this uses N4OS memory only."]
+
     summary = [
         _count_summary("calendar", operations.get("events")),
         _count_summary("prep", operations.get("prep_events")),
@@ -586,6 +676,13 @@ def _week_ahead_next_action(target: str | None) -> str:
     if target == "Navya":
         return "Next action: choose one simple routine or learning win for tomorrow."
     return "Next action: choose tomorrow's one hard priority tonight, then schedule movement before work."
+
+
+def _compact_signal_line(value: str, max_length: int = 180) -> str:
+    cleaned = " ".join(value.split())
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max_length - 3].rstrip() + "..."
 
 
 def _current_observations_path() -> str:

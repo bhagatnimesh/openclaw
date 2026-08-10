@@ -22,10 +22,12 @@ from telegram_bot import (
     ERROR_MESSAGE,
     HELP_MESSAGE,
     HOW_TO_HELP,
+    READING_PHOTO_UPLOAD_DIR,
     SETUP_USER_MESSAGE,
     UNAUTHORIZED_MESSAGE,
     N4OSTelegramBot,
     TelegramConfig,
+    TelegramSenderProfile,
     VOICE_TRANSCRIPTION_EMPTY_MESSAGE,
     VOICE_TRANSCRIPTION_FAILED_MESSAGE,
     VOICE_TRANSCRIPTION_RESULT_MESSAGE,
@@ -35,8 +37,10 @@ from telegram_bot import (
     build_application,
     load_config,
 )
+from claws.n4os.claw import N4OSClaw
 from n4os_capture import CaptureIngestResult, JournalEntry
 from n4os_capture import CaptureUndoResult
+from n4os_chat import N4OSChatResult
 from n4os_memory_inbox import MemoryIngestResult, MemoryObservation
 
 
@@ -85,6 +89,59 @@ class FakeClaw:
             "intent_summary": "Route to family-tasks.",
             "confidence": 0.9,
         }
+
+
+class FakeLibraryRouteClaw(N4OSClaw):
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str | None, str | None]] = []
+
+    def handle_request(
+        self,
+        request: str,
+        reference_time=None,
+        source: str = "telegram_text",
+        default_owner: str | None = None,
+        photo_path: str | None = None,
+    ):
+        del reference_time
+        self.calls.append((request, source, default_owner, photo_path))
+        print("Saved library photo.")
+        return {
+            "route": "library",
+            "intent_summary": "Route to library for record_reading.",
+            "confidence": 0.9,
+        }
+
+
+class FakeLibraryCheckoutRouteClaw(FakeLibraryRouteClaw):
+    def handle_request(
+        self,
+        request: str,
+        reference_time=None,
+        source: str = "telegram_text",
+        default_owner: str | None = None,
+        photo_path: str | None = None,
+    ):
+        del reference_time
+        self.calls.append((request, source, default_owner, photo_path))
+        print("Saved this library bag with 1 book at home.")
+        return {
+            "route": "library",
+            "intent_summary": "Route to library for record_checkout.",
+            "confidence": 0.9,
+        }
+
+
+class FakeShoppingRouteClaw:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object | None]] = []
+        self.undo_stack: list[dict[str, str]] = []
+
+    def handle_request(self, request: str, reference_time=None):
+        self.calls.append((request, reference_time))
+        self.undo_stack.append({"action": "shopping"})
+        print(f"Added milk to Costco.")
+        return f"Added milk to Costco."
 
 
 class UndoableRouterClaw:
@@ -280,6 +337,47 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies, [UNAUTHORIZED_MESSAGE])
         self.assertEqual(claw.requests, [])
 
+    async def test_secondary_allowed_user_can_route_messages(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(
+                token="token",
+                allowed_user_id=12345,
+                allowed_user_ids=frozenset({12345, 67890}),
+            ),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("Add task buy milk")
+
+        await bot.handle_message(FakeUpdate(67890, message), None)
+
+        self.assertEqual(claw.requests, ["Add task buy milk"])
+        self.assertNotEqual(message.replies, [UNAUTHORIZED_MESSAGE])
+
+    async def test_sender_profile_tags_routed_message_source_and_default_owner(self):
+        claw = FakeLibraryRouteClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(
+                token="token",
+                allowed_user_id=12345,
+                allowed_user_ids=frozenset({12345, 67890}),
+                sender_profiles=(TelegramSenderProfile(67890, "niyati", "mom"),),
+            ),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("Nysha read 8 pages")
+
+        await bot.handle_message(FakeUpdate(67890, message), None)
+
+        self.assertEqual(len(claw.calls), 1)
+        request, source, default_owner, photo_path = claw.calls[0]
+        self.assertEqual(request, "Nysha read 8 pages")
+        self.assertEqual(source, "telegram_text:niyati")
+        self.assertEqual(default_owner, "mom")
+        self.assertIsNone(photo_path)
+
     async def test_unauthorized_voice_is_denied_without_transcription(self):
         claw = FakeClaw()
         transcriber = FakeAudioTranscriber("Add task buy milk")
@@ -310,6 +408,24 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(claw.requests, ["Add task buy milk"])
         self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
+
+    async def test_authorized_cart_command_routes_to_shopping(self):
+        shopping = FakeShoppingRouteClaw()
+        claw = N4OSClaw(shopping_claw=shopping)
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/cart add milk to Costco")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(
+            shopping.calls,
+            [("/cart add milk to Costco", None)],
+        )
+        self.assertEqual(message.replies, ["Added milk to Costco."])
 
     async def test_photo_caption_routes_with_extracted_image_text(self):
         claw = FakeClaw()
@@ -345,6 +461,103 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies, ["router replied to: " + claw.requests[0]])
         self.assertEqual(len(extractor.paths), 1)
         self.assertFalse(extractor.paths[0].exists())
+
+    async def test_library_photo_is_preserved_as_dashboard_snap(self):
+        claw = FakeLibraryRouteClaw()
+        extractor = FakeImageTextExtractor("Book title: Mercy Watson")
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            image_text_extractor=extractor,
+        )
+        telegram_file = FakeTelegramFile(b"book cover bytes")
+        message = FakeMessage(
+            caption="Nysha read this",
+            photo=[FakeTelegramPhoto(telegram_file)],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(len(claw.calls), 1)
+        request, source, default_owner, photo_path = claw.calls[0]
+        self.assertIn("Book title: Mercy Watson", request)
+        self.assertEqual(source, "telegram_photo")
+        self.assertIsNone(default_owner)
+        self.assertIsNotNone(photo_path)
+        self.assertTrue(photo_path.startswith("/static/dashboard/uploads/reading/"))
+        stored_file = READING_PHOTO_UPLOAD_DIR / Path(photo_path).name
+        try:
+            self.assertTrue(stored_file.exists())
+            self.assertEqual(stored_file.read_bytes(), b"book cover bytes")
+        finally:
+            stored_file.unlink(missing_ok=True)
+        self.assertEqual(message.replies, ["Saved library photo."])
+
+    async def test_slash_library_add_parent_reading_photo_is_preserved(self):
+        claw = FakeLibraryRouteClaw()
+        extractor = FakeImageTextExtractor(
+            "Book title: EARL & WORM THE BIG MESS STORIES Author: GREG PIZZOLI",
+        )
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            image_text_extractor=extractor,
+        )
+        telegram_file = FakeTelegramFile(b"book cover bytes")
+        message = FakeMessage(
+            caption="/library add dad read to nysha",
+            photo=[FakeTelegramPhoto(telegram_file)],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(len(claw.calls), 1)
+        request, source, default_owner, photo_path = claw.calls[0]
+        self.assertIn("/library add dad read to nysha", request)
+        self.assertIn("Book title: EARL & WORM THE BIG MESS STORIES", request)
+        self.assertEqual(source, "telegram_photo")
+        self.assertIsNone(default_owner)
+        self.assertIsNotNone(photo_path)
+        self.assertTrue(photo_path.startswith("/static/dashboard/uploads/reading/"))
+        stored_file = READING_PHOTO_UPLOAD_DIR / Path(photo_path).name
+        try:
+            self.assertTrue(stored_file.exists())
+            self.assertEqual(stored_file.read_bytes(), b"book cover bytes")
+        finally:
+            stored_file.unlink(missing_ok=True)
+        self.assertEqual(message.replies, ["Saved library photo."])
+
+    async def test_family_library_checkout_photo_is_not_preserved_as_reading_snap(self):
+        claw = FakeLibraryCheckoutRouteClaw()
+        extractor = FakeImageTextExtractor(
+            "Book title: Earl & Worm: The Big Mess and Other Stories\n"
+            "Author: Greg Pizzoli",
+        )
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            image_text_extractor=extractor,
+        )
+        telegram_file = FakeTelegramFile(b"book cover bytes")
+        message = FakeMessage(
+            caption="Add to library family reading read by Dad",
+            photo=[FakeTelegramPhoto(telegram_file)],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(len(claw.calls), 1)
+        request, source, default_owner, photo_path = claw.calls[0]
+        self.assertIn("Book title: Earl & Worm: The Big Mess and Other Stories", request)
+        self.assertEqual(source, "telegram_photo")
+        self.assertIsNone(default_owner)
+        self.assertIsNotNone(photo_path)
+        stored_file = READING_PHOTO_UPLOAD_DIR / Path(photo_path).name
+        self.assertFalse(stored_file.exists())
+        self.assertEqual(message.replies, ["Saved this library bag with 1 book at home."])
 
     async def test_authorized_slash_calendar_routes_to_n4os_as_text(self):
         claw = FakeClaw()
@@ -436,6 +649,34 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
                 "No profiles, playbooks, or goals were promoted automatically."
             ],
         )
+
+    async def test_sender_profile_tags_capture_origin(self):
+        claw = FakeClaw()
+        result = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[],
+            skipped_journal_duplicates=[],
+        )
+        bot = N4OSTelegramBot(
+            TelegramConfig(
+                token="token",
+                allowed_user_id=12345,
+                allowed_user_ids=frozenset({12345, 67890}),
+                sender_profiles=(TelegramSenderProfile(67890, "niyati", "mom"),),
+            ),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/capture Niyati journal note")
+
+        with patch("telegram_bot.ingest_capture_notes", return_value=result) as ingest:
+            await bot.handle_message(FakeUpdate(67890, message), None)
+
+        ingest.assert_called_once_with(
+            "/capture Niyati journal note",
+            source="Telegram/Niyati",
+        )
+        self.assertEqual(claw.requests, [])
 
     async def test_authorized_bare_voice_capture_is_captured_without_routing(self):
         claw = FakeClaw()
@@ -609,6 +850,65 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claw.requests, [])
         self.assertEqual(message.replies, ["family memory summary"])
 
+    async def test_authorized_remember_records_structured_memory_without_routing_or_capture(self):
+        today = date.today()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            message = FakeMessage("/remember Niyati picked up dinner tonight")
+
+            with patch("telegram_bot.ingest_capture_notes") as ingest:
+                await bot.handle_message(FakeUpdate(12345, message), None)
+
+        ingest.assert_not_called()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(
+            message.replies,
+            [f"Remembered. Dinner pickup: Niyati on {today.isoformat()}."],
+        )
+
+    async def test_authorized_dinner_pickup_query_reads_structured_memory(self):
+        today = date.today()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember Niyati picked up dinner tonight")),
+                None,
+            )
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember Nimesh picked up dinner yesterday")),
+                None,
+            )
+            query = FakeMessage("who picked the last 2 dinners?")
+
+            await bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(
+            query.replies,
+            [
+                "Last 2 dinner pickups:\n"
+                f"1. {today.isoformat()}: Niyati\n"
+                f"2. {(today - date.resolution).isoformat()}: Nimesh"
+            ],
+        )
+
     async def test_authorized_status_target_reports_without_routing(self):
         claw = FakeClaw()
         bot = N4OSTelegramBot(
@@ -680,10 +980,16 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         )
         message = FakeMessage("/ask How should we approach Nysha's reading?")
 
-        with patch("telegram_bot.format_n4os_advice", return_value="memory-backed advice") as advice:
+        with patch("telegram_bot.format_n4os_advice", return_value="memory-backed advice") as advice, patch(
+            "telegram_bot.record_n4os_trajectory"
+        ) as record:
             await bot.handle_message(FakeUpdate(12345, message), None)
 
-        advice.assert_called_once_with("/ask How should we approach Nysha's reading?")
+        advice.assert_called_once_with(
+            "/ask How should we approach Nysha's reading?",
+            n4os_root=bot.n4os_root,
+        )
+        record.assert_called_once()
         self.assertEqual(claw.requests, [])
         self.assertEqual(message.replies, ["memory-backed advice"])
 
@@ -696,12 +1002,176 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         )
         message = FakeMessage("/ask how should I help Nysha with school transition?")
 
-        with patch("telegram_bot.format_n4os_advice", return_value="school advice") as advice:
+        with patch("telegram_bot.format_n4os_advice", return_value="school advice") as advice, patch(
+            "telegram_bot.record_n4os_trajectory"
+        ) as record:
             await bot.handle_message(FakeUpdate(12345, message), None)
 
-        advice.assert_called_once_with("/ask how should I help Nysha with school transition?")
+        advice.assert_called_once_with(
+            "/ask how should I help Nysha with school transition?",
+            n4os_root=bot.n4os_root,
+        )
+        record.assert_called_once()
         self.assertEqual(claw.requests, [])
         self.assertEqual(message.replies, ["school advice"])
+
+    async def test_morning_checkin_uses_n4os_advice_before_router(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("Run morning check-in.")
+
+        with patch("telegram_bot.format_n4os_advice", return_value="morning prompt") as advice, patch(
+            "telegram_bot.record_n4os_trajectory"
+        ) as record:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        advice.assert_called_once_with("Run morning check-in.", n4os_root=bot.n4os_root)
+        record.assert_called_once()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["morning prompt"])
+
+    async def test_help_me_plan_morning_uses_advice_not_command_help(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("Help me plan tomorrow morning.")
+
+        with patch("telegram_bot.format_n4os_advice", return_value="tomorrow plan") as advice, patch(
+            "telegram_bot.record_n4os_trajectory"
+        ) as record:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        advice.assert_called_once_with("Help me plan tomorrow morning.", n4os_root=bot.n4os_root)
+        record.assert_called_once()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["tomorrow plan"])
+
+    async def test_ask_question_stores_trajectory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir(parents=True)
+            (n4os_root / "SOUL.md").write_text("Be warm.\n", encoding="utf-8")
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            message = FakeMessage("/ask How should I approach Nysha school?")
+
+            with patch("telegram_bot.format_n4os_advice", return_value="school advice"):
+                await bot.handle_message(FakeUpdate(12345, message), None)
+
+            trajectory_path = next((n4os_root / "trajectories").glob("*.md"))
+            trajectory = trajectory_path.read_text(encoding="utf-8")
+
+        self.assertIn("- Mode: ask", trajectory)
+        self.assertIn("How should I approach Nysha school?", trajectory)
+        self.assertIn("school advice", trajectory)
+
+    async def test_chat_command_routes_to_rich_chat_and_stores_trajectory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir(parents=True)
+            (n4os_root / "SOUL.md").write_text("Be warm.\n", encoding="utf-8")
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            message = FakeMessage("/chat How do I approach Nysha's first week at school?")
+
+            with patch(
+                "telegram_bot.format_n4os_chat",
+                return_value=N4OSChatResult(
+                    reply="rich school conversation",
+                    context_labels=["SOUL", "Nysha"],
+                    model="gpt-5.4-mini",
+                ),
+            ) as chat:
+                await bot.handle_message(FakeUpdate(12345, message), None)
+
+            trajectory_path = next((n4os_root / "trajectories").glob("*.md"))
+            trajectory = trajectory_path.read_text(encoding="utf-8")
+
+        chat.assert_called_once()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["rich school conversation"])
+        self.assertIn("- Mode: chat", trajectory)
+        self.assertIn("rich school conversation", trajectory)
+
+    async def test_chat_followup_continues_active_session(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        first = FakeMessage("/chat first topic")
+        second = FakeMessage("what about day two?")
+
+        with patch(
+            "telegram_bot.format_n4os_chat",
+            side_effect=[
+                N4OSChatResult("first answer", ["SOUL"], "gpt-5.4-mini"),
+                N4OSChatResult("second answer", ["SOUL"], "gpt-5.4-mini"),
+            ],
+        ) as chat, patch("telegram_bot.record_n4os_trajectory"):
+            await bot.handle_message(FakeUpdate(12345, first), None)
+            await bot.handle_message(FakeUpdate(12345, second), None)
+
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(first.replies, ["first answer"])
+        self.assertEqual(second.replies, ["second answer"])
+        self.assertEqual(claw.requests, [])
+
+    async def test_active_chat_does_not_capture_mutation_commands(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        bot.chat_sessions.append(
+            "telegram:12345",
+            user_text="topic",
+            assistant_text="answer",
+        )
+        message = FakeMessage("Add task buy milk")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, ["Add task buy milk"])
+        self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
+
+    async def test_long_chat_reply_is_chunked(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/chat long topic")
+        long_reply = "A" * 3900 + "\n\n" + "B" * 3900
+
+        with patch(
+            "telegram_bot.format_n4os_chat",
+            return_value=N4OSChatResult(long_reply, ["SOUL"], "gpt-5.4-mini"),
+        ), patch("telegram_bot.record_n4os_trajectory"):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertGreaterEqual(len(message.replies), 2)
+        self.assertTrue(all(len(reply) <= 3800 for reply in message.replies))
 
     async def test_authorized_how_to_memory_gets_direct_help(self):
         claw = FakeClaw()
@@ -1124,12 +1594,128 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies, [HELP_MESSAGE])
         self.assertIn("/capture Nysha", HELP_MESSAGE)
         self.assertIn("/ask How should", HELP_MESSAGE)
+        self.assertIn("/chat Let's think", HELP_MESSAGE)
         self.assertIn("/review week", HELP_MESSAGE)
         self.assertIn("/status Nysha", HELP_MESSAGE)
+        self.assertIn("/status reading", HELP_MESSAGE)
         self.assertIn("/event create", HELP_MESSAGE)
+        self.assertIn("add task call FUSD", HELP_MESSAGE)
+        self.assertIn("/cart add milk", HELP_MESSAGE)
+        self.assertIn("today's briefing", HELP_MESSAGE)
         self.assertIn("/goals", HELP_MESSAGE)
         self.assertIn("Nysha read 8 pages", HELP_MESSAGE)
         self.assertIn("science lab experiments", HELP_MESSAGE)
+        self.assertIn("Discussion: Should we attend", HELP_MESSAGE)
+        self.assertIn("Planning: Camping trip", HELP_MESSAGE)
+        self.assertIn("Decision: Choose Nysha's school", HELP_MESSAGE)
+        self.assertIn("add home board item", HELP_MESSAGE)
+        self.assertIn("how do I add a memory?", HELP_MESSAGE)
+        self.assertIn("how do I use shopping?", HELP_MESSAGE)
+        self.assertLessEqual(len(HELP_MESSAGE.splitlines()), 16)
+        self.assertNotIn("**", HELP_MESSAGE)
+        self.assertNotIn("###", HELP_MESSAGE)
+        self.assertNotIn("Loaded:", HELP_MESSAGE)
+        self.assertNotIn("n4os/", HELP_MESSAGE)
+
+    async def test_help_command_with_library_topic_gets_library_help(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/help library")
+
+        await bot.handle_help(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [HOW_TO_HELP["library"]])
+        self.assertIn("Send one of these:", HOW_TO_HELP["library"])
+        self.assertIn("Add reading:", HOW_TO_HELP["library"])
+        self.assertIn("Change:", HOW_TO_HELP["library"])
+        self.assertIn("Delete:", HOW_TO_HELP["library"])
+        self.assertIn("See:", HOW_TO_HELP["library"])
+        self.assertIn("Change Nysha latest reading book", HOW_TO_HELP["library"])
+        self.assertIn("/status reading", HOW_TO_HELP["library"])
+
+    async def test_help_command_with_event_topic_gets_event_help(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/help event")
+
+        await bot.handle_help(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [HOW_TO_HELP["event"]])
+        self.assertIn("Send one of these:", HOW_TO_HELP["event"])
+        self.assertIn("Add:", HOW_TO_HELP["event"])
+        self.assertIn("Move:", HOW_TO_HELP["event"])
+        self.assertIn("Cancel:", HOW_TO_HELP["event"])
+        self.assertIn("See:", HOW_TO_HELP["event"])
+        self.assertIn("Move dinner with Rahul", HOW_TO_HELP["event"])
+        self.assertIn("give me today's briefing", HOW_TO_HELP["event"])
+
+    async def test_help_command_with_task_topic_gets_task_help(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/help task")
+
+        await bot.handle_help(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [HOW_TO_HELP["task"]])
+        self.assertIn("Send one of these:", HOW_TO_HELP["task"])
+        self.assertIn("Add:", HOW_TO_HELP["task"])
+        self.assertIn("Done:", HOW_TO_HELP["task"])
+        self.assertIn("Delete:", HOW_TO_HELP["task"])
+        self.assertIn("See:", HOW_TO_HELP["task"])
+        self.assertIn("complete task call FUSD", HOW_TO_HELP["task"])
+        self.assertIn("show urgent tasks", HOW_TO_HELP["task"])
+
+    async def test_help_command_with_shop_topic_gets_shopping_help(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/help shop")
+
+        await bot.handle_help(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [HOW_TO_HELP["shopping"]])
+        self.assertIn("Send one of these:", HOW_TO_HELP["shopping"])
+        self.assertIn("Add:", HOW_TO_HELP["shopping"])
+        self.assertIn("Cross off:", HOW_TO_HELP["shopping"])
+        self.assertIn("Move:", HOW_TO_HELP["shopping"])
+        self.assertIn("See:", HOW_TO_HELP["shopping"])
+        self.assertIn("/shop move coconut milk", HOW_TO_HELP["shopping"])
+        self.assertIn("what's on my Whole Foods list?", HOW_TO_HELP["shopping"])
+
+    async def test_help_command_with_status_topic_gets_status_help(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/help status")
+
+        await bot.handle_help(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [HOW_TO_HELP["memory_status"]])
+
+    async def test_help_command_with_chat_topic_gets_advice_help(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/help chat")
+
+        await bot.handle_help(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [HOW_TO_HELP["n4os_advice"]])
 
     async def test_router_errors_are_reported_gracefully(self):
         bot = N4OSTelegramBot(
@@ -1157,6 +1743,39 @@ class TelegramConfigTest(unittest.TestCase):
 
         self.assertEqual(config.token, "token")
         self.assertEqual(config.allowed_user_id, 12345)
+
+    def test_load_config_reads_multiple_allowed_user_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text(
+                "TELEGRAM_BOT_TOKEN=token\nALLOWED_TELEGRAM_USER_IDS=12345,67890\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(env_path=env_path)
+
+        self.assertEqual(config.token, "token")
+        self.assertEqual(config.allowed_user_ids, frozenset({12345, 67890}))
+
+    def test_load_config_reads_sender_profiles(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text(
+                "TELEGRAM_BOT_TOKEN=token\n"
+                "ALLOWED_TELEGRAM_USER_IDS=12345,67890\n"
+                "TELEGRAM_USER_PROFILES=12345:Nimesh:dad,67890:Niyati:mom\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(env_path=env_path)
+
+        self.assertEqual(
+            config.sender_profiles,
+            (
+                TelegramSenderProfile(12345, "nimesh", "dad"),
+                TelegramSenderProfile(67890, "niyati", "mom"),
+            ),
+        )
 
     def test_load_config_reads_voice_transcribe_command(self):
         with tempfile.TemporaryDirectory() as tmpdir:

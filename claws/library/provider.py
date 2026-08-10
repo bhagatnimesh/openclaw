@@ -14,7 +14,7 @@ DEFAULT_DB_FILE = ROOT / "data" / "n4os.db"
 
 
 class SQLiteLibraryProvider:
-    """SQLite provider for Nysha's independent-reading events and family library bags."""
+    """SQLite provider for kids' reading events and family library bags."""
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_FILE):
         self.db_path = Path(db_path)
@@ -48,6 +48,8 @@ class SQLiteLibraryProvider:
                     pages INTEGER,
                     reaction TEXT,
                     status TEXT NOT NULL CHECK (status IN ('in_progress', 'completed', 'unknown')),
+                    reading_mode TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK (reading_mode IN ('independent', 'read_together', 'read_aloud', 'unknown')),
                     source TEXT NOT NULL CHECK (source IN ('telegram_text', 'telegram_voice', 'telegram_photo')),
                     photo_path TEXT,
                     raw_input TEXT NOT NULL,
@@ -55,6 +57,18 @@ class SQLiteLibraryProvider:
                 )
                 """,
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(library_reading_events)").fetchall()
+            }
+            if "reading_mode" not in columns:
+                connection.execute(
+                    """
+                    ALTER TABLE library_reading_events
+                    ADD COLUMN reading_mode TEXT NOT NULL DEFAULT 'unknown'
+                    CHECK (reading_mode IN ('independent', 'read_together', 'read_aloud', 'unknown'))
+                    """,
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_library_reading_events_date
@@ -91,6 +105,7 @@ class SQLiteLibraryProvider:
         pages: int | None,
         reaction: str | None,
         status: str,
+        reading_mode: str,
         source: str,
         photo_path: str | None,
         raw_input: str,
@@ -105,6 +120,7 @@ class SQLiteLibraryProvider:
             "pages": pages,
             "reaction": reaction,
             "status": status,
+            "reading_mode": reading_mode,
             "source": source,
             "photo_path": photo_path,
             "raw_input": raw_input,
@@ -122,6 +138,7 @@ class SQLiteLibraryProvider:
                     pages,
                     reaction,
                     status,
+                    reading_mode,
                     source,
                     photo_path,
                     raw_input,
@@ -136,6 +153,7 @@ class SQLiteLibraryProvider:
                     :pages,
                     :reaction,
                     :status,
+                    :reading_mode,
                     :source,
                     :photo_path,
                     :raw_input,
@@ -177,6 +195,81 @@ class SQLiteLibraryProvider:
         with self._connection() as connection:
             rows = connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def get_event(self, event_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM library_reading_events
+                WHERE id = :event_id
+                """,
+                {"event_id": event_id},
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def update_event(
+        self,
+        event_id: str,
+        *,
+        child: str | None = None,
+        date: str | Date | None = None,
+        book: str | None = None,
+        minutes: int | None = None,
+        pages: int | None = None,
+        reaction: str | None = None,
+        status: str | None = None,
+        reading_mode: str | None = None,
+        clear_minutes: bool = False,
+        clear_pages: bool = False,
+        clear_reaction: bool = False,
+    ) -> dict[str, Any] | None:
+        current = self.get_event(event_id)
+        if current is None:
+            return None
+
+        updated = {
+            **current,
+            "child": child or current["child"],
+            "date": date.isoformat() if isinstance(date, Date) else (date or current["date"]),
+            "book": book or current["book"],
+            "minutes": None if clear_minutes else (minutes if minutes is not None else current["minutes"]),
+            "pages": None if clear_pages else (pages if pages is not None else current["pages"]),
+            "reaction": None if clear_reaction else (reaction if reaction is not None else current["reaction"]),
+            "status": status or current["status"],
+            "reading_mode": reading_mode or current["reading_mode"],
+        }
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE library_reading_events
+                SET child = :child,
+                    date = :date,
+                    book = :book,
+                    minutes = :minutes,
+                    pages = :pages,
+                    reaction = :reaction,
+                    status = :status,
+                    reading_mode = :reading_mode
+                WHERE id = :id
+                """,
+                updated,
+            )
+        return updated
+
+    def delete_event(self, event_id: str) -> dict[str, Any] | None:
+        current = self.get_event(event_id)
+        if current is None:
+            return None
+        with self._connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM library_reading_events
+                WHERE id = :event_id
+                """,
+                {"event_id": event_id},
+            )
+        return current
 
     def add_visit(
         self,

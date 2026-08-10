@@ -55,6 +55,7 @@ PERSON_PATTERN = "|".join(
 ACTION_WORDS = (
     "take",
     "bring",
+    "give",
     "put",
     "keep",
     "carry",
@@ -76,6 +77,10 @@ WEEKDAYS = {
     "saturday": 5,
     "sunday": 6,
 }
+QUESTION_START_RE = re.compile(
+    r"^\s*(?:when|what|where|who|which|how)\b",
+    re.IGNORECASE,
+)
 
 
 def _default_now(now: datetime | None) -> datetime:
@@ -143,6 +148,12 @@ def _strip_date_words(text: str, date_anchor: str) -> str:
     if date_anchor:
         cleaned = re.sub(rf"\b{re.escape(date_anchor)}\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(today|tomorrow)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\b(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\bat\s+\d{1,2}(?::\d{2})?\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", cleaned)
     cleaned = re.sub(
         r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
@@ -150,6 +161,7 @@ def _strip_date_words(text: str, date_anchor: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(r"\b(?:for|on)\s*$", "", cleaned, flags=re.IGNORECASE)
     return _clean_spaces(cleaned)
 
 
@@ -159,6 +171,11 @@ def _infer_context(text: str) -> tuple[str, str | None]:
         return "before_leave", "leave_home"
     if re.search(r"\bairport|flight|passport|passports\b", lowered):
         return "airport", "airport"
+    if re.search(r"\b(home board|today at home|house board)\b", lowered) and re.search(
+        r"\b(take|bring|give|carry|pack|return)\b",
+        lowered,
+    ):
+        return "before_leave", "leave_home"
     if re.search(r"\bfridge|kitchen|food|lunch|dinner|snack\b", lowered):
         return "kitchen", None
     if re.search(r"\bschool|journal|form|permission slip|homework|library\b", lowered):
@@ -207,11 +224,19 @@ def _normalize_message(value: str) -> str:
 
 def _strip_add_item_prefix(text: str) -> str:
     cleaned = re.sub(
+        r"^\s*(?:please\s+)?(?:add|create|capture|remember)\s+to\s+"
+        r"(?:home\s+board|today\s+at\s+home|house\s+board)\s*(?:item|notice|reminder)?\s*(?:for|to|:)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
         r"^\s*(?:please\s+)?(?:(?:add|create|capture|remember)\s+)?"
+        r"(?:to\s+)?"
         r"(?:an?\s+)?(?:(?:home\s+board|today\s+at\s+home|house\s+board)\s+)?"
         r"(?:item|notice|reminder)\s*(?:for|to|:)?\s*",
         "",
-        text,
+        cleaned,
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(
@@ -300,8 +325,14 @@ def _extract_person_and_message(text: str) -> tuple[str, str]:
 
 def _looks_like_home_board_add(text: str) -> bool:
     lowered = text.lower()
+    if QUESTION_START_RE.search(text) and not re.search(
+        r"\b(home board|today at home|house board)\b",
+        lowered,
+    ):
+        return False
     return bool(
-        re.search(r"\bbefore\b", lowered)
+        re.search(r"\b(home board|today at home|house board)\b", lowered)
+        or re.search(r"\bbefore\b", lowered)
         or re.search(rf"\b(?:{PERSON_PATTERN})\b", lowered)
         or re.search(rf"\b({'|'.join(ACTION_WORDS)})\b", lowered)
     )
