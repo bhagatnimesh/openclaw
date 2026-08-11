@@ -11,6 +11,7 @@ links:
   - "[[goals/2026|2026 Goals]]"
   - "[[family/FamilyValues|Family Values]]"
   - "[[family/observations/2026-07|2026-07 Observations]]"
+  - "[[family/observations/2026-08|2026-08 Observations]]"
 ---
 
 # Nysha
@@ -18,6 +19,12 @@ links:
 ## 2026 Focus
 
 Help Nysha build love of [[Reading|reading]], logical reasoning, curiosity, emotional ability, [[Confidence|confidence]], and strong family connection.
+
+## Current Season
+
+- As of 2026-08-10, Nysha is starting second grade at Chadbourne Elementary.
+- After school: Learning Bee.
+- RSM classes have started.
 
 ## Love For Reading
 

@@ -86,6 +86,11 @@ LEADING_ACTION_RE = re.compile(
     r"^\s*(?:add|create|capture|schedule)\b\s*",
     re.IGNORECASE,
 )
+LEADING_TASK_CREATE_RE = re.compile(
+    r"^\s*(?:(?:add|create|capture|remember)\s+)?(?:an?\s+)?"
+    r"(?:task|todo|to-do|open loop)\b[:\s-]*",
+    re.IGNORECASE,
+)
 
 FUZZY_DATE_VOCABULARY = {
     "today",
@@ -190,7 +195,8 @@ def _normalize_slash_command(text: str) -> str:
     if command in ("task", "tasks", "todo", "todos"):
         if TASK_LIST_BODY_RE.search(body):
             return _normalize_task_list_body(body)
-        suffix = body_without_action or body
+        suffix = LEADING_TASK_CREATE_RE.sub("", body, count=1).strip()
+        suffix = suffix or body_without_action or body
         return f"add task {suffix}".strip()
     if command in ("decision", "decisions"):
         suffix = body or "list pending decisions"

@@ -1,4 +1,5 @@
 import unittest
+from intent import read_metadata_from_notes
 from tools import FamilyTaskTools
 
 
@@ -82,8 +83,9 @@ class FamilyTaskToolsTest(unittest.TestCase):
         created = provider.created[0]
         self.assertEqual(created["title"], "Call Rahul")
         self.assertEqual(created["due"], "2026-07-04")
-        self.assertEqual(created["notes"], "Call after school drop-off.")
-        self.assertNotIn("N4OS_METADATA", created["notes"])
+        human_notes, metadata = read_metadata_from_notes(created["notes"])
+        self.assertEqual(human_notes, "Call after school drop-off.")
+        self.assertEqual(metadata["owner"], "dad")
         task = response["data"]["task"]
         self.assertEqual(task["_n4os_metadata"]["context"], ["car", "phone"])
         self.assertEqual(task["_n4os_metadata"]["effort_type"], "communication")

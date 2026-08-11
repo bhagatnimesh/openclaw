@@ -347,6 +347,47 @@ def _bulk_image_task_caption(request: str) -> str:
     return split_request[0].strip() if split_request is not None else request
 
 
+MULTI_CREATE_TASK_RE = re.compile(
+    r"(?P<prefix>(?:^|[.!?]\s+)(?:and\s+)?)"
+    r"(?P<verb>add|create|capture|remember)\s+another\s+"
+    r"(?P<noun>task|todo|to-do|open loop)\b",
+    re.IGNORECASE,
+)
+
+
+def _split_multiple_create_task_requests(request: str) -> list[str]:
+    matches = list(MULTI_CREATE_TASK_RE.finditer(request))
+    if not matches:
+        return [request]
+
+    raw_parts: list[str] = []
+    start = 0
+    for match in matches:
+        first_part = request[start : match.start()].strip()
+        if first_part:
+            raw_parts.append(first_part)
+
+        prefix = match.group("prefix")
+        start = match.start() + len(prefix)
+
+    final_part = request[start:].strip()
+    if final_part:
+        raw_parts.append(final_part)
+
+    parts = [
+        re.sub(
+            r"^\s*(?:and\s+)?(add|create|capture|remember)\s+another\s+"
+            r"(task|todo|to-do|open loop)\b",
+            r"\1 \2",
+            part,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+        for part in raw_parts
+    ]
+    return parts if len(parts) > 1 else [request]
+
+
 def _bulk_image_fallback_tags(request: str) -> list[str]:
     split_request = _split_bulk_image_task_request(request)
     if split_request is None:
@@ -374,7 +415,8 @@ OWNER_TARGET_RE = re.compile(
     re.IGNORECASE,
 )
 OWNER_ONLY_RE = re.compile(
-    rf"\b(?:owner|owned\s+by|assign(?:ed)?\s+to|belongs\s+to|for)\s*"
+    rf"\b(?:owner(?:\s+of\s+(?:it|this|that|the\s+task))?|owned\s+by|"
+    rf"assign(?:ed)?\s+to|belongs\s+to|for)\s*"
     rf"(?:is|:|to|as)?\s*(?P<owner>{OWNER_ALIAS_PATTERN})\b",
     re.IGNORECASE,
 )
@@ -420,6 +462,11 @@ def _clean_task_target(value: str) -> str | None:
 
 
 def _owner_from_request(request: str) -> tuple[str | None, str | None]:
+    for pattern in (OWNER_ONLY_RE, OWNER_AS_RE):
+        match = pattern.search(request)
+        if match is not None:
+            return OWNER_ALIASES.get(match.group("owner").strip().lower(), "unknown"), None
+
     target_match = OWNER_TARGET_RE.search(request)
     if target_match is not None:
         owner = OWNER_ALIASES.get(target_match.group("owner").strip().lower(), "unknown")
@@ -428,10 +475,6 @@ def _owner_from_request(request: str) -> tuple[str | None, str | None]:
             return owner, None
         return owner, _clean_task_target(target_match.group("target"))
 
-    for pattern in (OWNER_ONLY_RE, OWNER_AS_RE):
-        match = pattern.search(request)
-        if match is not None:
-            return OWNER_ALIASES.get(match.group("owner").strip().lower(), "unknown"), None
     return None, None
 
 
@@ -573,6 +616,14 @@ class FamilyTasksClaw:
         reference_time: datetime | None = None,
         research_client: NoahResearchClient | None = None,
     ) -> str:
+        split_requests = _split_multiple_create_task_requests(request)
+        if len(split_requests) > 1:
+            return self._add_multiple_tasks_from_requests(
+                split_requests,
+                reference_time=reference_time,
+                research_client=research_client,
+            )
+
         bulk_titles = _bulk_image_task_titles(request)
         if bulk_titles:
             return self._add_bulk_tasks_from_image_request(
@@ -582,15 +633,31 @@ class FamilyTasksClaw:
             )
 
         intent = extract_intent(request, now=reference_time)
+        message, _ = self._add_task_from_intent(
+            intent,
+            reference_time=reference_time,
+            research_client=research_client,
+        )
+        return message
+
+    def _add_task_from_intent(
+        self,
+        intent: dict[str, Any],
+        reference_time: datetime | None = None,
+        research_client: NoahResearchClient | None = None,
+        print_message: bool = True,
+    ) -> tuple[str, dict[str, Any] | None]:
         missing = intent.get("missing_fields", [])
         if intent.get("intent") != "create_task":
             message = "That does not look like a task creation request."
-            print(message)
-            return message
+            if print_message:
+                print(message)
+            return message, None
         if missing:
             message = "Please provide: " + ", ".join(missing) + "."
-            print(message)
-            return message
+            if print_message:
+                print(message)
+            return message, None
 
         metadata = intent.get("metadata") or {}
         notes = _set_note_tags(intent.get("notes"), metadata.get("tags") or [])
@@ -602,8 +669,9 @@ class FamilyTasksClaw:
         )
         if response["status"] != "ok":
             message = response["message"]
-            print(message)
-            return message
+            if print_message:
+                print(message)
+            return message, None
 
         task = response.get("data", {}).get("task", {})
         self.last_created_task = dict(task) if task else None
@@ -630,6 +698,62 @@ class FamilyTasksClaw:
             )
             if assistant_acknowledgment:
                 message = f"{message}\n{assistant_acknowledgment}"
+        if print_message:
+            print(message)
+        return message, dict(task) if task else None
+
+    def _add_multiple_tasks_from_requests(
+        self,
+        requests: list[str],
+        reference_time: datetime | None = None,
+        research_client: NoahResearchClient | None = None,
+    ) -> str:
+        created_tasks: list[dict[str, Any]] = []
+        messages: list[str] = []
+        failed: list[str] = []
+        undo_start = len(self.undo_stack)
+
+        for request in requests:
+            intent = extract_intent(request, now=reference_time)
+            message, task = self._add_task_from_intent(
+                intent,
+                reference_time=reference_time,
+                research_client=research_client,
+                print_message=False,
+            )
+            if task is None:
+                failed.append(message)
+                continue
+            created_tasks.append(task)
+            messages.append(message)
+
+        if created_tasks:
+            del self.undo_stack[undo_start:]
+            undo_tasks = [task for task in created_tasks if task.get("id")]
+            if undo_tasks:
+                self.undo_stack.append(
+                    {
+                        "action": "delete_tasks",
+                        "tasks": undo_tasks,
+                        "task_list_id": DEFAULT_TASK_LIST_ID,
+                    },
+                )
+            self.last_created_task = dict(created_tasks[-1])
+
+        if not created_tasks:
+            message = "Could not create tasks:\n" + "\n".join(f"- {failure}" for failure in failed)
+            print(message)
+            return message
+
+        lines = [f"Created {len(created_tasks)} tasks:"]
+        lines.extend(f"- {task.get('title') or 'Untitled task'}" for task in created_tasks)
+        if failed:
+            lines.append("Some tasks failed:")
+            lines.extend(f"- {failure}" for failure in failed)
+        if any("\n" in message for message in messages):
+            lines.append("")
+            lines.extend(messages)
+        message = "\n".join(lines)
         print(message)
         return message
 

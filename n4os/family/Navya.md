@@ -6,10 +6,12 @@ tags:
 links:
   - "[[Reading]]"
   - "[[Confidence]]"
+  - "[[School Transition]]"
   - "[[playbooks/Parenting|Parenting]]"
   - "[[goals/2026|2026 Goals]]"
   - "[[family/FamilyValues|Family Values]]"
   - "[[family/observations/2026-07|2026-07 Observations]]"
+  - "[[family/observations/2026-08|2026-08 Observations]]"
 ---
 
 # Navya
@@ -17,6 +19,10 @@ links:
 ## Focus
 
 Help Navya grow with love, curiosity, resilience, [[Confidence|confidence]], emotional intelligence, strong values, and strong foundations.
+
+## Current Season
+
+- As of 2026-08-10, Navya is starting pre-kindergarten at Montessori Children House.
 
 ## What To Protect
 

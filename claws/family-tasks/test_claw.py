@@ -292,6 +292,28 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertEqual(metadata["effort_type"], "communication")
         self.assertEqual(metadata["requires"], ["phone"])
 
+    def test_add_task_from_voice_request_creates_multiple_tasks(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 8, 10, 19, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "Add a task to clean up the car games owner Nimesh. "
+                "This is over the weekend. Add another task to configure the "
+                "digital lock over the weekend on Saturday, owner Nimesh.",
+                reference_time=now,
+            )
+
+        self.assertIn("Created 2 tasks:", message)
+        self.assertEqual(
+            [task["title"] for task in provider.created],
+            ["Clean up the car games", "Configure the digital lock"],
+        )
+        for created in provider.created:
+            _, metadata = _task_notes_and_metadata(created)
+            self.assertEqual(metadata["owner"], "dad")
+
     def test_add_task_from_prose_details_uses_readable_title_notes_and_reply(self):
         provider = FakeProvider()
         claw = FamilyTasksClaw.from_provider(provider)
@@ -317,13 +339,13 @@ class FamilyTasksClawTest(unittest.TestCase):
         )
         created = provider.created[0]
         self.assertEqual(created["title"], "Visit Nysha's school")
+        human_notes, metadata = read_metadata_from_notes(created["notes"])
         self.assertEqual(
-            created["notes"],
+            human_notes,
             "Add driver, check on school supplies and things to get, "
             "other dogs and donuts for the first day.",
         )
         self.assertEqual(created["due"], "2026-08-10")
-        _, metadata = _task_notes_and_metadata(created)
         self.assertEqual(metadata["owner"], "dad")
 
     def test_add_task_from_refined_header_and_body(self):
@@ -367,8 +389,8 @@ class FamilyTasksClawTest(unittest.TestCase):
         )
         created = provider.created[0]
         self.assertEqual(created["title"], "Buy new water filter")
-        self.assertEqual(created["notes"], "Tags: #shopping #home")
-        self.assertNotIn("N4OS_METADATA", created["notes"])
+        human_notes, _ = read_metadata_from_notes(created["notes"])
+        self.assertEqual(human_notes, "Tags: #shopping #home")
         _, metadata = _task_notes_and_metadata(created)
         self.assertEqual(metadata["tags"], ["shopping", "home"])
 
@@ -405,7 +427,8 @@ class FamilyTasksClawTest(unittest.TestCase):
         )
         self.assertEqual([task["due"] for task in provider.created], ["2026-08-01"] * 3)
         for created in provider.created:
-            self.assertEqual(created["notes"], "Tags: #indiatrip")
+            human_notes, _ = read_metadata_from_notes(created["notes"])
+            self.assertEqual(human_notes, "Tags: #indiatrip")
             _, metadata = _task_notes_and_metadata(created)
             self.assertEqual(metadata["tags"], ["indiatrip"])
 
@@ -432,7 +455,8 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertEqual(message, "Created 2 tasks from the image.")
         self.assertEqual([task["due"] for task in provider.created], ["2026-08-01"] * 2)
         for created in provider.created:
-            self.assertEqual(created["notes"], "Tags: #indiatrip")
+            human_notes, _ = read_metadata_from_notes(created["notes"])
+            self.assertEqual(human_notes, "Tags: #indiatrip")
             _, metadata = _task_notes_and_metadata(created)
             self.assertEqual(metadata["tags"], ["indiatrip"])
 
@@ -454,9 +478,9 @@ class FamilyTasksClawTest(unittest.TestCase):
         )
         created = provider.created[0]
         self.assertEqual(created["title"], "Call home warranty about the solar panel")
-        self.assertIsNone(created["notes"])
+        human_notes, metadata = read_metadata_from_notes(created["notes"])
+        self.assertEqual(human_notes, "")
         self.assertEqual(created["due"], "2026-07-06")
-        _, metadata = _task_notes_and_metadata(created)
         self.assertEqual(metadata["owner"], "dad")
 
     def test_add_task_from_request_stores_ai_assistant_help(self):
@@ -864,6 +888,54 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertIn("tagged finance", message)
         self.assertNotIn("Buy water filter", message)
 
+    def test_recommend_tasks_from_request_filters_by_owner_phrase(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            _task(
+                "Pack bag for day 1",
+                {"owner": "nysha"},
+                due="2026-08-10T00:00:00.000Z",
+            ),
+            _task(
+                "Prepare Nysha's and Navya's bag for first day of school",
+                {"owner": "navya"},
+                due="2026-08-09T00:00:00.000Z",
+            ),
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 8, 10, 19, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.recommend_tasks_from_request(
+                "List tasks with owner Nysha",
+                reference_time=now,
+            )
+
+        self.assertIn("Pack bag for day 1", message)
+        self.assertIn("owned by nysha", message)
+        self.assertNotIn("Prepare Nysha's and Navya's bag", message)
+
+    def test_recommend_tasks_from_request_filters_by_owner_task_phrase(self):
+        provider = FakeProvider()
+        provider.tasks = [
+            _task("Pack bag for day 1", {"owner": "nysha"}),
+            _task(
+                "Prepare Nysha's and Navya's bag for first day of school",
+                {"owner": "navya"},
+            ),
+        ]
+        claw = FamilyTasksClaw.from_provider(provider)
+        now = datetime(2026, 8, 10, 19, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.recommend_tasks_from_request(
+                "list Nysha tasks",
+                reference_time=now,
+            )
+
+        self.assertIn("Pack bag for day 1", message)
+        self.assertNotIn("Prepare Nysha's and Navya's bag", message)
+
     def test_recommend_tasks_for_drive_filters_visible_drive_tag(self):
         provider = FakeProvider()
         provider.tasks = [
@@ -1075,6 +1147,20 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertIn("Updated task (owner=mom)", second)
         _, metadata = _task_notes_and_metadata(provider.updated[-1])
         self.assertEqual(metadata["owner"], "mom")
+
+    def test_update_task_owner_accepts_owner_of_task_wording_for_child(self):
+        provider = FakeProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.add_task_from_request("Add task pack bag for day 1")
+            message = claw.update_task_from_request(
+                "Change the owner of the task to Nysha",
+            )
+
+        self.assertIn("Updated task (owner=nysha)", message)
+        _, metadata = _task_notes_and_metadata(provider.updated[-1])
+        self.assertEqual(metadata["owner"], "nysha")
 
     def test_update_task_followup_appends_note_to_last_created_task(self):
         provider = FakeProvider()

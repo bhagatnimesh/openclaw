@@ -1309,6 +1309,17 @@ def build_dashboard_data(
     open_loops = open_loops[:8]
     pending_tasks = tasks[:24]
     task_tags = sorted({tag for task in pending_tasks for tag in task["tags"]})
+    task_owner_counts: dict[tuple[str, str], int] = {}
+    task_owner_today_counts: dict[tuple[str, str], int] = {}
+    for task in pending_tasks:
+        owner_key = (task["owner"], task["owner_label"])
+        task_owner_counts[owner_key] = task_owner_counts.get(owner_key, 0) + 1
+        if task["days_until_due"] == 0:
+            task_owner_today_counts[owner_key] = task_owner_today_counts.get(owner_key, 0) + 1
+    task_owners = sorted(
+        task_owner_counts,
+        key=lambda item: (item[0] == "unknown", item[1].lower()),
+    )
 
     warnings = [
         {"level": "warning", "title": conflict["title"], "detail": conflict["detail"]}
@@ -1384,6 +1395,15 @@ def build_dashboard_data(
             "due_soon": [_public_task(task) for task in due_soon_tasks],
             "pending": [_public_task(task) for task in pending_tasks],
             "tags": task_tags,
+            "owners": [
+                {
+                    "owner": owner,
+                    "label": label,
+                    "count": task_owner_counts[(owner, label)],
+                    "today_count": task_owner_today_counts.get((owner, label), 0),
+                }
+                for owner, label in task_owners
+            ],
             "recommended": [
                 {
                     "task": _public_task(recommendation["task"]),

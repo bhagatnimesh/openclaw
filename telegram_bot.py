@@ -555,6 +555,11 @@ def _capture_source(profile: TelegramSenderProfile | None) -> str:
 
 def _telegram_how_to_reply(text: str) -> str | None:
     lowered = text.lower().strip()
+    if re.match(
+        r"^/(?:task|tasks|todo|todos)(?:@[a-z0-9_]+)?(?:\s+|:\s*)\S",
+        lowered,
+    ):
+        return None
     if not any(cue in lowered for cue in ("how do i", "how to", "can i", "what command", "commands", "help")):
         return None
 

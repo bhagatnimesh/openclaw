@@ -178,6 +178,13 @@ def _matches_metadata_value(
     return str(metadata.get(field) or "unknown") == expected
 
 
+def _matches_owner(metadata: dict[str, Any], expected_owner: str | None) -> bool:
+    if expected_owner is None:
+        return True
+
+    return str(metadata.get("owner") or "unknown") == expected_owner
+
+
 def _task_requirements(metadata: dict[str, Any]) -> set[str]:
     return {str(value).lower() for value in metadata.get("requires") or [] if value}
 
@@ -263,6 +270,7 @@ def task_matches_filters(
             "effort_type",
             filters.get("effort_type"),
         )
+        and _matches_owner(metadata, filters.get("owner"))
         and _matches_can_do_while(metadata, filters.get("can_do_while"))
         and _matches_location(metadata, filters.get("location"))
         and _matches_required_resources(
@@ -295,6 +303,9 @@ def _task_match_score(task: dict[str, Any], filters: dict[str, Any]) -> int:
         expected = filters.get(field)
         if expected is not None and metadata.get(field) == expected:
             score += 3
+
+    if filters.get("owner") is not None and metadata.get("owner") == filters.get("owner"):
+        score += 3
 
     available_minutes = filters.get("duration_minutes")
     duration = metadata.get("duration_minutes")
@@ -370,6 +381,10 @@ def _task_fit_reasons(task: dict[str, Any], filters: dict[str, Any]) -> list[str
     task_location = metadata.get("location")
     if location is not None and task_location in (location, "anywhere"):
         reasons.append(f"works at {location}")
+
+    owner = filters.get("owner")
+    if owner is not None and metadata.get("owner") == owner:
+        reasons.append(f"owned by {owner}")
 
     available = set(filters.get("available_resources") or [])
     resource_matches = available & _task_requirements(metadata)

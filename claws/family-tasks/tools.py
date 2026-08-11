@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal, Protocol, TypedDict
 
 from constants import DEFAULT_TASK_LIST_ID
-from intent import normalize_metadata, write_human_notes
+from intent import normalize_metadata, write_human_notes, write_metadata_to_notes
 from matcher import recommend_task_matches
 
 
@@ -75,6 +75,19 @@ def _missing_response(fields: list[str]) -> ToolResponse:
     }
 
 
+def _has_meaningful_metadata(metadata: dict[str, Any] | None) -> bool:
+    if metadata is None:
+        return False
+    normalized = normalize_metadata(metadata)
+    return bool(
+        normalized.get("owner") != "unknown"
+        or normalized.get("assistant_help_needed")
+        or normalized.get("assistant_help_request")
+        or normalized.get("assistant_context")
+        or normalized.get("assistant_help_status")
+    )
+
+
 def _confirmation_response(action: str, task_id: str) -> ToolResponse:
     return {
         "status": "needs_confirmation",
@@ -131,9 +144,15 @@ class FamilyTaskTools:
             return _missing_response(["title"])
 
         try:
+            has_metadata = _has_meaningful_metadata(metadata)
+            task_notes = (
+                write_metadata_to_notes(notes, metadata)
+                if has_metadata
+                else write_human_notes(notes)
+            )
             task = self.provider.create_task(
                 title=cleaned_title,
-                notes=write_human_notes(notes),
+                notes=task_notes,
                 due=_clean_optional(due),
                 task_list_id=task_list_id,
             )
@@ -193,10 +212,18 @@ class FamilyTaskTools:
             return _missing_response(["title, notes, due, status, or metadata"])
 
         try:
+            has_metadata = _has_meaningful_metadata(metadata)
+            task_notes = (
+                write_metadata_to_notes(notes, metadata)
+                if has_metadata
+                else write_human_notes(notes)
+                if has_notes_update
+                else None
+            )
             task = self.provider.update_task(
                 task_id=cleaned_task_id,
                 title=_clean_optional(title),
-                notes=write_human_notes(notes) if has_notes_update else None,
+                notes=task_notes,
                 due=_clean_optional(due),
                 status=cleaned_status,
                 task_list_id=task_list_id,

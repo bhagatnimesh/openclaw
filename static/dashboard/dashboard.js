@@ -36,6 +36,14 @@
       .replace(/'/g, "&#039;");
   }
 
+  function titleLabel(value) {
+    return text(value)
+      .replace(/[-_]+/g, " ")
+      .replace(/\b\w/g, function (match) {
+        return match.toUpperCase();
+      });
+  }
+
   function setText(id, value) {
     var node = byId(id);
     if (node) {
@@ -83,6 +91,7 @@
       if (
         target.getAttribute("data-task-complete") !== null ||
         target.getAttribute("data-task-tag-filter") !== null ||
+        target.getAttribute("data-task-owner-chip") !== null ||
         target.getAttribute("data-reading-child") !== null ||
         target.getAttribute("data-reading-heatmap-day") !== null ||
         target.getAttribute("data-reading-update") !== null ||
@@ -143,6 +152,20 @@
     return normalizeTag(getQueryParam("tag"));
   }
 
+  function normalizeTaskOwner(value) {
+    return text(value).trim().toLowerCase() || "unknown";
+  }
+
+  function selectedTaskOwner() {
+    var value = getQueryParam("owner");
+    if (value === null) return "all";
+    return normalizeTaskOwner(value);
+  }
+
+  function selectedTaskDueFilter() {
+    return text(getQueryParam("due")).trim().toLowerCase() === "today" ? "today" : "";
+  }
+
   function setSelectedTaskTag(tag) {
     var selected = normalizeTag(tag);
     var url = new URL(window.location.href);
@@ -153,6 +176,48 @@
       url.searchParams.delete("tag");
     }
     window.history.replaceState({}, "", url.toString());
+  }
+
+  function setSelectedTaskOwner(owner) {
+    var selected = normalizeTaskOwner(owner);
+    var url = new URL(window.location.href);
+    if (selected && selected !== "all") {
+      url.searchParams.set("owner", selected);
+      url.hash = "#tasks";
+    } else {
+      url.searchParams.delete("owner");
+    }
+    window.history.replaceState({}, "", url.toString());
+  }
+
+  function setSelectedTaskDueFilter(filter) {
+    var selected = text(filter).trim().toLowerCase();
+    var url = new URL(window.location.href);
+    if (selected === "today") {
+      url.searchParams.set("due", "today");
+      url.hash = "#tasks";
+    } else {
+      url.searchParams.delete("due");
+    }
+    window.history.replaceState({}, "", url.toString());
+  }
+
+  function taskOwnerHref(owner, dueFilter) {
+    var selected = normalizeTaskOwner(owner);
+    var url = new URL(window.location.href);
+    url.searchParams.delete("tag");
+    if (selected && selected !== "all") {
+      url.searchParams.set("owner", selected);
+    } else {
+      url.searchParams.delete("owner");
+    }
+    if (dueFilter === "today") {
+      url.searchParams.set("due", "today");
+    } else {
+      url.searchParams.delete("due");
+    }
+    url.hash = "#tasks";
+    return url.pathname + url.search + url.hash;
   }
 
   function parseClockMinutes(value) {
@@ -968,6 +1033,64 @@
       "family",
       "family",
     );
+    renderTaskOwnerChips((data.tasks || {}).owners || []);
+  }
+
+  function renderTaskOwnerChips(owners) {
+    var node = byId("task-owner-chips");
+    if (!node) return;
+    var byOwner = {};
+    (owners || []).forEach(function (entry) {
+      byOwner[normalizeTaskOwner(entry.owner)] = {
+        owner: normalizeTaskOwner(entry.owner),
+        label: text(entry.label) || titleLabel(entry.owner),
+        count: Number(entry.count || 0),
+        todayCount: Number(entry.today_count || 0),
+      };
+    });
+    ["nysha", "navya"].forEach(function (owner) {
+      if (!byOwner[owner]) {
+        byOwner[owner] = { owner: owner, label: titleLabel(owner), count: 0, todayCount: 0 };
+      }
+    });
+    var visibleOwners = ["nysha", "navya"]
+      .map(function (owner) {
+        return byOwner[owner];
+      })
+      .concat(
+        Object.keys(byOwner)
+          .filter(function (owner) {
+            return owner !== "nysha" && owner !== "navya" && byOwner[owner].todayCount > 0;
+          })
+          .sort(function (left, right) {
+            return byOwner[left].label.localeCompare(byOwner[right].label);
+          })
+          .map(function (owner) {
+            return byOwner[owner];
+          }),
+      );
+    node.innerHTML = visibleOwners
+      .map(function (entry) {
+        var owner = normalizeTaskOwner(entry.owner);
+        var label = text(entry.label) || (owner === "unknown" ? "Unassigned" : titleLabel(owner));
+        var count = Number(entry.todayCount || 0);
+        return (
+          '<a class="task-owner-chip ' +
+          (owner === "unknown" ? "is-unassigned" : "") +
+          (count === 0 ? " is-empty" : "") +
+          '" href="' +
+          escapeHtml(taskOwnerHref(owner, "today")) +
+          '" data-task-owner-chip="' +
+          escapeHtml(owner) +
+          '"><strong>' +
+          escapeHtml(String(count)) +
+          "</strong><span>" +
+          escapeHtml(label) +
+          " today" +
+          "</span></a>"
+        );
+      })
+      .join("");
   }
 
   function renderPrep(events) {
@@ -1036,6 +1159,60 @@
     return tasks.filter(function (task) {
       return taskMatchesTag(task, tag);
     });
+  }
+
+  function taskMatchesOwner(task, owner) {
+    return !owner || owner === "all" || normalizeTaskOwner(task.owner) === owner;
+  }
+
+  function taskMatchesDueFilter(task, dueFilter) {
+    if (dueFilter !== "today") return true;
+    return Number(task.days_until_due) === 0;
+  }
+
+  function filterTasks(tasks, tag, owner, dueFilter) {
+    tasks = tasks || [];
+    return tasks.filter(function (task) {
+      return (
+        taskMatchesTag(task, tag) &&
+        taskMatchesOwner(task, owner) &&
+        taskMatchesDueFilter(task, dueFilter)
+      );
+    });
+  }
+
+  function renderTaskOwnerFilter(owners, selectedOwner) {
+    var node = byId("task-owner-filter");
+    if (!node) return;
+    selectedOwner = selectedOwner || "all";
+    var options = [{ owner: "all", label: "All owners" }];
+    var seen = { all: true };
+    (owners || []).forEach(function (entry) {
+      var owner = normalizeTaskOwner(entry.owner);
+      if (seen[owner]) return;
+      seen[owner] = true;
+      options.push({
+        owner: owner,
+        label: text(entry.label) || (owner === "unknown" ? "Unassigned" : titleLabel(owner)),
+      });
+    });
+    if (selectedOwner !== "all" && !seen[selectedOwner]) {
+      options.push({ owner: selectedOwner, label: titleLabel(selectedOwner) });
+    }
+    node.innerHTML = options
+      .map(function (entry) {
+        return (
+          '<option value="' +
+          escapeHtml(entry.owner) +
+          '"' +
+          (entry.owner === selectedOwner ? " selected" : "") +
+          ">" +
+          escapeHtml(entry.label) +
+          "</option>"
+        );
+      })
+      .join("");
+    node.hidden = options.length <= 1 && selectedOwner === "all";
   }
 
   function renderTaskTagFilters(tags, selectedTag, taskCount) {
@@ -1119,6 +1296,53 @@
     if (!node) return;
     node.textContent = text(message);
     node.dataset.state = state || "";
+  }
+
+  function celebrationOwnerName(ownerLabel) {
+    var owner = text(ownerLabel).trim();
+    return owner && owner !== "Unassigned" ? owner : "Team";
+  }
+
+  function speakTaskCelebration(ownerLabel) {
+    if (!("speechSynthesis" in window) || typeof window.SpeechSynthesisUtterance !== "function") {
+      return;
+    }
+    var owner = celebrationOwnerName(ownerLabel);
+    var utterance = new window.SpeechSynthesisUtterance("Nice work, " + owner + ". Task complete.");
+    utterance.rate = 1.02;
+    utterance.pitch = 1.08;
+    utterance.volume = 0.75;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function showTaskCelebration(taskTitle, ownerLabel) {
+    var layer = byId("task-celebration");
+    if (!layer) return;
+    var titleNode = byId("task-celebration-title");
+    var ownerNode = byId("task-celebration-owner");
+    var burstsNode = byId("task-celebration-bursts");
+    var owner = celebrationOwnerName(ownerLabel);
+    if (ownerNode) ownerNode.textContent = owner + " finished a task";
+    if (titleNode) titleNode.textContent = text(taskTitle, "Nice work.");
+    if (burstsNode) {
+      burstsNode.innerHTML = Array.from({ length: 22 })
+        .map(function (_, index) {
+          return '<span style="--i:' + index + '"></span>';
+        })
+        .join("");
+    }
+    layer.hidden = false;
+    layer.classList.remove("is-active");
+    window.requestAnimationFrame(function () {
+      layer.classList.add("is-active");
+    });
+    window.clearTimeout(layer._hideTimer);
+    layer._hideTimer = window.setTimeout(function () {
+      layer.classList.remove("is-active");
+      layer.hidden = true;
+    }, 2600);
+    speakTaskCelebration(ownerLabel);
   }
 
   function setDecisionActionStatus(message, state) {
@@ -1316,6 +1540,10 @@
     return (
       '<button class="task-complete-button" type="button" data-task-complete="' +
       escapeHtml(task.id) +
+      '" data-task-title="' +
+      escapeHtml(task.title || "Task") +
+      '" data-task-owner-label="' +
+      escapeHtml(task.owner_label || "") +
       '" aria-label="Complete ' +
       escapeHtml(task.title) +
       '">Complete</button>'
@@ -1344,6 +1572,10 @@
       }
       if (request.status >= 200 && request.status < 300 && payload.status === "ok") {
         setTaskActionStatus("Task completed.", "ok");
+        showTaskCelebration(
+          button ? button.getAttribute("data-task-title") : "",
+          button ? button.getAttribute("data-task-owner-label") : "",
+        );
         loadDashboard();
         return;
       }
@@ -1592,7 +1824,7 @@
       .join("");
   }
 
-  function renderPendingTasks(tasks, allTaskCount) {
+  function renderPendingTasks(tasks, allTaskCount, dueFilter) {
     var node = byId("pending-task-items");
     tasks = tasks || [];
     allTaskCount = allTaskCount === undefined ? tasks.length : allTaskCount;
@@ -1622,7 +1854,11 @@
     setCardHidden("task-triage", dueCount + unassignedCount + unscheduledCount === 0);
     if (!node) return;
     if (!tasks.length) {
-      node.innerHTML = empty("No pending tasks match this tag.");
+      node.innerHTML = empty(
+        dueFilter === "today"
+          ? "No tasks due today match these filters."
+          : "No pending tasks match these filters.",
+      );
       return;
     }
     node.innerHTML = tasks
@@ -2113,9 +2349,25 @@
     tasks = tasks || {};
     var pendingTasks = tasks.pending || [];
     var selectedTag = selectedTaskTag();
-    var filteredTasks = filterTasksByTag(pendingTasks, selectedTag);
-    renderTaskTagFilters(tasks.tags || [], selectedTag, filteredTasks.length);
-    renderPendingTasks(filteredTasks, pendingTasks.length);
+    var selectedOwner = selectedTaskOwner();
+    var selectedDue = selectedTaskDueFilter();
+    var ownerFilteredTasks = pendingTasks.filter(function (task) {
+      return taskMatchesOwner(task, selectedOwner) && taskMatchesDueFilter(task, selectedDue);
+    });
+    var availableTags = tasks.tags || [];
+    if (selectedOwner !== "all" || selectedDue) {
+      availableTags = Array.from(
+        new Set(
+          ownerFilteredTasks.reduce(function (tags, task) {
+            return tags.concat(task.tags || []);
+          }, []),
+        ),
+      ).sort();
+    }
+    var filteredTasks = filterTasks(pendingTasks, selectedTag, selectedOwner, selectedDue);
+    renderTaskOwnerFilter(tasks.owners || [], selectedOwner);
+    renderTaskTagFilters(availableTags, selectedTag, filteredTasks.length);
+    renderPendingTasks(filteredTasks, pendingTasks.length, selectedDue);
     renderTaskGroups(tasks.groups || [], selectedTag);
   }
 
@@ -2147,6 +2399,16 @@
     }
     if (target.getAttribute("data-task-tag-filter") !== null) {
       setSelectedTaskTag(target.getAttribute("data-task-tag-filter"));
+      renderTasks(lastTasksData);
+      updateActiveNav();
+      scrollToHashSection();
+      return;
+    }
+    if (target.getAttribute("data-task-owner-chip") !== null) {
+      event.preventDefault();
+      setSelectedTaskTag("");
+      setSelectedTaskOwner(target.getAttribute("data-task-owner-chip"));
+      setSelectedTaskDueFilter("today");
       renderTasks(lastTasksData);
       updateActiveNav();
       scrollToHashSection();
@@ -2208,6 +2470,16 @@
         renderBacklog(lastBacklogData);
       });
   });
+  var taskOwnerFilter = byId("task-owner-filter");
+  if (taskOwnerFilter) {
+    taskOwnerFilter.addEventListener("change", function () {
+      setSelectedTaskOwner(taskOwnerFilter.value);
+      setSelectedTaskDueFilter("");
+      renderTasks(lastTasksData);
+      updateActiveNav();
+      scrollToHashSection();
+    });
+  }
   var backlogDialog = byId("backlog-add-dialog");
   var backlogAddButton = byId("backlog-add-button");
   var backlogForm = byId("backlog-add-form");

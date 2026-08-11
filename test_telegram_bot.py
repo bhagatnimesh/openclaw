@@ -409,6 +409,28 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claw.requests, ["Add task buy milk"])
         self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
 
+    async def test_task_command_with_assistant_help_routes_to_n4os(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        text = (
+            "/task add task research next 3 places for weekend trips to take "
+            "the kids. Need Noah assistant help to find suggestions."
+        )
+        message = FakeMessage(text)
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        normalized = (
+            "add task research next 3 places for weekend trips to take the kids. "
+            "Need Noah assistant help to find suggestions."
+        )
+        self.assertEqual(claw.requests, [normalized])
+        self.assertEqual(message.replies, [f"router replied to: {normalized}"])
+
     async def test_authorized_cart_command_routes_to_shopping(self):
         shopping = FakeShoppingRouteClaw()
         claw = N4OSClaw(shopping_claw=shopping)

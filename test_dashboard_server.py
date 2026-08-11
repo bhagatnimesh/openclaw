@@ -496,6 +496,37 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(tasks_by_title["File receipt"], ["finance", "home"])
         self.assertEqual(tasks_by_title["Clean garage shelf"], [])
 
+    def test_dashboard_tasks_expose_owners_for_filtering(self):
+        data = build_dashboard_data(
+            sources(
+                tasks=[
+                    task(
+                        "Pack school bag",
+                        due="2026-07-03T00:00:00.000Z",
+                        metadata={"owner": "nysha"},
+                    ),
+                    task("File receipt", due="2026-07-04T00:00:00.000Z", metadata={"owner": "dad"}),
+                    task("Clean garage shelf"),
+                ],
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(
+            data["tasks"]["owners"],
+            [
+                {"owner": "dad", "label": "Dad", "count": 1, "today_count": 0},
+                {"owner": "nysha", "label": "Nysha", "count": 1, "today_count": 1},
+                {"owner": "unknown", "label": "Unassigned", "count": 1, "today_count": 0},
+            ],
+        )
+        owners_by_title = {
+            task_data["title"]: task_data["owner"]
+            for task_data in data["tasks"]["pending"]
+        }
+        self.assertEqual(owners_by_title["Pack school bag"], "nysha")
+        self.assertEqual(owners_by_title["Clean garage shelf"], "unknown")
+
     def test_dashboard_tasks_expose_visible_note_tags(self):
         data = build_dashboard_data(
             sources(

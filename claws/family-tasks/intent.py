@@ -68,7 +68,7 @@ VALID_LOCATIONS = {
     "specific",
     "unknown",
 }
-VALID_OWNERS = {"dad", "mom", "both", "grandmom", "unknown"}
+VALID_OWNERS = {"dad", "mom", "both", "grandmom", "nysha", "navya", "unknown"}
 OWNER_ALIASES = {
     "dad": "dad",
     "father": "dad",
@@ -89,11 +89,27 @@ OWNER_ALIASES = {
     "grandmom": "grandmom",
     "dadi": "grandmom",
     "tarla": "grandmom",
+    "nysha": "nysha",
+    "navya": "navya",
     "unknown": "unknown",
 }
 OWNER_ALIAS_PATTERN = "|".join(
     re.escape(value)
     for value in sorted(OWNER_ALIASES, key=len, reverse=True)
+)
+OWNER_FILTER_RE = re.compile(
+    rf"\b(?:with\s+)?owner\s*(?:(?:is|=)\s*|:\s*|\s+)"
+    rf"(?P<owner>{OWNER_ALIAS_PATTERN})\b|"
+    rf"\b(?:owned\s+by|assigned\s+to)\s+"
+    rf"(?P<assigned_owner>{OWNER_ALIAS_PATTERN})\b",
+    re.IGNORECASE,
+)
+OWNER_TASK_LIST_RE = re.compile(
+    rf"\b(?P<owner_task>{OWNER_ALIAS_PATTERN})\s+"
+    r"(?:tasks?|todos?|to-dos?|open loops?)\b|"
+    r"\b(?:tasks?|todos?|to-dos?|open loops?)\s+for\s+"
+    rf"(?P<for_owner>{OWNER_ALIAS_PATTERN})\b",
+    re.IGNORECASE,
 )
 LEGACY_MODE_TO_EFFORT_TYPE = {
     "call": "communication",
@@ -284,7 +300,8 @@ CREATE_TASK_START_RE = re.compile(
     re.IGNORECASE,
 )
 CREATE_TASK_REQUEST_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
+    r"^\s*(?:(?:/tasks?|tasks?)\s+)?(?:please\s+)?"
+    r"(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
     r"(?:add|create|capture|remember)\s+(?:an?\s+)?"
     r"(?:task|todo|to-do|open loop)\b",
     re.IGNORECASE,
@@ -533,6 +550,7 @@ def _extract_task_detail_notes(user_text: str) -> tuple[str, str | None]:
         notes,
         flags=re.IGNORECASE,
     ).strip()
+    notes = TASK_OWNER_ANNOTATION_RE.sub("", notes).strip()
     if notes:
         notes = notes[:1].upper() + notes[1:]
     return title_text, notes or None
@@ -721,6 +739,35 @@ def _extract_tag_filter_text(user_text: str) -> tuple[list[str], str]:
 
     semantic_text = LIST_FOR_TAG_RE.sub(strip_list_for_tag, semantic_text)
     return normalize_tags(tags), semantic_text
+
+
+def _extract_owner_filter_text(user_text: str) -> tuple[str | None, str]:
+    owner: str | None = None
+
+    def keep_first_owner(candidate: str) -> str:
+        nonlocal owner
+        normalized = _owner_from_alias(candidate)
+        if normalized != "unknown" and owner is None:
+            owner = normalized
+            return " "
+        return ""
+
+    def strip_clause(match: re.Match[str]) -> str:
+        candidate = match.group("owner") or match.group("assigned_owner") or ""
+        if keep_first_owner(candidate):
+            return " "
+        return match.group(0)
+
+    semantic_text = OWNER_FILTER_RE.sub(strip_clause, user_text)
+
+    def strip_task_list_clause(match: re.Match[str]) -> str:
+        candidate = match.group("owner_task") or match.group("for_owner") or ""
+        if keep_first_owner(candidate):
+            return " tasks "
+        return match.group(0)
+
+    semantic_text = OWNER_TASK_LIST_RE.sub(strip_task_list_clause, semantic_text)
+    return owner, semantic_text
 
 
 def _clean_level(value: Any) -> str:
@@ -1107,6 +1154,10 @@ def _infer_owner(user_text: str) -> str:
         return "grandmom"
     if re.search(r"\b(?:both|we|us|parents)\s+(?:will|can|should|need to|have to)\b", lowered):
         return "both"
+    if re.search(r"\bnysha\s+(?:will|can|should|need to|has to|have to)\b", lowered):
+        return "nysha"
+    if re.search(r"\bnavya\s+(?:will|can|should|need to|has to|have to)\b", lowered):
+        return "navya"
     return "unknown"
 
 
@@ -1226,7 +1277,7 @@ def _infer_metadata(
 
 def _strip_create_words(user_text: str) -> str:
     cleaned = re.sub(
-        r"^\s*(?:please\s+)?(?:"
+        r"^\s*(?:(?:/tasks?|tasks?)\s+)?(?:please\s+)?(?:"
         r"(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
         r"(?:add|create|capture|remember)\s+(?:an?\s+)?"
         r"(?:(?:task|todo|to-do|open loop)\b[:\s-]*)?(?:to\s+)?"
@@ -1262,6 +1313,15 @@ def _strip_task_annotations(title: str) -> str:
     cleaned = TASK_OWNER_ANNOTATION_RE.sub("", cleaned)
     cleaned = TASK_OWNER_NOTE_RE.sub("", cleaned)
     cleaned = DUE_DATE_ANNOTATION_RE.sub("", cleaned)
+    cleaned = re.sub(
+        r"^\s*(?:for|on|due)\s+"
+        r"(?:today|tomorrow|tonight|this\s+weekend|weekend)"
+        r"(?:\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))?"
+        r"\s*[,.:-]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(
         r"^\s*(?:for|on|due)\s+"
         r"(?:(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
@@ -1309,6 +1369,7 @@ def _strip_task_annotations(title: str) -> str:
     )
     cleaned = re.sub(r"\s*,\s*(?:needs?|requires?).*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:this\s+weekend|today|tomorrow|tonight)\b.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:this\s+is\s+)?over\s+the\s+weekend\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(
         r"\b(?:due\s+|on\s+|for\s+)?"
         r"(?:(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
@@ -1352,6 +1413,8 @@ def _extract_create_intent(
     metadata_text = task_text or user_text
     intent_text, detail_notes = _extract_task_detail_notes(metadata_text)
     due, _ = _extract_due_date(intent_text, reference)
+    if due is None and intent_text != metadata_text:
+        due, _ = _extract_due_date(metadata_text, reference)
     title = _title_from_request(intent_text)
     missing_fields = []
     if title is None:
@@ -1383,6 +1446,7 @@ def _extract_recommendation_filters(
     reference: datetime,
 ) -> dict[str, Any]:
     tags, semantic_text = _extract_tag_filter_text(user_text)
+    owner, semantic_text = _extract_owner_filter_text(semantic_text)
     semantic_text = HASHTAG_RE.sub("", semantic_text)
     lowered = semantic_text.lower()
     contexts, can_do_while, requirements, location = _extract_contexts(semantic_text)
@@ -1398,6 +1462,8 @@ def _extract_recommendation_filters(
         filters["available_resources"] = requirements
     if location != "unknown":
         filters["location"] = location
+    if owner is not None:
+        filters["owner"] = owner
 
     energy = _extract_level(semantic_text, "energy")
     if energy is not None:

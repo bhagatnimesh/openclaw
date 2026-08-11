@@ -46,6 +46,10 @@
                 <span id="summary-family"><strong>0</strong> family</span>
               </div>
             </div>
+            <div class="kid-task-strip" aria-label="Pending tasks by owner">
+              <span>Today</span>
+              <div id="task-owner-chips" class="task-owner-chips"></div>
+            </div>
           </section>
         </header>
 
@@ -159,7 +163,12 @@
                 <h3>Pending Queue</h3>
                 <span id="pending-task-count">0 pending</span>
               </div>
-              <div id="task-tag-filters" class="task-tag-filters" aria-label="Filter tasks by tag"></div>
+              <div class="task-filter-row" aria-label="Task filters">
+                <select id="task-owner-filter" aria-label="Filter tasks by owner">
+                  <option value="all">All owners</option>
+                </select>
+                <div id="task-tag-filters" class="task-tag-filters" aria-label="Filter tasks by tag"></div>
+              </div>
               <p id="task-action-status" class="task-action-status" aria-live="polite"></p>
               <div id="pending-task-items" class="pending-task-list"></div>
             </article>
@@ -397,6 +406,14 @@
         <div class="dialog-actions"><button class="secondary-action" id="backlog-dialog-cancel" type="button">Cancel</button><button class="primary-action" type="submit">Add item</button></div>
       </form>
     </dialog>
+
+    <div id="task-celebration" class="task-celebration" aria-live="polite" hidden>
+      <div id="task-celebration-bursts" class="task-celebration-bursts" aria-hidden="true"></div>
+      <div class="task-celebration-card">
+        <p id="task-celebration-owner" class="eyebrow">Task complete</p>
+        <strong id="task-celebration-title">Nice work.</strong>
+      </div>
+    </div>
 
     <script src="/static/dashboard/dashboard.js?v={{ASSET_VERSION}}"></script>
   </body>

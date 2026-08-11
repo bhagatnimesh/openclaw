@@ -1537,6 +1537,18 @@ class IntentRouterTest(unittest.TestCase):
             "view tasks all with tag indiatrip",
         )
 
+    def test_input_improvement_normalizes_task_create_slash_command(self):
+        self.assertEqual(
+            improve_entered_text(
+                "/task add task research weekend trips. Need Noah assistant help."
+            ),
+            "add task research weekend trips. Need Noah assistant help.",
+        )
+        self.assertEqual(
+            improve_entered_text("/task research weekend trips"),
+            "add task research weekend trips",
+        )
+
     def test_input_improvement_normalizes_decisions_slash_command(self):
         self.assertEqual(
             improve_entered_text("/decisions give list of pending decisions"),

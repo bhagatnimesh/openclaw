@@ -132,6 +132,46 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["metadata"]["owner"], "dad")
         self.assertEqual(intent["missing_fields"], [])
 
+    def test_slash_task_labeled_request_preserves_due_title_notes_and_child_owner(self):
+        now = datetime(2026, 8, 10, 10, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "/task create task for today 2 PM. Title: Pack bag for day 1. "
+            "Details: Paper, pencil, eraser, crayons, color pens, spare clothes, "
+            "paper napkin Owner: Nysha",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Pack bag for day 1")
+        self.assertEqual(intent["due"], "2026-08-10")
+        self.assertEqual(
+            intent["notes"],
+            "Paper, pencil, eraser, crayons, color pens, spare clothes, paper napkin",
+        )
+        self.assertEqual(intent["metadata"]["owner"], "nysha")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_slash_task_inline_request_creates_task_with_child_owner(self):
+        now = datetime(2026, 8, 10, 10, 17, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "/task create task Pack bag for day 1. Paper, pencil, eraser, "
+            "crayons, color pens, spare clothes, paper napkin, Today 2 pm "
+            "Owner: Nysha",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(
+            intent["title"],
+            "Pack bag for day 1. Paper, pencil, eraser, crayons, color pens, "
+            "spare clothes, paper napkin",
+        )
+        self.assertEqual(intent["due"], "2026-08-10")
+        self.assertEqual(intent["metadata"]["owner"], "nysha")
+        self.assertEqual(intent["missing_fields"], [])
+
     def test_below_email_followup_creates_readable_title_and_notes(self):
         now = datetime(2026, 7, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
