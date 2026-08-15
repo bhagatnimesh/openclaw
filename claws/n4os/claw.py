@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from contextlib import redirect_stdout
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta
+from io import StringIO
 import os
 import re
 import sys
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 try:
@@ -28,6 +30,15 @@ try:
     )
     from .input_normalizer import improve_entered_text
     from .prompts import CLARIFICATION_PROMPT, SYSTEM_PROMPT
+    from .routing_contracts import (
+        OperationResult,
+        PreparedCommand,
+        ROUTE_REGISTRY,
+        RouteId,
+        TurnDecision,
+        is_valid_route_action,
+        parse_explicit_route,
+    )
 except ImportError:
     from ai_refinement import OpenAIN4OSIntentInterpreter
     from intent_router import (
@@ -48,6 +59,15 @@ except ImportError:
     )
     from input_normalizer import improve_entered_text
     from prompts import CLARIFICATION_PROMPT, SYSTEM_PROMPT
+    from routing_contracts import (
+        OperationResult,
+        PreparedCommand,
+        ROUTE_REGISTRY,
+        RouteId,
+        TurnDecision,
+        is_valid_route_action,
+        parse_explicit_route,
+    )
 
 
 DEFAULT_TIMEZONE = "America/Los_Angeles"
@@ -118,6 +138,21 @@ def _is_day_briefing_request(request: str) -> bool:
         or "day briefing" in lowered
         or "daily briefing" in lowered
     )
+
+
+def _combined_calendar_request(request: str) -> str:
+    lowered = request.lower()
+    if "tomorrow" in lowered:
+        return "calendar briefing tomorrow"
+    if "next week" in lowered:
+        return "calendar briefing next week"
+    named_window = re.search(
+        r"\b(?:(?:this|next)\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend)\b",
+        lowered,
+    )
+    if named_window is not None:
+        return f"calendar briefing {named_window.group(0)}"
+    return "calendar briefing this week"
 
 
 def _default_now(reference_time: datetime | None) -> datetime:
@@ -312,7 +347,16 @@ def _clarified_route(request: str) -> str | None:
     normalized = request.lower().strip(" .!?")
     if normalized in ("calendar", "cal", "use calendar"):
         return "calendar"
-    if normalized in ("task", "tasks", "todo", "to-do", "use tasks"):
+    if normalized in (
+        "task",
+        "tasks",
+        "todo",
+        "to-do",
+        "create task",
+        "task create",
+        "use task",
+        "use tasks",
+    ):
         return "tasks"
     if normalized in ("shopping", "shopping list", "cart", "shop", "use shopping"):
         return "shopping"
@@ -324,7 +368,12 @@ def _clarified_route(request: str) -> str | None:
         return "science_lab"
     if normalized in ("library", "reading garden", "use library"):
         return "library"
-    if normalized in ("both", "calendar and tasks", "tasks and calendar"):
+    if normalized in (
+        "both",
+        "calendar and tasks",
+        "tasks and calendar",
+        "combined planning",
+    ):
         return "both"
     return None
 
@@ -378,6 +427,11 @@ def _undo_depth(claw: Any | None) -> int:
     return len(stack) if isinstance(stack, list) else 0
 
 
+def _clear_domain_result(claw: Any | None) -> None:
+    if claw is not None and hasattr(claw, "last_result"):
+        setattr(claw, "last_result", None)
+
+
 def _pending_owner(
     calendar: Any | None,
     tasks: Any | None,
@@ -424,9 +478,11 @@ def _clarified_route_action(
             )
             is not None
         )
+        task_intent = _tasks_module().extract_intent(request, now=reference_time)
+        if task_intent.get("intent") == "create_task":
+            return "create_task"
         if _is_object_update_request(request) and not has_dangling_owner_annotation:
             return "update_task"
-        task_intent = _tasks_module().extract_intent(request, now=reference_time)
         if task_intent.get("intent") != "recommend_tasks":
             return str(task_intent["intent"])
         create_intent = _tasks_module().extract_intent(
@@ -443,11 +499,11 @@ def _clarified_route_action(
     if route == "decisions":
         return str(_decisions_module().extract_intent(request, now=reference_time)["intent"])
     if route == "science_lab":
-        return "science_lab"
+        return "plan_experiments"
     if route == "library":
         return str(_library_module().extract_intent(request, now=reference_time)["intent"])
     if route == "both":
-        return "calendar_and_tasks"
+        return "combined_planning"
     return "unknown"
 
 
@@ -462,6 +518,29 @@ def _clarified_dispatch_request(
         if task_intent.get("intent") == "recommend_tasks":
             return f"add task {request}"
     return request
+
+
+def _prepared_target_id(fields: dict[str, Any] | None, *keys: str) -> str | None:
+    target = (fields or {}).get("target")
+    if not isinstance(target, dict):
+        return None
+    for key in keys:
+        value = str(target.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _prepared_target_value(fields: dict[str, Any] | None, *keys: str) -> str | None:
+    return _prepared_target_id(fields, *keys)
+
+
+def _prepared_owner(fields: dict[str, Any] | None) -> str | None:
+    slots = (fields or {}).get("slots")
+    if not isinstance(slots, dict):
+        return None
+    owner = str(slots.get("owner") or "").strip().lower()
+    return owner if owner in DEFAULT_OWNER_VALUES else None
 
 
 @dataclass
@@ -479,13 +558,15 @@ class N4OSClaw:
     intent_interpreter: Any | None = None
     pending_route_clarification: PendingRouteClarification | None = None
     route_context: RouteContext = field(default_factory=RouteContext)
+    last_turn_decision: TurnDecision | None = None
+    last_domain_status: str | None = None
 
     @classmethod
     def default(cls) -> "N4OSClaw":
         return cls(intent_interpreter=OpenAIN4OSIntentInterpreter.from_env_or_none())
 
     def route(self, request: str, reference_time: datetime | None = None) -> dict[str, Any]:
-        request = improve_entered_text(request)
+        request = request if parse_explicit_route(request) is not None else improve_entered_text(request)
         return route_request(
             request,
             now=reference_time,
@@ -498,12 +579,29 @@ class N4OSClaw:
         request: str,
         reference_time: datetime | None = None,
     ) -> N4OSIntentFrame:
-        request = improve_entered_text(request)
+        request = request if parse_explicit_route(request) is not None else improve_entered_text(request)
         return interpret_request(
             request,
             now=reference_time,
             context=self._context_payload(),
             interpreter=self.intent_interpreter,
+        )
+
+    def recognize(
+        self,
+        request: str,
+        reference_time: datetime | None = None,
+    ) -> N4OSIntentFrame:
+        """Recognize standalone actions for conversation-state arbitration."""
+
+        request = request if parse_explicit_route(request) is not None else improve_entered_text(request)
+        return interpret_request(
+            request,
+            now=reference_time,
+            # Chat replies must not inherit an earlier router target. Only a
+            # standalone high-confidence action may interrupt active chat.
+            context=None,
+            interpreter=None,
         )
 
     def _context_payload(self) -> dict[str, Any]:
@@ -522,6 +620,7 @@ class N4OSClaw:
         request: str,
         frame: N4OSIntentFrame,
     ) -> None:
+        self.last_turn_decision = frame.to_turn_decision(request)
         self.route_context.last_route = frame.route
         self.route_context.last_action = frame.action
         self.route_context.last_request = request
@@ -539,7 +638,7 @@ class N4OSClaw:
         default_owner: str | None = None,
         photo_path: str | None = None,
     ) -> dict[str, Any]:
-        request = improve_entered_text(request)
+        request = request if parse_explicit_route(request) is not None else improve_entered_text(request)
         calendar = self.calendar_claw
         tasks = self.tasks_claw
         home_board = self.home_board_claw
@@ -559,7 +658,7 @@ class N4OSClaw:
                 _clear_pending_action(home_board)
                 _clear_pending_action(decisions)
                 self.pending_route_clarification = None
-                self._dispatch_decision(
+                response = self._dispatch_decision(
                     request,
                     decision,
                     reference_time,
@@ -568,6 +667,7 @@ class N4OSClaw:
                     default_owner=default_owner,
                     photo_path=photo_path,
                 )
+                decision["response"] = response
                 self._remember_route(request, frame)
                 return decision
 
@@ -587,7 +687,7 @@ class N4OSClaw:
                 _clear_pending_action(home_board)
                 _clear_pending_action(decisions)
                 self.pending_route_clarification = None
-                self._dispatch_decision(
+                response = self._dispatch_decision(
                     request,
                     decision,
                     reference_time,
@@ -596,10 +696,12 @@ class N4OSClaw:
                     default_owner=default_owner,
                     photo_path=photo_path,
                 )
+                decision["response"] = response
                 self._remember_route(request, frame)
                 return decision
 
         if calendar is not None and _handle_pending_response(calendar, request, reference_time):
+            self._adopt_domain_status(calendar)
             frame = N4OSIntentFrame(
                 route="calendar",
                 action="pending_response",
@@ -610,11 +712,13 @@ class N4OSClaw:
             self._remember_route(request, frame)
             return {
                 "route": "calendar",
+                "action": "pending_response",
                 "intent_summary": "Handled pending family-calendar response.",
                 "confidence": 1.0,
             }
 
         if tasks is not None and tasks.handle_pending_response(request):
+            self._adopt_domain_status(tasks)
             frame = N4OSIntentFrame(
                 route="tasks",
                 action="pending_response",
@@ -625,12 +729,14 @@ class N4OSClaw:
             self._remember_route(request, frame)
             return {
                 "route": "tasks",
+                "action": "pending_response",
                 "intent_summary": "Handled pending family-tasks response.",
                 "confidence": 1.0,
             }
 
         handle_pending_decision = getattr(decisions, "handle_pending_response", None)
         if callable(handle_pending_decision) and handle_pending_decision(request):
+            self._adopt_domain_status(decisions)
             frame = N4OSIntentFrame(
                 route="decisions",
                 action="pending_response",
@@ -641,6 +747,7 @@ class N4OSClaw:
             self._remember_route(request, frame)
             return {
                 "route": "decisions",
+                "action": "pending_response",
                 "intent_summary": "Handled pending family backlog response.",
                 "confidence": 1.0,
             }
@@ -671,7 +778,7 @@ class N4OSClaw:
                 normalized_request=dispatch_request,
             )
             decision = frame.to_route_decision()
-            self._dispatch_decision(
+            response = self._dispatch_decision(
                 dispatch_request,
                 decision,
                 pending_route.reference_time,
@@ -680,6 +787,7 @@ class N4OSClaw:
                 default_owner=default_owner,
                 photo_path=photo_path,
             )
+            decision["response"] = response
             self._remember_route(dispatch_request, frame)
             return decision
 
@@ -693,11 +801,14 @@ class N4OSClaw:
                 request=request,
                 reference_time=reference_time,
             )
-            print(frame.clarification_question or CLARIFICATION_PROMPT)
+            response = frame.clarification_question or CLARIFICATION_PROMPT
+            decision["response"] = response
+            self.last_turn_decision = frame.to_turn_decision(request)
+            print(response)
             return decision
 
         self.pending_route_clarification = None
-        self._dispatch_decision(
+        response = self._dispatch_decision(
             request,
             decision,
             reference_time,
@@ -706,8 +817,108 @@ class N4OSClaw:
             default_owner=default_owner,
             photo_path=photo_path,
         )
+        decision["response"] = response
         self._remember_route(request, frame)
         return decision
+
+    def handle_turn(
+        self,
+        request: str,
+        reference_time: datetime | None = None,
+        source: str = "telegram_text",
+        default_owner: str | None = None,
+        photo_path: str | None = None,
+    ) -> OperationResult:
+        """Return one structured turn result while legacy domain CLIs still print."""
+
+        self.last_turn_decision = None
+        self.last_domain_status = None
+        before_mutations = len(self.route_context.mutation_route_stack)
+        output = StringIO()
+        with redirect_stdout(output):
+            decision = self.handle_request(
+                request,
+                reference_time=reference_time,
+                source=source,
+                default_owner=default_owner,
+                photo_path=photo_path,
+            )
+
+        route = cast(RouteId, str(decision.get("route") or "unknown"))
+        action = str(decision.get("action") or "unknown")
+        response = str(
+            decision.get("response")
+            or output.getvalue().strip()
+            or decision.get("intent_summary")
+            or "Done."
+        )
+        after_mutations = len(self.route_context.mutation_route_stack)
+        mutation_recorded = after_mutations > before_mutations
+        awaiting_domain_response = _pending_owner(
+            self.calendar_claw,
+            self.tasks_claw,
+            self.shopping_claw,
+            self.home_board_claw,
+            self.decisions_claw,
+        ) is not None
+
+        spec = ROUTE_REGISTRY.get(route, ROUTE_REGISTRY["unknown"])
+        reported_mutation_succeeded = (
+            action in spec.mutating_actions and self.last_domain_status == "ok"
+        )
+        decision_missing_fields = bool(
+            self.last_turn_decision and self.last_turn_decision.missing_fields
+        )
+        effect_is_mutation = mutation_recorded or reported_mutation_succeeded
+        if self.last_domain_status == "error":
+            status = "failure"
+        elif self.last_domain_status in {"needs_information"}:
+            status = "clarification"
+        elif self.last_domain_status == "not_counted":
+            status = "noop"
+        elif route == "unknown" or awaiting_domain_response:
+            status = "clarification"
+        elif effect_is_mutation:
+            status = "success"
+        elif action in spec.mutating_actions and decision_missing_fields:
+            status = "clarification"
+        elif action in spec.mutating_actions:
+            # A mutating owner must prove an effect through its undo stack or
+            # structured domain status. No proof means the mutation failed.
+            status = "failure"
+        else:
+            status = "success"
+
+        source_value = str(decision.get("source") or "rules")
+        if source_value not in {"explicit", "rules", "llm", "clarification"}:
+            source_value = "rules"
+        turn_decision = self.last_turn_decision
+        if turn_decision is None:
+            turn_decision = TurnDecision(
+                route=route,
+                action=action,
+                confidence=float(decision.get("confidence") or 0),
+                source=cast(Any, source_value),
+                original_input=request,
+                normalized_input=request,
+                clarification=response if status == "clarification" else None,
+            )
+        else:
+            turn_decision = replace(
+                turn_decision,
+                original_input=request,
+                clarification=response if status == "clarification" else None,
+            )
+        return OperationResult(
+            status=cast(Any, status),
+            route=route,
+            action=action,
+            response=response,
+            effect="mutation" if effect_is_mutation else ("read" if status == "success" else "none"),
+            mutation_reference=self.route_context.last_mutation_route if mutation_recorded else None,
+            undoable=mutation_recorded,
+            decision=turn_decision,
+        )
 
     def _dispatch_decision(
         self,
@@ -718,69 +929,160 @@ class N4OSClaw:
         source: str = "telegram_text",
         default_owner: str | None = None,
         photo_path: str | None = None,
-    ) -> None:
-        dispatch_request = (frame.normalized_request if frame else request) or request
-        action = frame.action if frame else None
+    ) -> str:
+        prepared = self._prepare_command(request, frame)
+        dispatch_request = prepared.original_input
+        action = prepared.action
+        prepared_owner = _prepared_owner(prepared.fields) or default_owner
         if decision["route"] == "both" and _is_day_briefing_request(dispatch_request):
-            self._handle_day_briefing(dispatch_request, reference_time)
-            return
+            return self._handle_day_briefing(dispatch_request, reference_time)
 
+        responses: list[str] = []
         if decision["route"] in ("calendar", "both"):
+            _clear_domain_result(self.calendar_claw)
             before = _undo_depth(self.calendar_claw)
-            self._handle_calendar_request(
-                dispatch_request,
+            response = self._handle_calendar_request(
+                (
+                    _combined_calendar_request(dispatch_request)
+                    if decision["route"] == "both"
+                    else dispatch_request
+                ),
                 reference_time,
-                action=action,
-                default_owner=default_owner,
+                action="family_briefing" if decision["route"] == "both" else action,
+                default_owner=prepared_owner,
+                prepared_fields=prepared.fields,
             )
+            if response:
+                responses.append(response)
+            self._adopt_domain_status(self.calendar_claw)
             self._remember_mutation_route("calendar", before, self.calendar_claw)
         if decision["route"] in ("tasks", "both"):
+            _clear_domain_result(self.tasks_claw)
             before = _undo_depth(self.tasks_claw)
-            self._handle_tasks_request(
+            response = self._handle_tasks_request(
+                dispatch_request,
+                reference_time,
+                action="recommend_tasks" if decision["route"] == "both" else action,
+                default_owner=prepared_owner,
+                prepared_fields=prepared.fields,
+            )
+            if response:
+                responses.append(response)
+            self._adopt_domain_status(self.tasks_claw)
+            self._remember_mutation_route("tasks", before, self.tasks_claw)
+        if decision["route"] == "shopping":
+            _clear_domain_result(self.shopping_claw)
+            before = _undo_depth(self.shopping_claw)
+            response = self._handle_shopping_request(dispatch_request, reference_time, action=action)
+            if response:
+                responses.append(response)
+            self._adopt_domain_status(self.shopping_claw)
+            self._remember_mutation_route("shopping", before, self.shopping_claw)
+        if decision["route"] == "home_board":
+            _clear_domain_result(self.home_board_claw)
+            before = _undo_depth(self.home_board_claw)
+            response = self._handle_home_board_request(
                 dispatch_request,
                 reference_time,
                 action=action,
-                default_owner=default_owner,
+                prepared_fields=prepared.fields,
             )
-            self._remember_mutation_route("tasks", before, self.tasks_claw)
-        if decision["route"] == "shopping":
-            before = _undo_depth(self.shopping_claw)
-            self._handle_shopping_request(dispatch_request, reference_time, action=action)
-            self._remember_mutation_route("shopping", before, self.shopping_claw)
-        if decision["route"] == "home_board":
-            before = _undo_depth(self.home_board_claw)
-            self._handle_home_board_request(dispatch_request, reference_time, action=action)
+            if response:
+                responses.append(response)
+            self._adopt_domain_status(self.home_board_claw)
             self._remember_mutation_route("home_board", before, self.home_board_claw)
         if decision["route"] == "decisions":
+            _clear_domain_result(self.decisions_claw)
             before = _undo_depth(self.decisions_claw)
-            self._handle_decision_request(
+            response = self._handle_decision_request(
                 dispatch_request,
                 reference_time,
                 action=action,
                 source=source,
-                default_owner=default_owner,
+                default_owner=prepared_owner,
             )
+            if response:
+                responses.append(response)
+            self._adopt_domain_status(self.decisions_claw)
             self._remember_mutation_route("decisions", before, self.decisions_claw)
         if decision["route"] == "science_lab":
-            self._handle_science_lab_request(dispatch_request)
+            _clear_domain_result(self.science_lab_claw)
+            response = self._handle_science_lab_request(dispatch_request)
+            if response:
+                responses.append(response)
+            self._adopt_domain_status(self.science_lab_claw)
         if decision["route"] == "library":
-            self._handle_library_request(
+            _clear_domain_result(self.library_claw)
+            response = self._handle_library_request(
                 dispatch_request,
                 reference_time,
                 action=action,
                 source=source,
                 photo_path=photo_path,
             )
+            if response:
+                responses.append(response)
+            self._adopt_domain_status(self.library_claw)
+        return "\n".join(responses).strip()
+
+    def _prepare_command(self, request: str, frame: N4OSIntentFrame | None) -> PreparedCommand:
+        if frame is None:
+            return PreparedCommand(
+                route="unknown",
+                action="unknown",
+                original_input=request,
+                fields={},
+            )
+        if not is_valid_route_action(frame.route, frame.action):
+            raise ValueError(f"invalid prepared action for {frame.route}: {frame.action}")
+        # Deterministic normalization is owner-controlled. LLM frames retain the
+        # original input and contribute only typed target/slot hints.
+        domain_input = frame.normalized_request or request
+        target = dict(frame.target)
+        if frame.decision_source == "llm":
+            prior_target = self.route_context.last_artifact.get("target", {})
+            trusted_ids = {
+                str(value)
+                for value in prior_target.values()
+                if isinstance(value, str) and value
+            }
+            target = {
+                key: value
+                for key, value in target.items()
+                if key not in {"id", "event_id", "task_id", "item_id", "calendar_id", "calendarId"}
+                or (isinstance(value, str) and (value in trusted_ids or value in request))
+            }
+        return PreparedCommand(
+            route=cast(RouteId, frame.route),
+            action=frame.action,
+            original_input=domain_input,
+            fields={"target": target, "slots": dict(frame.slots)},
+        )
 
     def _remember_mutation_route(
         self,
         route: str,
         before_depth: int,
         claw: Any | None,
-    ) -> None:
+    ) -> str:
         if _undo_depth(claw) > before_depth:
             self.route_context.last_mutation_route = route
             self.route_context.mutation_route_stack.append(route)
+
+    def _adopt_domain_status(self, claw: Any | None) -> None:
+        result = getattr(claw, "last_result", None)
+        if not isinstance(result, dict):
+            return
+        status = str(result.get("status") or "")
+        priority = {
+            "ok": 1,
+            "not_counted": 2,
+            "needs_information": 3,
+            "error": 4,
+        }
+        current_priority = priority.get(self.last_domain_status or "", 0)
+        if priority.get(status, 0) >= current_priority:
+            self.last_domain_status = status
 
     def _undo_last_action(self, request: str) -> dict[str, Any]:
         route = self.route_context.mutation_route_stack[-1] if self.route_context.mutation_route_stack else None
@@ -795,7 +1097,13 @@ class N4OSClaw:
         if claw is None or not hasattr(claw, "undo_last_action"):
             message = "Nothing to undo."
             print(message)
-            return {"route": "unknown", "intent_summary": message, "confidence": 1.0}
+            return {
+                "route": "unknown",
+                "action": "undo",
+                "intent_summary": message,
+                "response": message,
+                "confidence": 1.0,
+            }
 
         message = claw.undo_last_action()
         if self.route_context.mutation_route_stack:
@@ -815,7 +1123,9 @@ class N4OSClaw:
         self._remember_route(request, frame)
         return {
             "route": route or "unknown",
+            "action": "undo",
             "intent_summary": message,
+            "response": message,
             "confidence": 1.0,
         }
 
@@ -882,39 +1192,107 @@ class N4OSClaw:
         reference_time: datetime | None,
         action: str | None = None,
         default_owner: str | None = None,
-    ) -> None:
+        prepared_fields: dict[str, Any] | None = None,
+    ) -> str:
         module = _calendar_module()
         claw = self._calendar()
         if claw is None:
-            return
-        intent = module.extract_intent(request, now=reference_time)
+            self.last_domain_status = "error"
+            return _missing_google_dependency_message("Family Calendar")
+        extract_calendar_intent = getattr(claw, "_extract_intent_from_request", None)
+        if callable(extract_calendar_intent):
+            intent = extract_calendar_intent(request, reference_time)
+        else:
+            intent = module.extract_intent(request, now=reference_time)
+        if intent.get("intent") == "add_guests" and action in {None, "create_event", "update_event"}:
+            action = "add_guests"
         action = action or intent["intent"]
+        event_id = _prepared_target_id(prepared_fields, "event_id", "id")
+        calendar_id = _prepared_target_value(prepared_fields, "calendar_id", "calendarId")
         if action == "preparation_checklist":
-            claw.preparation_from_request(request, reference_time=reference_time)
+            return claw.preparation_from_request(request, reference_time=reference_time)
         elif action == "family_briefing":
-            claw.briefing_from_request(request, reference_time=reference_time)
+            return claw.briefing_from_request(request, reference_time=reference_time)
         elif action == "list_events":
-            claw.list_events_from_request(request, reference_time=reference_time)
+            return claw.list_events_from_request(request, reference_time=reference_time)
         elif action == "delete_event":
-            claw.delete_event_from_request(request, reference_time=reference_time)
+            return claw.delete_event_from_request(
+                request,
+                reference_time=reference_time,
+                event_id=event_id,
+                calendar_id=calendar_id,
+            )
         elif action == "update_event":
-            if hasattr(claw, "assign_owner_from_request") and re.search(
+            if intent["intent"] == "add_guests" and hasattr(claw, "add_guests_from_request"):
+                return claw.add_guests_from_request(
+                    request,
+                    reference_time=reference_time,
+                    event_id=event_id,
+                    calendar_id=calendar_id,
+                )
+            elif hasattr(claw, "assign_owner_from_request") and re.search(
                 r"\b(?:assign|assigned|owner|owned|belongs)\b|"
                 r"\b(?:set|make|change|update|put)\b.*\b(?:owner|as\s+owner)\b",
                 request,
                 flags=re.IGNORECASE,
             ):
-                claw.assign_owner_from_request(request, reference_time=reference_time)
+                return claw.assign_owner_from_request(
+                    request,
+                    reference_time=reference_time,
+                    event_id=event_id,
+                    calendar_id=calendar_id,
+                )
             elif re.search(
                 r"^\s*(?:add|append|set|update|put)?\s*(?:a\s+)?(?:note|notes|description|context|fyi)\b",
                 request,
                 flags=re.IGNORECASE,
             ):
-                claw.create_event_from_request(request, reference_time=reference_time)
+                return claw.create_event_from_request(
+                    request,
+                    reference_time=reference_time,
+                    event_id=event_id,
+                    calendar_id=calendar_id,
+                )
             else:
-                claw.update_event_from_request(request, reference_time=reference_time)
+                return claw.update_event_from_request(
+                    request,
+                    reference_time=reference_time,
+                    event_id=event_id,
+                    calendar_id=calendar_id,
+                )
+        elif action == "add_guests" and hasattr(claw, "add_guests_from_request"):
+            if intent.get("intent") == "add_guests" and hasattr(claw, "add_guests_from_intent"):
+                return claw.add_guests_from_intent(
+                    intent,
+                    event_id=event_id,
+                    calendar_id=calendar_id,
+                )
+            return claw.add_guests_from_request(
+                request,
+                reference_time=reference_time,
+                event_id=event_id,
+                calendar_id=calendar_id,
+            )
         else:
-            claw.create_event_from_request(
+            if event_id and re.search(
+                r"^\s*(?:add|append|set|update|put)?\s*(?:a\s+)?(?:note|notes|description|context|fyi)\b",
+                request,
+                flags=re.IGNORECASE,
+            ):
+                return claw.create_event_from_request(
+                    request,
+                    reference_time=reference_time,
+                    event_id=event_id,
+                    calendar_id=calendar_id,
+                )
+            if event_id and action == "add_guests" and hasattr(claw, "add_guests_from_request"):
+                return claw.add_guests_from_request(
+                    request,
+                    reference_time=reference_time,
+                    event_id=event_id,
+                    calendar_id=calendar_id,
+                )
+            return claw.create_event_from_request(
                 _request_with_default_owner(request, intent, default_owner),
                 reference_time=reference_time,
             )
@@ -925,60 +1303,89 @@ class N4OSClaw:
         reference_time: datetime | None,
         action: str | None = None,
         default_owner: str | None = None,
-    ) -> None:
+        prepared_fields: dict[str, Any] | None = None,
+    ) -> str:
         module = _tasks_module()
         claw = self._tasks()
         if claw is None:
-            return
+            self.last_domain_status = "error"
+            return _missing_google_dependency_message("Family Tasks")
         intent = module.extract_intent(request, now=reference_time)
         action = action or intent["intent"]
+        task_id = _prepared_target_id(prepared_fields, "task_id", "id")
         if action == "create_task":
-            claw.add_task_from_request(
+            return claw.add_task_from_request(
                 _request_with_default_owner(request, intent, default_owner),
                 reference_time=reference_time,
             )
         elif action == "update_task":
             if hasattr(claw, "update_task_from_request"):
-                claw.update_task_from_request(request)
+                return claw.update_task_from_request(request, task_id=task_id)
             else:
-                claw.assign_owner_from_request(request)
+                return claw.assign_owner_from_request(request)
         elif action == "complete_task":
-            claw.complete_task_from_request(request)
+            return claw.complete_task_from_request(request, task_id=task_id)
         elif action == "delete_task":
-            claw.delete_task_from_request(request)
+            return claw.delete_task_from_request(request, task_id=task_id)
         elif action == "run_assistant_help":
-            claw.run_noah_assistant_help_from_request(
+            return claw.run_noah_assistant_help_from_request(
                 request,
                 reference_time=reference_time,
             )
         else:
-            claw.recommend_tasks_from_request(request, reference_time=reference_time)
+            return claw.recommend_tasks_from_request(request, reference_time=reference_time)
 
     def _handle_home_board_request(
         self,
         request: str,
         reference_time: datetime | None,
         action: str | None = None,
-    ) -> None:
+        prepared_fields: dict[str, Any] | None = None,
+    ) -> str:
         module = _home_board_module()
         claw = self._home_board()
         intent = module.extract_intent(request, now=reference_time)
         action = action or intent["intent"]
+        item_id = _prepared_target_id(prepared_fields, "item_id", "id")
         if action == "list_items":
-            claw.list_items_from_request(request, reference_time=reference_time)
+            return claw.list_items_from_request(request, reference_time=reference_time)
         elif action == "mark_done":
-            claw.mark_done_from_request(request)
+            return claw.mark_done_from_request(request, item_id=item_id)
         else:
-            claw.add_item_from_request(request, reference_time=reference_time)
+            return claw.add_item_from_request(request, reference_time=reference_time)
 
     def _handle_shopping_request(
         self,
         request: str,
         reference_time: datetime | None,
         action: str | None = None,
-    ) -> None:
-        del action
-        self._shopping().handle_request(request, reference_time=reference_time)
+    ) -> str:
+        claw = self._shopping()
+        # Some injected shopping implementations still expose only the public
+        # aggregate handler. Keep dispatch typed while honoring that boundary.
+        if not hasattr(claw, "add_items_from_request"):
+            return claw.handle_request(request, reference_time=reference_time)
+        if action == "list_lists":
+            message = claw.list_lists_from_request(request, reference_time=reference_time)
+        elif action == "list_items":
+            message = claw.list_items_from_request(request, reference_time=reference_time)
+        elif action in {"add_item", "add_items"}:
+            message = claw.add_items_from_request(request, reference_time=reference_time)
+        elif action == "check_item":
+            message = claw.check_item_from_request(request, checked=True)
+        elif action == "uncheck_item":
+            message = claw.check_item_from_request(request, checked=False)
+        elif action == "delete_item":
+            message = claw.delete_item_from_request(request)
+        elif action == "clear_list":
+            message = claw.clear_list_from_request(request, reference_time=reference_time)
+        elif action == "move_item":
+            message = claw.move_item_from_request(request)
+        else:
+            message = claw.handle_request(request, reference_time=reference_time)
+        result = getattr(claw, "last_result", None)
+        self.last_domain_status = str(result.get("status")) if isinstance(result, dict) else None
+        return message
 
     def _handle_decision_request(
         self,
@@ -987,23 +1394,23 @@ class N4OSClaw:
         action: str | None = None,
         source: str = "telegram_text",
         default_owner: str | None = None,
-    ) -> None:
+    ) -> str:
         claw = self._decisions()
         if action == "list_decisions":
-            claw.list_decisions_from_request(request)
+            return claw.list_decisions_from_request(request)
         elif action == "decision_brief":
-            claw.decision_brief_from_request(request)
+            return claw.decision_brief_from_request(request)
         elif action == "add_option":
-            claw.add_option_from_request(request, reference_time=reference_time)
+            return claw.add_option_from_request(request, reference_time=reference_time)
         elif action == "add_evidence":
-            claw.add_evidence_from_request(request, reference_time=reference_time)
+            return claw.add_evidence_from_request(request, reference_time=reference_time)
         elif action == "add_next_step":
-            claw.add_next_step_from_request(request, reference_time=reference_time)
+            return claw.add_next_step_from_request(request, reference_time=reference_time)
         elif action == "record_decision":
-            claw.record_decision_from_request(request, reference_time=reference_time)
+            return claw.record_decision_from_request(request, reference_time=reference_time)
         else:
             try:
-                claw.handle_request(
+                return claw.handle_request(
                     request,
                     reference_time=reference_time,
                     source=source,
@@ -1012,10 +1419,10 @@ class N4OSClaw:
             except TypeError as error:
                 if "unexpected keyword argument" not in str(error):
                     raise
-                claw.handle_request(request, reference_time=reference_time)
+                return claw.handle_request(request, reference_time=reference_time)
 
-    def _handle_science_lab_request(self, request: str) -> None:
-        self._science_lab().plan_from_request(request)
+    def _handle_science_lab_request(self, request: str) -> str:
+        return self._science_lab().plan_from_request(request)
 
     def _handle_library_request(
         self,
@@ -1024,29 +1431,37 @@ class N4OSClaw:
         action: str | None = None,
         source: str = "telegram_text",
         photo_path: str | None = None,
-    ) -> None:
+    ) -> str:
         claw = self._library()
         if action == "status":
-            claw.status_from_request(request, reference_time=reference_time)
+            message = claw.status_from_request(request, reference_time=reference_time)
         elif action == "record_checkout":
-            claw.checkout_from_request(request, reference_time=reference_time, source=source)
+            message = claw.checkout_from_request(request, reference_time=reference_time, source=source)
+        elif action == "update_reading":
+            message = claw.update_from_request(request, reference_time=reference_time)
+        elif action == "delete_reading":
+            message = claw.delete_from_request(request, reference_time=reference_time)
         else:
-            claw.record_from_request(
+            message = claw.record_from_request(
                 request,
                 reference_time=reference_time,
                 source=source,
                 photo_path=photo_path,
             )
+        result = getattr(claw, "last_result", None)
+        self.last_domain_status = str(result.get("status")) if isinstance(result, dict) else None
+        return message
 
     def _handle_day_briefing(
         self,
         request: str,
         reference_time: datetime | None,
-    ) -> None:
+    ) -> str:
         calendar = self._calendar()
         tasks = self._tasks()
         if calendar is None or tasks is None:
-            return
+            self.last_domain_status = "error"
+            return "Calendar and Tasks need their Google dependencies before I can build a briefing."
 
         calendar_module = _calendar_module()
         tasks_module = _tasks_module()
@@ -1060,13 +1475,15 @@ class N4OSClaw:
             max_results=100,
         )
         if event_response["status"] != "ok":
+            self.last_domain_status = str(event_response["status"])
             print(event_response["message"])
-            return
+            return event_response["message"]
 
         task_response = tasks.tools.list_tasks(show_completed=False)
         if task_response["status"] != "ok":
+            self.last_domain_status = str(task_response["status"])
             print(task_response["message"])
-            return
+            return task_response["message"]
 
         events = sorted(
             event_response.get("data", {}).get("events", []),
@@ -1082,8 +1499,9 @@ class N4OSClaw:
             filters={"duration_minutes": gap_minutes},
         )
         if recommend_response["status"] != "ok":
+            self.last_domain_status = str(recommend_response["status"])
             print(recommend_response["message"])
-            return
+            return recommend_response["message"]
 
         recommended_tasks = recommend_response.get("data", {}).get("tasks", [])
         message = _format_day_briefing(
@@ -1095,6 +1513,7 @@ class N4OSClaw:
             tasks_module=tasks_module,
         )
         print(message)
+        return message
 
 
 def run_cli(argv: list[str] | None = None) -> None:

@@ -12,9 +12,11 @@
   var lastReadingData = {};
   var lastShoppingData = {};
   var lastBacklogData = {};
+  var lastBedtimeData = {};
   var backlogReviewIndex = -1;
   var selectedReadingChild = "Nysha";
   var selectedShoppingList = "all";
+  var bedtimeVoiceEnabled = false;
 
   function byId(id) {
     return document.getElementById(id);
@@ -96,6 +98,8 @@
         target.getAttribute("data-reading-heatmap-day") !== null ||
         target.getAttribute("data-reading-update") !== null ||
         target.getAttribute("data-reading-delete") !== null ||
+        target.getAttribute("data-bedtime-ack") !== null ||
+        target.getAttribute("data-bedtime-voice") !== null ||
         target.getAttribute("data-decision-complete") !== null ||
         target.getAttribute("data-backlog-action") !== null ||
         target.getAttribute("data-shopping-tab") !== null ||
@@ -491,17 +495,7 @@
       .join("");
   }
 
-  function renderHomeBoard(items) {
-    var node = byId("home-board-items");
-    if (!node) return;
-    items = items || [];
-    setText("home-board-count", items.length + " pending");
-    setCardHidden("home-board", !items.length);
-    if (!items.length) {
-      node.innerHTML = "";
-      return;
-    }
-
+  function renderHomeBoardPersonGroups(items) {
     var grouped = {};
     items.forEach(function (item) {
       var person = text(item.person_or_group, "Family");
@@ -509,7 +503,7 @@
       grouped[person].push(item);
     });
 
-    node.innerHTML = Object.keys(grouped)
+    return Object.keys(grouped)
       .sort()
       .map(function (person) {
         var rows = grouped[person]
@@ -535,6 +529,197 @@
         );
       })
       .join("");
+  }
+
+  function renderHomeBoard(homeBoard) {
+    var node = byId("home-board-items");
+    if (!node) return;
+    homeBoard = homeBoard || {};
+    var todayItems = homeBoard.today || [];
+    var tomorrowItems = homeBoard.tomorrow || [];
+    var totalCount = todayItems.length + tomorrowItems.length;
+    setText(
+      "home-board-count",
+      todayItems.length + " today | " + tomorrowItems.length + " tomorrow",
+    );
+    setCardHidden("home-board", !totalCount);
+    if (!totalCount) {
+      node.innerHTML = "";
+      return;
+    }
+
+    node.innerHTML = [
+      { label: "Today", items: todayItems },
+      { label: "Preparing for Tomorrow", items: tomorrowItems },
+    ]
+      .filter(function (section) {
+        return section.items.length;
+      })
+      .map(function (section) {
+        return (
+          '<section class="home-board-day"><div class="home-board-day-header"><h4>' +
+          escapeHtml(section.label) +
+          '</h4><span>' +
+          escapeHtml(section.items.length + " pending") +
+          '</span></div><div class="home-board-day-groups">' +
+          renderHomeBoardPersonGroups(section.items) +
+          "</div></section>"
+        );
+      })
+      .join("");
+  }
+
+  function bedtimeVoiceStorageKey() {
+    return "n4os-dashboard-bedtime-voice";
+  }
+
+  function bedtimeStepMinutes(step) {
+    return parseClockMinutes(step.time || "");
+  }
+
+  function currentClockMinutes() {
+    var now = new Date();
+    return now.getHours() * 60 + now.getMinutes();
+  }
+
+  function setBedtimeStatus(message, state) {
+    var node = byId("bedtime-action-status");
+    if (!node) return;
+    node.textContent = text(message);
+    node.dataset.state = state || "";
+  }
+
+  function setBedtimeVoiceButton() {
+    var button = byId("bedtime-voice-button");
+    if (!button) return;
+    button.textContent = bedtimeVoiceEnabled ? "Voice on" : "Enable voice";
+    button.classList.toggle("is-called-out", bedtimeVoiceEnabled);
+    button.setAttribute("aria-pressed", bedtimeVoiceEnabled ? "true" : "false");
+  }
+
+  function speakBedtimeNudge(message) {
+    if (!bedtimeVoiceEnabled) return false;
+    if (!("speechSynthesis" in window) || typeof window.SpeechSynthesisUtterance !== "function") {
+      setBedtimeStatus("Voice is not supported in this browser.", "error");
+      return false;
+    }
+    try {
+      var utterance = new window.SpeechSynthesisUtterance(message);
+      utterance.rate = 0.98;
+      utterance.pitch = 1.02;
+      utterance.volume = 0.82;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utterance);
+      return true;
+    } catch (_error) {
+      setBedtimeVoiceEnabled(false);
+      setBedtimeStatus("Voice failed in this browser, so it was turned off.", "error");
+      return false;
+    }
+  }
+
+  function setBedtimeVoiceEnabled(enabled) {
+    bedtimeVoiceEnabled = !!enabled;
+    try {
+      window.localStorage.setItem(bedtimeVoiceStorageKey(), bedtimeVoiceEnabled ? "1" : "0");
+    } catch (_error) {}
+    setBedtimeVoiceButton();
+  }
+
+  function loadBedtimeVoicePreference() {
+    bedtimeVoiceEnabled = false;
+    try {
+      window.localStorage.setItem(bedtimeVoiceStorageKey(), "0");
+    } catch (_error) {}
+    setBedtimeVoiceButton();
+  }
+
+  function renderBedtime(data) {
+    data = data || {};
+    lastBedtimeData = data;
+    setCardHidden("bedtime", false);
+    setText("bedtime-target", data.target || "7:15 PM upstairs");
+    setText("bedtime-status", data.enabled ? data.status || "School-night routine" : "Off tonight");
+    setBedtimeVoiceButton();
+
+    var node = byId("bedtime-steps");
+    if (!node) return;
+    var steps = data.steps || [];
+    if (!data.enabled) {
+      node.innerHTML = '<p class="empty">No bedtime launch routine tonight.</p>';
+      return;
+    }
+    if (!steps.length) {
+      node.innerHTML = '<p class="empty">No bedtime steps configured.</p>';
+      return;
+    }
+
+    var currentMinutes = currentClockMinutes();
+    node.innerHTML = steps
+      .map(function (step) {
+        var stepMinutes = bedtimeStepMinutes(step);
+        var active = stepMinutes !== null && !step.acknowledged && currentMinutes >= stepMinutes;
+        var ackLabel = step.acknowledged
+          ? "Acked " + new Date(step.acked_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+          : "Ack";
+        return (
+          '<div class="bedtime-step' +
+          (active ? " is-active" : "") +
+          (step.acknowledged ? " is-acked" : "") +
+          '"><div><span class="bedtime-time">' +
+          escapeHtml(formatClockMinutes(stepMinutes || 0)) +
+          "</span><strong>" +
+          escapeHtml(step.label || "Bedtime step") +
+          "</strong><p>" +
+          escapeHtml(step.detail || "") +
+          '</p></div><button class="bedtime-ack-button" type="button" data-bedtime-ack="' +
+          escapeHtml(step.id || "") +
+          '"' +
+          (step.acknowledged ? " disabled" : "") +
+          ">" +
+          escapeHtml(ackLabel) +
+          "</button></div>"
+        );
+      })
+      .join("");
+  }
+
+  function postBedtimeAck(stepId, button) {
+    if (!stepId) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Acking";
+    }
+    setBedtimeStatus("Acknowledging bedtime step...", "pending");
+
+    var request = new XMLHttpRequest();
+    request.open("POST", "/api/bedtime/ack", true);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      var response = {};
+      try {
+        response = JSON.parse(request.responseText || "{}");
+      } catch (_error) {
+        response = {};
+      }
+      if (request.status >= 200 && request.status < 300 && response.status === "ok") {
+        setBedtimeStatus("Bedtime step acknowledged.", "ok");
+        if (response.data && response.data.bedtime) {
+          renderBedtime(response.data.bedtime);
+        } else {
+          loadDashboard();
+        }
+        return;
+      }
+      setBedtimeStatus(response.message || "Bedtime ack failed.", "error");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Ack";
+      }
+    };
+    request.send(JSON.stringify({ step_id: stepId }));
   }
 
   function readingGardenWeekDays(history, recentEvents, fallbackActiveDays, readToday) {
@@ -1073,20 +1258,25 @@
       .map(function (entry) {
         var owner = normalizeTaskOwner(entry.owner);
         var label = text(entry.label) || (owner === "unknown" ? "Unassigned" : titleLabel(owner));
-        var count = Number(entry.todayCount || 0);
+        var todayCount = Number(entry.todayCount || 0);
+        var totalCount = Number(entry.count || 0);
+        var count = todayCount || totalCount;
+        var dueFilter = todayCount > 0 ? "today" : "";
         return (
           '<a class="task-owner-chip ' +
           (owner === "unknown" ? "is-unassigned" : "") +
           (count === 0 ? " is-empty" : "") +
           '" href="' +
-          escapeHtml(taskOwnerHref(owner, "today")) +
+          escapeHtml(taskOwnerHref(owner, dueFilter)) +
           '" data-task-owner-chip="' +
           escapeHtml(owner) +
+          '" data-task-owner-due="' +
+          escapeHtml(dueFilter) +
           '"><strong>' +
           escapeHtml(String(count)) +
           "</strong><span>" +
           escapeHtml(label) +
-          " today" +
+          (dueFilter === "today" ? " today" : " open") +
           "</span></a>"
         );
       })
@@ -2126,6 +2316,7 @@
       backlogActionButton(item, "move", "Move") +
       backlogActionButton(item, "link_event", "Link event") +
       backlogActionButton(item, "link_task", "Link task") +
+      (item.kind === "decision" ? backlogActionButton(item, "create_task", "Create task") : "") +
       backlogActionButton(item, "park", "Park") +
       backlogActionButton(item, "close", "Close") +
       (reviewCurrent ? backlogActionButton(item, "keep", "Keep") : "") +
@@ -2238,9 +2429,27 @@
       );
       if (!payload.external_id) return;
       if (action === "link_task") payload.container_id = "@default";
+    } else if (action === "create_task") {
+      var backlogItem = ["discussion", "planning", "decision"].reduce(function (found, kind) {
+        return (
+          found ||
+          ((lastBacklogData.lanes || {})[kind] || []).find(function (row) {
+            return row.id === itemId;
+          })
+        );
+      }, null);
+      var defaultTitle =
+        backlogItem && backlogItem.next_step && backlogItem.next_step !== "Assign one clear next step"
+          ? backlogItem.next_step
+          : "";
+      payload.title = window.prompt("Follow-up task", defaultTitle);
+      if (!payload.title) return;
+      payload.notes = backlogItem ? "Follow-up for decision: " + backlogItem.title : "";
+      payload.due = backlogItem ? backlogItem.next_step_due || backlogItem.due || "" : "";
+      payload.container_id = "@default";
     } else if (action === "close") {
-      payload.outcome = window.prompt("Recorded outcome");
-      if (!payload.outcome || !window.confirm("Close this backlog item?")) return;
+      payload.outcome = window.prompt("Recorded outcome", "Closed from dashboard.");
+      if (payload.outcome === null || !window.confirm("Close this backlog item?")) return;
       payload.confirmed = true;
     }
     postBacklog("/api/backlog/actions", payload);
@@ -2331,7 +2540,8 @@
     setText("busy-day-label", calendar.busy_day ? calendar.busy_day.label : "");
     renderTimeline(calendar.today || []);
     renderReadingGarden(data.reading_garden || {});
-    renderHomeBoard(data.home_board ? data.home_board.today : []);
+    renderHomeBoard(data.home_board || {});
+    renderBedtime(data.bedtime || {});
     renderShopping(data.shopping || {});
     renderPrep(calendar.prep_needed || []);
     renderWarnings(data.warnings || []);
@@ -2385,6 +2595,7 @@
     request.send();
   }
 
+  loadBedtimeVoicePreference();
   loadDashboard();
   syncWakeLock();
   window.setInterval(loadDashboard, refreshMs);
@@ -2408,7 +2619,7 @@
       event.preventDefault();
       setSelectedTaskTag("");
       setSelectedTaskOwner(target.getAttribute("data-task-owner-chip"));
-      setSelectedTaskDueFilter("today");
+      setSelectedTaskDueFilter(target.getAttribute("data-task-owner-due") || "");
       renderTasks(lastTasksData);
       updateActiveNav();
       scrollToHashSection();
@@ -2429,6 +2640,19 @@
     }
     if (target.getAttribute("data-reading-delete") !== null) {
       postReadingDelete(target.getAttribute("data-reading-delete") || "", target);
+      return;
+    }
+    if (target.getAttribute("data-bedtime-voice") !== null) {
+      setBedtimeVoiceEnabled(!bedtimeVoiceEnabled);
+      if (bedtimeVoiceEnabled) {
+        speakBedtimeNudge("Bedtime voice is on.");
+      } else {
+        setBedtimeStatus("Bedtime voice off.", "pending");
+      }
+      return;
+    }
+    if (target.getAttribute("data-bedtime-ack") !== null) {
+      postBedtimeAck(target.getAttribute("data-bedtime-ack") || "", target);
       return;
     }
     if (target.getAttribute("data-decision-complete") !== null) {

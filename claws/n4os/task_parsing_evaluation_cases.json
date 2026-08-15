@@ -1,0 +1,709 @@
+[
+  {
+    "case_id": "task-create-water-filter",
+    "utterance": "/task change water filter this weekend",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Change water filter",
+      "due": "2026-08-15",
+      "metadata": {
+        "complexity": "low",
+        "context": [
+          "home"
+        ],
+        "duration_minutes": 15,
+        "effort_type": "physical",
+        "energy": "medium",
+        "location": "home",
+        "requires": [
+          "equipment"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-car-registration",
+    "utterance": "Remind me to renew the car registration next Friday",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Renew the car registration",
+      "due": "2026-08-21",
+      "metadata": {
+        "can_do_while": [
+          "driving"
+        ],
+        "complexity": "medium",
+        "context": [
+          "car",
+          "phone"
+        ],
+        "duration_minutes": 30,
+        "effort_type": "admin",
+        "energy": "medium",
+        "location": "anywhere",
+        "requires": [
+          "phone",
+          "computer",
+          "internet"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-owner-child",
+    "utterance": "/task create task Pack bag for day 1 today 2pm Owner: Nysha",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Pack bag for day 1",
+      "due": "2026-08-13",
+      "metadata": {
+        "owner": "nysha",
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-notes-school",
+    "utterance": "Add a task for Monday. Visit Nysha's school. Details: add driver and check school supplies Owner: dad",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Visit Nysha's school",
+      "due": "2026-08-17",
+      "notes": "Add driver and check school supplies",
+      "metadata": {
+        "owner": "dad",
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-followup-email",
+    "utterance": "For below email to follow-up next Wednesday. Hello Nimesh, please confirm the roofing contractor number.",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Follow up on email",
+      "due": "2026-08-19",
+      "notes": "Hello Nimesh, please confirm the roofing contractor number.",
+      "metadata": {
+        "can_do_while": [
+          "driving",
+          "commuting"
+        ],
+        "complexity": "low",
+        "context": [
+          "computer",
+          "phone"
+        ],
+        "duration_minutes": 20,
+        "effort_type": "communication",
+        "energy": "low",
+        "location": "anywhere",
+        "requires": [
+          "computer",
+          "internet"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-tags",
+    "utterance": "Add task check visa letters due August 20 and tag IndiaTrip",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Check visa letters",
+      "due": "2026-08-20",
+      "metadata": {
+        "complexity": "high",
+        "duration_minutes": 60,
+        "effort_type": "paperwork",
+        "energy": "high",
+        "location": "anywhere",
+        "requires": [
+          "paperwork",
+          "computer",
+          "focus"
+        ],
+        "tags": [
+          "indiatrip"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-duration-energy",
+    "utterance": "Add task research math tutor options, 45 minutes, high energy #kids",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Research math tutor options",
+      "metadata": {
+        "complexity": "medium",
+        "context": [
+          "computer"
+        ],
+        "duration_minutes": 45,
+        "effort_type": "research",
+        "energy": "high",
+        "location": "anywhere",
+        "requires": [
+          "computer",
+          "internet",
+          "focus"
+        ],
+        "tags": [
+          "kids"
+        ]
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-commute-call",
+    "utterance": "Add task call pediatrician while driving tomorrow",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Call pediatrician",
+      "due": "2026-08-14",
+      "metadata": {
+        "can_do_while": [
+          "driving"
+        ],
+        "complexity": "low",
+        "context": [
+          "car",
+          "phone"
+        ],
+        "duration_minutes": 20,
+        "effort_type": "communication",
+        "energy": "low",
+        "location": "anywhere",
+        "requires": [
+          "phone"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-paperwork",
+    "utterance": "Add task fill passport renewal forms by Sep 1",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Fill passport renewal forms",
+      "due": "2026-09-01",
+      "metadata": {
+        "complexity": "high",
+        "duration_minutes": 60,
+        "effort_type": "paperwork",
+        "energy": "high",
+        "location": "anywhere",
+        "requires": [
+          "paperwork",
+          "computer",
+          "focus"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-errand",
+    "utterance": "/task return library books this weekend",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Return library books",
+      "due": "2026-08-15",
+      "metadata": {
+        "context": [
+          "errand"
+        ],
+        "effort_type": "errand",
+        "location": "outside",
+        "requires": [
+          "car"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-assistant-help",
+    "utterance": "Add task compare solar quotes. Noah help: summarize warranty differences.",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Compare solar quotes",
+      "metadata": {
+        "assistant_help_needed": true,
+        "assistant_help_request": "Summarize warranty differences",
+        "assistant_name": "Noah",
+        "complexity": "medium",
+        "duration_minutes": 45,
+        "effort_type": "research",
+        "energy": "medium",
+        "location": "anywhere",
+        "requires": [
+          "computer",
+          "internet",
+          "focus"
+        ]
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-assistant-context",
+    "utterance": "Add task draft email to HOA. Noah help: make it concise. Context: ask about pool key access.",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Draft email to HOA",
+      "metadata": {
+        "assistant_context": "ask about pool key access",
+        "assistant_help_needed": true,
+        "assistant_help_request": "Make it concise",
+        "assistant_name": "Noah",
+        "can_do_while": [
+          "driving",
+          "commuting"
+        ],
+        "complexity": "low",
+        "context": [
+          "computer",
+          "phone"
+        ],
+        "duration_minutes": 20,
+        "effort_type": "communication",
+        "energy": "low",
+        "location": "anywhere",
+        "requires": [
+          "computer",
+          "internet"
+        ]
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-next-weekday",
+    "utterance": "Add task buy new water filter for next Wednesday",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Buy new water filter",
+      "due": "2026-08-19",
+      "metadata": {
+        "complexity": "low",
+        "context": [
+          "home"
+        ],
+        "duration_minutes": 15,
+        "effort_type": "physical",
+        "energy": "medium",
+        "location": "home",
+        "requires": [
+          "equipment"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-relative-week",
+    "utterance": "Add task call builder in two weeks",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Call builder",
+      "due": "2026-08-27",
+      "metadata": {
+        "can_do_while": [
+          "driving",
+          "commuting"
+        ],
+        "complexity": "low",
+        "context": [
+          "phone"
+        ],
+        "duration_minutes": 20,
+        "effort_type": "communication",
+        "energy": "low",
+        "location": "anywhere",
+        "requires": [
+          "phone"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-labeled-title-body",
+    "utterance": "Add task: Call FUSD about Nysha waitlist Notes: Ask for the right contact and next steps.",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Call FUSD about Nysha waitlist",
+      "notes": "Ask for the right contact and next steps.",
+      "metadata": {
+        "can_do_while": [
+          "driving",
+          "commuting"
+        ],
+        "complexity": "low",
+        "context": [
+          "phone"
+        ],
+        "duration_minutes": 20,
+        "effort_type": "communication",
+        "energy": "low",
+        "location": "anywhere",
+        "requires": [
+          "phone"
+        ]
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-home-low-energy",
+    "utterance": "Add task clean the garage for 30 mins low energy",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Clean the garage",
+      "metadata": {
+        "complexity": "low",
+        "context": [
+          "home"
+        ],
+        "duration_minutes": 30,
+        "effort_type": "physical",
+        "energy": "low",
+        "location": "home",
+        "requires": [
+          "equipment"
+        ]
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-owner-mom",
+    "utterance": "Add task order birthday cake due Friday. Owner: mom",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Order birthday cake",
+      "due": "2026-08-14",
+      "metadata": {
+        "complexity": "medium",
+        "duration_minutes": 30,
+        "effort_type": "admin",
+        "energy": "medium",
+        "location": "anywhere",
+        "owner": "mom",
+        "requires": [
+          "computer",
+          "internet"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-both-owners",
+    "utterance": "Add task plan Navya birthday menu this weekend owner both",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Plan Navya birthday menu",
+      "due": "2026-08-15",
+      "metadata": {
+        "effort_type": "cognitive",
+        "owner": "both",
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-recommend-driving",
+    "utterance": "What tasks can I do while driving?",
+    "expected_route": "tasks",
+    "expected_action": "recommend_tasks",
+    "expected_slots": {
+      "filters": {
+        "context": [
+          "car",
+          "phone"
+        ],
+        "can_do_while": [
+          "driving"
+        ],
+        "available_resources": [
+          "phone",
+          "car"
+        ],
+        "unavailable_resources": [
+          "computer",
+          "paperwork",
+          "equipment",
+          "quiet",
+          "focus"
+        ],
+        "available_context": [
+          "car",
+          "phone"
+        ]
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-recommend-tag-finance",
+    "utterance": "list my tasks for tag finance",
+    "expected_route": "tasks",
+    "expected_action": "recommend_tasks",
+    "expected_slots": {
+      "filters": {
+        "tags": [
+          "finance"
+        ]
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-recommend-owner-dad",
+    "utterance": "show dad tasks due today",
+    "expected_route": "tasks",
+    "expected_action": "recommend_tasks",
+    "expected_slots": {
+      "filters": {
+        "owner": "dad",
+        "due_min": "2026-08-13T00:00:00-07:00",
+        "due_max": "2026-08-13T23:59:59.999999-07:00"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-recommend-low-energy",
+    "utterance": "what low energy tasks can I do on my phone?",
+    "expected_route": "tasks",
+    "expected_action": "recommend_tasks",
+    "expected_slots": {
+      "filters": {
+        "energy": "low",
+        "context": [
+          "phone"
+        ],
+        "available_resources": [
+          "phone"
+        ],
+        "effort_type": "communication",
+        "available_context": [
+          "phone"
+        ],
+        "preferred_effort_type": "communication"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-recommend-paperwork",
+    "utterance": "show paperwork tasks I can do on the laptop",
+    "expected_route": "tasks",
+    "expected_action": "recommend_tasks",
+    "expected_slots": {
+      "filters": {
+        "context": [
+          "computer"
+        ],
+        "effort_type": "paperwork",
+        "available_resources": [
+          "computer",
+          "focus",
+          "internet",
+          "paperwork",
+          "phone"
+        ],
+        "available_context": [
+          "computer"
+        ],
+        "preferred_effort_type": "paperwork"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-complete-query",
+    "utterance": "/task complete water filter",
+    "expected_route": "tasks",
+    "expected_action": "complete_task",
+    "expected_slots": {
+      "query": "water filter"
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-delete-query",
+    "utterance": "/task delete old solar quote follow up",
+    "expected_route": "tasks",
+    "expected_action": "delete_task",
+    "expected_slots": {
+      "query": "old solar quote follow up"
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-run-assistant-help",
+    "utterance": "Run Noah assistant help",
+    "expected_route": "tasks",
+    "expected_action": "run_assistant_help",
+    "expected_slots": {},
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-shopping-not-cart",
+    "utterance": "Add task buy Costco diapers tomorrow",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Buy Costco diapers",
+      "due": "2026-08-14",
+      "metadata": {
+        "context": [
+          "errand"
+        ],
+        "effort_type": "errand",
+        "location": "outside",
+        "requires": [
+          "car"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-online-order",
+    "utterance": "Add task order replacement lunchbox online tonight",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Order replacement lunchbox online",
+      "due": "2026-08-13",
+      "metadata": {
+        "complexity": "medium",
+        "context": [
+          "computer"
+        ],
+        "duration_minutes": 30,
+        "effort_type": "admin",
+        "energy": "medium",
+        "location": "anywhere",
+        "requires": [
+          "computer",
+          "internet"
+        ]
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-grandmom-owner",
+    "utterance": "Add task text Dadi about medicine refill next Tuesday",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Text Dadi about medicine refill",
+      "due": "2026-08-18",
+      "metadata": {
+        "can_do_while": [
+          "driving",
+          "commuting"
+        ],
+        "complexity": "low",
+        "context": [
+          "phone"
+        ],
+        "duration_minutes": 20,
+        "effort_type": "communication",
+        "energy": "low",
+        "location": "anywhere",
+        "requires": [
+          "phone"
+        ],
+        "urgency": "medium"
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-create-focus-requirement",
+    "utterance": "Add task write teacher appreciation note, needs quiet focus",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Write teacher appreciation note",
+      "metadata": {
+        "effort_type": "cognitive",
+        "requires": [
+          "quiet",
+          "focus"
+        ]
+      }
+    },
+    "origin": "synthetic_task_api_context"
+  },
+  {
+    "case_id": "task-negative-shopping",
+    "utterance": "buy milk at Costco",
+    "expected_route": "shopping",
+    "expected_action": "add_item",
+    "expected_slots": {},
+    "origin": "synthetic_task_negative_control"
+  },
+  {
+    "case_id": "task-negative-calendar",
+    "utterance": "move dentist appointment to Friday",
+    "expected_route": "calendar",
+    "expected_action": "update_event",
+    "expected_slots": {},
+    "origin": "synthetic_task_negative_control"
+  },
+  {
+    "case_id": "task-negative-unknown",
+    "utterance": "what is the weather tomorrow",
+    "expected_route": "unknown",
+    "expected_action": "unknown",
+    "expected_slots": {},
+    "origin": "synthetic_task_negative_control"
+  }
+]

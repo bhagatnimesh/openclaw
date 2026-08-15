@@ -1,0 +1,440 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from datetime import date as Date, datetime
+import json
+from pathlib import Path
+import sqlite3
+from typing import Any, Iterator
+from uuid import uuid4
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DB_FILE = ROOT / "data" / "n4os.db"
+STATUS_VALUES = {"assigned", "in_progress", "submitted", "archived"}
+
+
+class SQLiteHomeworkProvider:
+    """SQLite source of truth for captured homework assignments and artifacts."""
+
+    def __init__(self, db_path: str | Path = DEFAULT_DB_FILE):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _ensure_schema(self) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS homework_items (
+                    id TEXT PRIMARY KEY,
+                    child TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    subject TEXT,
+                    assigned_date TEXT NOT NULL,
+                    due_date TEXT,
+                    status TEXT NOT NULL CHECK (status IN ('assigned', 'in_progress', 'submitted', 'archived')),
+                    notes TEXT,
+                    grade TEXT,
+                    week_range TEXT,
+                    daily_work TEXT,
+                    metadata_json TEXT,
+                    content_fingerprint TEXT,
+                    raw_input TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """,
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS homework_assets (
+                    id TEXT PRIMARY KEY,
+                    homework_item_id TEXT NOT NULL REFERENCES homework_items(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK (kind IN ('assignment_photo', 'submission_photo', 'ocr_text')),
+                    path TEXT,
+                    ocr_text TEXT,
+                    content_fingerprint TEXT,
+                    photo_sha256 TEXT,
+                    source TEXT NOT NULL CHECK (source IN ('telegram_text', 'telegram_voice', 'telegram_photo')),
+                    created_at TEXT NOT NULL
+                )
+                """,
+            )
+            item_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(homework_items)").fetchall()
+            }
+            if "metadata_json" not in item_columns:
+                connection.execute("ALTER TABLE homework_items ADD COLUMN metadata_json TEXT")
+            if "content_fingerprint" not in item_columns:
+                connection.execute("ALTER TABLE homework_items ADD COLUMN content_fingerprint TEXT")
+            asset_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(homework_assets)").fetchall()
+            }
+            if "content_fingerprint" not in asset_columns:
+                connection.execute("ALTER TABLE homework_assets ADD COLUMN content_fingerprint TEXT")
+            if "photo_sha256" not in asset_columns:
+                connection.execute("ALTER TABLE homework_assets ADD COLUMN photo_sha256 TEXT")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS homework_events (
+                    id TEXT PRIMARY KEY,
+                    homework_item_id TEXT NOT NULL REFERENCES homework_items(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL CHECK (event_type IN ('assigned', 'submitted', 'note')),
+                    note TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """,
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_homework_items_child_due
+                ON homework_items(child, due_date, updated_at)
+                """,
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_homework_items_fingerprint
+                ON homework_items(child, content_fingerprint)
+                """,
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_homework_assets_item
+                ON homework_assets(homework_item_id, created_at)
+                """,
+            )
+
+    def capture_assignment(
+        self,
+        *,
+        child: str,
+        title: str,
+        subject: str | None,
+        assigned_date: str | Date,
+        due_date: str | Date | None,
+        status: str = "assigned",
+        notes: str | None = None,
+        grade: str | None = None,
+        week_range: str | None = None,
+        daily_work: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        content_fingerprint: str | None = None,
+        raw_input: str,
+        source: str,
+        photo_path: str | None = None,
+        ocr_text: str | None = None,
+        photo_sha256: str | None = None,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        timestamp = created_at or datetime.now().astimezone().isoformat()
+        metadata_json = _metadata_json(metadata)
+        item = {
+            "id": uuid4().hex,
+            "child": child,
+            "title": title,
+            "subject": subject,
+            "assigned_date": _date_text(assigned_date),
+            "due_date": _date_text(due_date),
+            "status": status if status in STATUS_VALUES else "assigned",
+            "notes": notes,
+            "grade": grade,
+            "week_range": week_range,
+            "daily_work": daily_work,
+            "metadata_json": metadata_json,
+            "content_fingerprint": content_fingerprint,
+            "raw_input": raw_input,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO homework_items (
+                    id, child, title, subject, assigned_date, due_date, status,
+                    notes, grade, week_range, daily_work, metadata_json, content_fingerprint,
+                    raw_input, created_at, updated_at
+                )
+                VALUES (
+                    :id, :child, :title, :subject, :assigned_date, :due_date, :status,
+                    :notes, :grade, :week_range, :daily_work, :metadata_json, :content_fingerprint,
+                    :raw_input, :created_at, :updated_at
+                )
+                """,
+                item,
+            )
+            self._insert_event(connection, item["id"], "assigned", notes, timestamp)
+            self._insert_assets(
+                connection,
+                item["id"],
+                "assignment_photo",
+                source,
+                photo_path,
+                ocr_text,
+                timestamp,
+                content_fingerprint=content_fingerprint,
+                photo_sha256=photo_sha256,
+            )
+        return item
+
+    def attach_assignment_asset(
+        self,
+        *,
+        homework_item_id: str,
+        source: str,
+        raw_input: str,
+        photo_path: str | None = None,
+        ocr_text: str | None = None,
+        content_fingerprint: str | None = None,
+        photo_sha256: str | None = None,
+        notes: str | None = None,
+        created_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        timestamp = created_at or datetime.now().astimezone().isoformat()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM homework_items WHERE id = :id",
+                {"id": homework_item_id},
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE homework_items
+                SET updated_at = :updated_at
+                WHERE id = :id
+                """,
+                {"id": homework_item_id, "updated_at": timestamp},
+            )
+            self._insert_event(connection, homework_item_id, "note", notes or "Attached matching homework capture.", timestamp)
+            self._insert_assets(
+                connection,
+                homework_item_id,
+                "assignment_photo",
+                source,
+                photo_path,
+                ocr_text,
+                timestamp,
+                content_fingerprint=content_fingerprint,
+                photo_sha256=photo_sha256,
+            )
+            updated = connection.execute(
+                "SELECT * FROM homework_items WHERE id = :id",
+                {"id": homework_item_id},
+            ).fetchone()
+        return dict(updated) if updated is not None else None
+
+    def capture_submission(
+        self,
+        *,
+        homework_item_id: str,
+        source: str,
+        raw_input: str,
+        photo_path: str | None = None,
+        ocr_text: str | None = None,
+        content_fingerprint: str | None = None,
+        photo_sha256: str | None = None,
+        notes: str | None = None,
+        created_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        timestamp = created_at or datetime.now().astimezone().isoformat()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM homework_items WHERE id = :id",
+                {"id": homework_item_id},
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE homework_items
+                SET status = 'submitted', updated_at = :updated_at
+                WHERE id = :id
+                """,
+                {"id": homework_item_id, "updated_at": timestamp},
+            )
+            self._insert_event(connection, homework_item_id, "submitted", notes or raw_input, timestamp)
+            self._insert_assets(
+                connection,
+                homework_item_id,
+                "submission_photo",
+                source,
+                photo_path,
+                ocr_text,
+                timestamp,
+                content_fingerprint=content_fingerprint,
+                photo_sha256=photo_sha256,
+            )
+            updated = connection.execute(
+                "SELECT * FROM homework_items WHERE id = :id",
+                {"id": homework_item_id},
+            ).fetchone()
+        return dict(updated) if updated is not None else None
+
+    def list_items(
+        self,
+        *,
+        child: str | None = None,
+        statuses: tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: dict[str, Any] = {}
+        if child:
+            clauses.append("child = :child")
+            params["child"] = child
+        if statuses:
+            placeholders = []
+            for index, status in enumerate(statuses):
+                key = f"status_{index}"
+                placeholders.append(f":{key}")
+                params[key] = status
+            clauses.append(f"status IN ({', '.join(placeholders)})")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        query = (
+            "SELECT * FROM homework_items"
+            + where
+            + " ORDER BY COALESCE(due_date, '9999-12-31') ASC, updated_at DESC"
+        )
+        if limit is not None:
+            query += " LIMIT :limit"
+            params["limit"] = max(1, int(limit))
+        with self._connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_assets(self, homework_item_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM homework_assets
+                WHERE homework_item_id = :id
+                ORDER BY created_at ASC
+                """,
+                {"id": homework_item_id},
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_events(self, homework_item_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM homework_events
+                WHERE homework_item_id = :id
+                ORDER BY created_at ASC
+                """,
+                {"id": homework_item_id},
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _insert_event(
+        self,
+        connection: sqlite3.Connection,
+        item_id: str,
+        event_type: str,
+        note: str | None,
+        created_at: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO homework_events (id, homework_item_id, event_type, note, created_at)
+            VALUES (:id, :homework_item_id, :event_type, :note, :created_at)
+            """,
+            {
+                "id": uuid4().hex,
+                "homework_item_id": item_id,
+                "event_type": event_type,
+                "note": note,
+                "created_at": created_at,
+            },
+        )
+
+    def _insert_assets(
+        self,
+        connection: sqlite3.Connection,
+        item_id: str,
+        kind: str,
+        source: str,
+        photo_path: str | None,
+        ocr_text: str | None,
+        created_at: str,
+        *,
+        content_fingerprint: str | None = None,
+        photo_sha256: str | None = None,
+    ) -> None:
+        if photo_path is not None:
+            connection.execute(
+                """
+                INSERT INTO homework_assets (
+                    id, homework_item_id, kind, path, ocr_text, content_fingerprint,
+                    photo_sha256, source, created_at
+                )
+                VALUES (
+                    :id, :homework_item_id, :kind, :path, :ocr_text, :content_fingerprint,
+                    :photo_sha256, :source, :created_at
+                )
+                """,
+                {
+                    "id": uuid4().hex,
+                    "homework_item_id": item_id,
+                    "kind": kind,
+                    "path": photo_path,
+                    "ocr_text": ocr_text,
+                    "content_fingerprint": content_fingerprint,
+                    "photo_sha256": photo_sha256,
+                    "source": source,
+                    "created_at": created_at,
+                },
+            )
+        elif ocr_text is not None:
+            connection.execute(
+                """
+                INSERT INTO homework_assets (
+                    id, homework_item_id, kind, path, ocr_text, content_fingerprint,
+                    photo_sha256, source, created_at
+                )
+                VALUES (
+                    :id, :homework_item_id, 'ocr_text', NULL, :ocr_text, :content_fingerprint,
+                    :photo_sha256, :source, :created_at
+                )
+                """,
+                {
+                    "id": uuid4().hex,
+                    "homework_item_id": item_id,
+                    "ocr_text": ocr_text,
+                    "content_fingerprint": content_fingerprint,
+                    "photo_sha256": photo_sha256,
+                    "source": source,
+                    "created_at": created_at,
+                },
+            )
+
+
+def _date_text(value: str | Date | None) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat() if isinstance(value, Date) else value
+
+
+def _metadata_json(metadata: dict[str, Any] | None) -> str | None:
+    if not metadata:
+        return None
+    return json.dumps(metadata, sort_keys=True, separators=(",", ":"))

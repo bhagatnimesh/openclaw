@@ -21,12 +21,14 @@ from telegram_audio import (
 from telegram_bot import (
     ERROR_MESSAGE,
     HELP_MESSAGE,
+    HOMEWORK_PHOTO_UPLOAD_DIR,
     HOW_TO_HELP,
     READING_PHOTO_UPLOAD_DIR,
     SETUP_USER_MESSAGE,
     UNAUTHORIZED_MESSAGE,
     N4OSTelegramBot,
     TelegramConfig,
+    TelegramUndoEntry,
     TelegramSenderProfile,
     VOICE_TRANSCRIPTION_EMPTY_MESSAGE,
     VOICE_TRANSCRIPTION_FAILED_MESSAGE,
@@ -36,6 +38,7 @@ from telegram_bot import (
     VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE,
     build_application,
     load_config,
+    _conversation_key,
 )
 from claws.n4os.claw import N4OSClaw
 from n4os_capture import CaptureIngestResult, JournalEntry
@@ -71,10 +74,16 @@ class FakeUser:
         self.id = user_id
 
 
+class FakeChat:
+    def __init__(self, chat_id: int) -> None:
+        self.id = chat_id
+
+
 class FakeUpdate:
-    def __init__(self, user_id: int, message: FakeMessage) -> None:
+    def __init__(self, user_id: int, message: FakeMessage, chat_id: int | None = None) -> None:
         self.effective_user = FakeUser(user_id)
         self.effective_message = message
+        self.effective_chat = FakeChat(chat_id) if chat_id is not None else None
 
 
 class FakeClaw:
@@ -89,6 +98,46 @@ class FakeClaw:
             "intent_summary": "Route to family-tasks.",
             "confidence": 0.9,
         }
+
+
+class RecordingTasksClaw:
+    def __init__(self) -> None:
+        self.requests: list[str] = []
+        self.undo_stack: list[dict[str, str]] = []
+        self.last_result: dict[str, str] | None = None
+        self.last_created_task: dict[str, Any] | None = None
+        self.pending_action = None
+
+    def handle_pending_response(self, request: str) -> bool:
+        del request
+        return False
+
+    def add_task_from_request(self, request: str, reference_time=None) -> str:
+        del reference_time
+        self.requests.append(request)
+        self.undo_stack.append({"action": "create"})
+        self.last_result = {"status": "ok"}
+        self.last_created_task = {
+            "id": "task-123",
+            "title": "Sign up for the parent-teacher meeting",
+            "due": "2026-08-11T00:00:00.000Z",
+            "webViewLink": "https://tasks.google.com/task/task-123",
+            "_n4os_metadata": {"owner": "mom"},
+        }
+        return "Created task: Sign up for the parent-teacher meeting."
+
+
+class FakeTelegramBot:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+
+    async def send_message(self, **kwargs: Any) -> None:
+        self.messages.append(kwargs)
+
+
+class FakeContext:
+    def __init__(self) -> None:
+        self.bot = FakeTelegramBot()
 
 
 class FakeLibraryRouteClaw(N4OSClaw):
@@ -109,6 +158,7 @@ class FakeLibraryRouteClaw(N4OSClaw):
         return {
             "route": "library",
             "intent_summary": "Route to library for record_reading.",
+            "response": "Saved.",
             "confidence": 0.9,
         }
 
@@ -127,9 +177,99 @@ class FakeLibraryCheckoutRouteClaw(FakeLibraryRouteClaw):
         print("Saved this library bag with 1 book at home.")
         return {
             "route": "library",
+            "action": "record_checkout",
             "intent_summary": "Route to library for record_checkout.",
             "confidence": 0.9,
         }
+
+
+class FailedLegacyLibraryRouteClaw(FakeLibraryRouteClaw):
+    def handle_request(
+        self,
+        request: str,
+        reference_time=None,
+        source: str = "telegram_text",
+        default_owner: str | None = None,
+        photo_path: str | None = None,
+    ):
+        del reference_time, default_owner
+        self.calls.append((request, source, None, photo_path))
+        return {
+            "route": "library",
+            "action": "record_reading",
+            "response": "Reading Garden storage failed.",
+            "confidence": 0.9,
+        }
+
+
+class FakeLibraryDomainClaw:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.last_result: dict[str, str] | None = None
+
+    def record_from_request(self, request: str, **kwargs):
+        del kwargs
+        self.calls.append(("record", request))
+        self.last_result = {"status": "ok"}
+        return "Saved. Nysha's Reading Garden grew a new leaf."
+
+
+class NonDeepcopyableLibraryDomainClaw(FakeLibraryDomainClaw):
+    def __deepcopy__(self, memo):
+        del memo
+        raise TypeError("provider client cannot be deep-copied")
+
+
+class FailedLibraryDomainClaw(FakeLibraryDomainClaw):
+    def record_from_request(self, request: str, **kwargs):
+        self.calls.append(("record", request))
+        self.photo_path = kwargs.get("photo_path")
+        self.last_result = {"status": "error"}
+        return "Reading Garden storage failed."
+
+
+class FakeHomeworkClaw:
+    def __init__(self, status: str = "ok") -> None:
+        self.status = status
+        self.calls: list[tuple[str, str | None, str | None, str | None]] = []
+        self.last_result: dict[str, Any] | None = None
+        self.pending_action: dict[str, Any] | None = None
+
+    def capture_from_request(self, request: str, **kwargs):
+        self.calls.append(
+            (
+                request,
+                kwargs.get("source"),
+                kwargs.get("photo_path"),
+                kwargs.get("photo_sha256"),
+            )
+        )
+        self.last_result = {"status": self.status}
+        return "Captured homework for Nysha: All About Me - assigned, due 2026-08-21."
+
+
+class PendingHomeworkClaw(FakeHomeworkClaw):
+    def __init__(self) -> None:
+        super().__init__(status="needs_information")
+        self.pending_action = None
+
+    def capture_from_request(self, request: str, **kwargs):
+        self.calls.append(
+            (
+                request,
+                kwargs.get("source"),
+                kwargs.get("photo_path"),
+                kwargs.get("photo_sha256"),
+            )
+        )
+        if request == "cancel":
+            photo_path = self.pending_action.get("photo_path") if self.pending_action else None
+            self.pending_action = None
+            self.last_result = {"status": "ok", "data": {"cleanup_photo_path": photo_path}}
+            return "Canceled homework capture."
+        self.pending_action = {"photo_path": kwargs.get("photo_path")}
+        self.last_result = {"status": "needs_information", "data": {"pending_action": self.pending_action}}
+        return "This looks similar to an existing homework. Reply `attach`, `new`, or `cancel`."
 
 
 class FakeShoppingRouteClaw:
@@ -211,6 +351,23 @@ class FakeApplication:
 class FailingClaw:
     def handle_request(self, request: str):
         raise RuntimeError(f"boom: {request}")
+
+
+class FailingLibraryRouteClaw(N4OSClaw):
+    def __init__(self) -> None:
+        self.photo_path: str | None = None
+
+    def handle_request(
+        self,
+        request: str,
+        reference_time=None,
+        source: str = "telegram_text",
+        default_owner: str | None = None,
+        photo_path: str | None = None,
+    ):
+        del request, reference_time, source, default_owner
+        self.photo_path = photo_path
+        raise RuntimeError("library write failed")
 
 
 class PendingClarificationClaw(FakeClaw):
@@ -308,6 +465,92 @@ class QuietLogger:
 
 
 class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
+    async def test_task_assignment_notifies_other_owner_with_summary_and_link(self):
+        tasks = RecordingTasksClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(
+                token="token",
+                allowed_user_id=12345,
+                allowed_user_ids=frozenset({12345, 67890}),
+                sender_profiles=(
+                    TelegramSenderProfile(12345, "dad", "dad"),
+                    TelegramSenderProfile(67890, "mom", "mom"),
+                ),
+            ),
+            N4OSClaw(tasks_claw=tasks),
+            logger=QuietLogger(),
+        )
+        context = FakeContext()
+        message = FakeMessage(
+            "create task sign up for parent teacher meeting today owner mom"
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), context)
+
+        self.assertEqual(
+            context.bot.messages,
+            [
+                {
+                    "chat_id": 67890,
+                    "text": (
+                        "Dad assigned you a task:\n"
+                        "Sign up for the parent-teacher meeting\n"
+                        "Due: 2026-08-11\n"
+                        "Open: https://tasks.google.com/task/task-123"
+                    ),
+                }
+            ],
+        )
+
+    async def test_task_assignment_does_not_notify_assigner(self):
+        tasks = RecordingTasksClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(
+                token="token",
+                allowed_user_id=67890,
+                sender_profiles=(TelegramSenderProfile(67890, "mom", "mom"),),
+            ),
+            N4OSClaw(tasks_claw=tasks),
+            logger=QuietLogger(),
+        )
+        context = FakeContext()
+
+        await bot.handle_message(
+            FakeUpdate(67890, FakeMessage("add task sign up owner mom")),
+            context,
+        )
+
+        self.assertEqual(context.bot.messages, [])
+
+    async def test_native_router_normalizes_multiline_task_slash_command(self):
+        tasks = RecordingTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        result = bot.route_message(
+            "/task create to schedule parent teacher at learning bee owner:mom today at 5 PM\n"
+            "Details:\nDear Parents,\nAttached is our weekly schedule.\n"
+            "Please pick a time slot.",
+            claw=claw,
+        )
+
+        self.assertEqual(
+            tasks.requests,
+            [
+                "add task to schedule parent teacher at learning bee owner:mom today at 5 PM\n"
+                "Details:\nDear Parents\nAttached is our weekly schedule.\n"
+                "Please pick a time slot."
+            ],
+        )
+        self.assertIsNone(claw.pending_route_clarification)
+        self.assertEqual(
+            result.response,
+            "Created task: Sign up for the parent-teacher meeting.",
+        )
+
     async def test_missing_allowed_user_id_replies_with_setup_instruction(self):
         bot = N4OSTelegramBot(
             TelegramConfig(token="token", allowed_user_id=None),
@@ -563,7 +806,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             logger=QuietLogger(),
             image_text_extractor=extractor,
         )
-        telegram_file = FakeTelegramFile(b"book cover bytes")
+        telegram_file = FakeTelegramFile(b"checkout receipt bytes")
         message = FakeMessage(
             caption="Add to library family reading read by Dad",
             photo=[FakeTelegramPhoto(telegram_file)],
@@ -580,6 +823,120 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         stored_file = READING_PHOTO_UPLOAD_DIR / Path(photo_path).name
         self.assertFalse(stored_file.exists())
         self.assertEqual(message.replies, ["Saved this library bag with 1 book at home."])
+
+    async def test_homework_photo_capture_commits_homework_upload(self):
+        homework = FakeHomeworkClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+            image_text_extractor=FakeImageTextExtractor("Homework title: All About Me\nDue date: 2026-08-21"),
+            homework_claw=homework,
+        )
+        message = FakeMessage(
+            caption="/capture homework Nysha",
+            photo=[FakeTelegramPhoto(FakeTelegramFile(b"homework image"))],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        request, source, photo_path, photo_sha256 = homework.calls[0]
+        self.assertIn("Image text:", request)
+        self.assertEqual(source, "telegram_photo")
+        self.assertIsNotNone(photo_path)
+        self.assertEqual(
+            photo_sha256,
+            "77a4a9bdc60913709eb309dc8a66dafc8f116a9d78802dc2ba96609ef86163e7",
+        )
+        self.assertTrue(photo_path.startswith("/static/dashboard/uploads/homework/"))
+        stored_file = HOMEWORK_PHOTO_UPLOAD_DIR / Path(photo_path).name
+        try:
+            self.assertTrue(stored_file.exists())
+            self.assertEqual(stored_file.read_bytes(), b"homework image")
+        finally:
+            stored_file.unlink(missing_ok=True)
+        self.assertEqual(message.replies, ["Captured homework for Nysha: All About Me - assigned, due 2026-08-21."])
+
+    async def test_failed_homework_capture_removes_staged_photo(self):
+        homework = FakeHomeworkClaw(status="error")
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+            image_text_extractor=FakeImageTextExtractor("Homework title: All About Me"),
+            homework_claw=homework,
+        )
+        message = FakeMessage(
+            caption="/capture homework Nysha",
+            photo=[FakeTelegramPhoto(FakeTelegramFile(b"failed homework image"))],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        photo_path = homework.calls[0][2]
+        self.assertIsNotNone(photo_path)
+        self.assertFalse((HOMEWORK_PHOTO_UPLOAD_DIR / Path(photo_path).name).exists())
+        self.assertEqual(message.replies, ["Captured homework for Nysha: All About Me - assigned, due 2026-08-21."])
+
+    async def test_homework_photo_caption_routes_even_without_ocr_text(self):
+        homework = FakeHomeworkClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+            image_text_extractor=FakeImageTextExtractor(""),
+            homework_claw=homework,
+        )
+        message = FakeMessage(
+            caption="Nysha math homework due Friday",
+            photo=[FakeTelegramPhoto(FakeTelegramFile(b"homework caption image"))],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        request, source, photo_path, photo_sha256 = homework.calls[0]
+        self.assertEqual(request, "Nysha math homework due Friday")
+        self.assertEqual(source, "telegram_photo")
+        self.assertIsNotNone(photo_path)
+        self.assertEqual(
+            photo_sha256,
+            "ea7351fec4e9f206eb5a583063348b53fd05d24a66064d76b55fbacb2b1f800b",
+        )
+        stored_file = HOMEWORK_PHOTO_UPLOAD_DIR / Path(photo_path).name
+        try:
+            self.assertTrue(stored_file.exists())
+        finally:
+            stored_file.unlink(missing_ok=True)
+        self.assertEqual(message.replies, ["Captured homework for Nysha: All About Me - assigned, due 2026-08-21."])
+
+    async def test_pending_homework_duplicate_preserves_photo_until_cancel(self):
+        homework = PendingHomeworkClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+            image_text_extractor=FakeImageTextExtractor("Homework title: Second Grade Homework\nMonday: Read aloud"),
+            homework_claw=homework,
+        )
+        message = FakeMessage(
+            caption="/capture homework Nysha",
+            photo=[FakeTelegramPhoto(FakeTelegramFile(b"duplicate homework image"))],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        photo_path = homework.calls[0][2]
+        self.assertIsNotNone(photo_path)
+        stored_file = HOMEWORK_PHOTO_UPLOAD_DIR / Path(photo_path).name
+        self.assertTrue(stored_file.exists())
+        self.assertIn("Reply `attach`", message.replies[0])
+
+        cancel_message = FakeMessage("cancel")
+        await bot.handle_message(FakeUpdate(12345, cancel_message), None)
+
+        self.assertEqual(homework.calls[-1][0], "cancel")
+        self.assertFalse(stored_file.exists())
+        self.assertEqual(cancel_message.replies, ["Canceled homework capture."])
 
     async def test_authorized_slash_calendar_routes_to_n4os_as_text(self):
         claw = FakeClaw()
@@ -852,6 +1209,125 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             ["Undid Home Board add: removed 1 item(s)."],
         )
 
+    async def test_empty_undo_is_terminal(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("undo")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, ["Nothing to undo."])
+        self.assertEqual(claw.requests, [])
+
+    async def test_conversations_have_isolated_router_state(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            N4OSClaw(),
+            logger=QuietLogger(),
+        )
+
+        first = bot.sessions.get("telegram:12345")
+        first.claw.pending_route_clarification = object()
+        first.undo_stack.append(type("Undo", (), {"kind": "router"})())
+        second = bot.sessions.get("telegram:67890")
+
+        self.assertIsNot(first.claw, second.claw)
+        self.assertIsNone(second.claw.pending_route_clarification)
+        self.assertEqual(second.undo_stack, [])
+
+    async def test_session_fallback_preserves_dependencies_and_isolates_state(self):
+        library = NonDeepcopyableLibraryDomainClaw()
+        library.last_item = {"id": "prior-session-item"}
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            N4OSClaw(library_claw=library),
+            logger=QuietLogger(),
+        )
+
+        first = bot.sessions.get("telegram:12345")
+        first.claw.library_claw.calls.append(("record", "first"))
+        second = bot.sessions.get("telegram:67890")
+
+        self.assertIsNot(first.claw, second.claw)
+        self.assertIsNot(first.claw.library_claw, second.claw.library_claw)
+        self.assertEqual(second.claw.library_claw.calls, [])
+        self.assertIsNone(second.claw.library_claw.last_item)
+
+    async def test_chat_reset_clears_conversation_router_state(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            N4OSClaw(),
+            logger=QuietLogger(),
+        )
+        before = bot.sessions.get("telegram:12345")
+        before.claw.handle_request("hmm maybe later")
+        before.undo_stack.append(TelegramUndoEntry(kind="router"))
+        message = FakeMessage("/chat reset")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        after = bot.sessions.get("telegram:12345")
+        self.assertIsNot(after.claw, before.claw)
+        self.assertIsNone(after.claw.pending_route_clarification)
+        self.assertEqual(after.undo_stack, [])
+        self.assertEqual(message.replies, ["Started a new N4OS session."])
+
+    async def test_new_session_command_resets_only_current_conversation(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            N4OSClaw(),
+            logger=QuietLogger(),
+        )
+        current = bot.sessions.get("telegram:12345")
+        current.claw.handle_request("hmm maybe later")
+        current.undo_stack.append(TelegramUndoEntry(kind="router"))
+        other = bot.sessions.get("telegram:67890")
+        other.claw.handle_request("hmm maybe later")
+        other.undo_stack.append(TelegramUndoEntry(kind="router"))
+        message = FakeMessage("/new")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        reset = bot.sessions.get("telegram:12345")
+        unchanged = bot.sessions.get("telegram:67890")
+        self.assertIsNot(reset.claw, current.claw)
+        self.assertIsNone(reset.claw.pending_route_clarification)
+        self.assertEqual(reset.undo_stack, [])
+        self.assertIs(unchanged.claw, other.claw)
+        self.assertIsNotNone(unchanged.claw.pending_route_clarification)
+        self.assertEqual(len(unchanged.undo_stack), 1)
+        self.assertEqual(message.replies, ["Started a new N4OS session."])
+
+    async def test_reset_command_starts_new_session(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            N4OSClaw(),
+            logger=QuietLogger(),
+        )
+        before = bot.sessions.get("telegram:12345")
+        before.claw.handle_request("hmm maybe later")
+        before.undo_stack.append(TelegramUndoEntry(kind="router"))
+        message = FakeMessage("/reset")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        after = bot.sessions.get("telegram:12345")
+        self.assertIsNot(after.claw, before.claw)
+        self.assertIsNone(after.claw.pending_route_clarification)
+        self.assertEqual(after.undo_stack, [])
+        self.assertEqual(message.replies, ["Started a new N4OS session."])
+
+    async def test_group_conversation_key_includes_sender(self):
+        first = FakeUpdate(12345, FakeMessage("one"), chat_id=-100)
+        second = FakeUpdate(67890, FakeMessage("two"), chat_id=-100)
+
+        self.assertEqual(_conversation_key(first, 12345), "telegram:-100:12345")
+        self.assertEqual(_conversation_key(second, 67890), "telegram:-100:67890")
+
     async def test_authorized_memory_status_reports_without_routing_or_capture(self):
         claw = FakeClaw()
         bot = N4OSTelegramBot(
@@ -930,6 +1406,680 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
                 f"2. {(today - date.resolution).isoformat()}: Nimesh"
             ],
         )
+
+    async def test_authorized_generic_memory_query_reads_matching_structured_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            query = FakeMessage("What is the learning code?")
+
+            await bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(query.replies, ["Remembered note: learning code 0816\nSource: Telegram."])
+
+    async def test_undo_after_structured_remember_deletes_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            remember = FakeMessage("/remember learning code 0816")
+            undo = FakeMessage("Undo")
+            query = FakeMessage("What is the learning code?")
+
+            await bot.handle_message(FakeUpdate(12345, remember), None)
+            await bot.handle_message(FakeUpdate(12345, undo), None)
+            await bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(claw.requests, ["What is the learning code?"])
+        self.assertEqual(remember.replies, ["Remembered. Structured note saved."])
+        self.assertEqual(undo.replies, ["Undid remembered memory: learning code 0816."])
+        self.assertEqual(query.replies, ["router replied to: What is the learning code?"])
+
+    async def test_authorized_forget_structured_memory_removes_matching_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            forget = FakeMessage("forget learning code")
+            query = FakeMessage("What is the learning code?")
+
+            await bot.handle_message(FakeUpdate(12345, forget), None)
+            await bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(claw.requests, ["What is the learning code?"])
+        self.assertEqual(forget.replies, ["Forgot structured memory: learning code 0816."])
+        self.assertEqual(query.replies, ["router replied to: What is the learning code?"])
+
+    async def test_undo_after_forget_restores_structured_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            forget = FakeMessage("forget learning code")
+            undo = FakeMessage("Undo")
+            query = FakeMessage("What is the learning code?")
+
+            await bot.handle_message(FakeUpdate(12345, forget), None)
+            await bot.handle_message(FakeUpdate(12345, undo), None)
+            await bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(undo.replies, ["Restored structured memory: learning code 0816."])
+        self.assertEqual(query.replies, ["Remembered note: learning code 0816\nSource: Telegram."])
+
+    async def test_undo_after_forget_does_not_restore_over_recreated_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            first_claw = FakeClaw()
+            second_claw = FakeClaw()
+            first_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                first_claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            second_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=67890),
+                second_claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("forget learning code")),
+                None,
+            )
+            await second_bot.handle_message(
+                FakeUpdate(67890, FakeMessage("/remember learning code 2222")),
+                None,
+            )
+            undo = FakeMessage("Undo")
+            query = FakeMessage("What is the learning code?")
+
+            await first_bot.handle_message(FakeUpdate(12345, undo), None)
+            await first_bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(
+            undo.replies,
+            ["That structured memory changed after this action, so I did not undo it."],
+        )
+        self.assertEqual(query.replies, ["Remembered note: learning code 2222\nSource: Telegram."])
+
+    async def test_refused_structured_memory_undo_keeps_undo_entry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            first_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            second_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=67890),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("forget learning code")),
+                None,
+            )
+            await second_bot.handle_message(
+                FakeUpdate(67890, FakeMessage("/remember learning code 2222")),
+                None,
+            )
+            first_undo = FakeMessage("Undo")
+            second_undo = FakeMessage("Undo")
+
+            await first_bot.handle_message(FakeUpdate(12345, first_undo), None)
+            await first_bot.handle_message(FakeUpdate(12345, second_undo), None)
+
+        self.assertEqual(
+            first_undo.replies,
+            ["That structured memory changed after this action, so I did not undo it."],
+        )
+        self.assertEqual(
+            second_undo.replies,
+            ["That structured memory changed after this action, so I did not undo it."],
+        )
+
+    async def test_undo_after_forget_restores_when_new_memory_has_extra_qualifier(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            first_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            second_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=67890),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("forget learning code")),
+                None,
+            )
+            await second_bot.handle_message(
+                FakeUpdate(67890, FakeMessage("/remember math learning code 2222")),
+                None,
+            )
+            undo = FakeMessage("Undo")
+            query = FakeMessage("What is the learning code?")
+
+            await first_bot.handle_message(FakeUpdate(12345, undo), None)
+            await first_bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(undo.replies, ["Restored structured memory: learning code 0816."])
+        self.assertEqual(
+            query.replies,
+            [
+                "I found multiple matching structured memories. Ask with more detail:\n"
+                "1. math learning code 2222\n"
+                "2. learning code 0816"
+            ],
+        )
+
+    async def test_undo_after_forget_restores_when_new_memory_has_trailing_extra_qualifier(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            first_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            second_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=67890),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("forget learning code")),
+                None,
+            )
+            await second_bot.handle_message(
+                FakeUpdate(67890, FakeMessage("/remember learning code for math 2222")),
+                None,
+            )
+            undo = FakeMessage("Undo")
+            query = FakeMessage("What is the learning code?")
+
+            await first_bot.handle_message(FakeUpdate(12345, undo), None)
+            await first_bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(undo.replies, ["Restored structured memory: learning code 0816."])
+        self.assertEqual(
+            query.replies,
+            [
+                "I found multiple matching structured memories. Ask with more detail:\n"
+                "1. learning code for math 2222\n"
+                "2. learning code 0816"
+            ],
+        )
+
+    async def test_structured_memory_undo_wins_over_unrelated_pending_domain(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            claw.tasks_claw = type("PendingTasks", (), {"pending_action": object()})()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            undo = FakeMessage("Undo")
+            query = FakeMessage("What is the learning code?")
+
+            await bot.handle_message(FakeUpdate(12345, undo), None)
+            await bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(undo.replies, ["Undid remembered memory: learning code 0816."])
+        self.assertEqual(claw.requests, ["What is the learning code?"])
+        self.assertEqual(query.replies, ["router replied to: What is the learning code?"])
+
+    async def test_undo_after_forget_does_not_restore_over_recreated_freeform_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            first_claw = FakeClaw()
+            second_claw = FakeClaw()
+            first_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                first_claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            second_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=67890),
+                second_claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember Navya is allergic to cashews")),
+                None,
+            )
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("forget Navya allergy")),
+                None,
+            )
+            await second_bot.handle_message(
+                FakeUpdate(67890, FakeMessage("/remember Navya is allergic to peanuts")),
+                None,
+            )
+            undo = FakeMessage("Undo")
+            query = FakeMessage("What do you remember about Navya allergy?")
+
+            await first_bot.handle_message(FakeUpdate(12345, undo), None)
+            await first_bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(
+            undo.replies,
+            ["That structured memory changed after this action, so I did not undo it."],
+        )
+        self.assertEqual(query.replies, ["Remembered note: Navya is allergic to peanuts\nSource: Telegram."])
+
+    async def test_authorized_update_structured_memory_replaces_matching_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            update = FakeMessage("update learning code to 9911")
+            query = FakeMessage("What is the learning code?")
+
+            await bot.handle_message(FakeUpdate(12345, update), None)
+            await bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(update.replies, ["Updated structured memory: learning code 9911."])
+        self.assertEqual(query.replies, ["Remembered note: learning code 9911\nSource: Telegram."])
+
+    async def test_undo_after_update_restores_previous_structured_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            update = FakeMessage("update learning code to 9911")
+            undo = FakeMessage("Undo")
+            query = FakeMessage("What is the learning code?")
+
+            await bot.handle_message(FakeUpdate(12345, update), None)
+            await bot.handle_message(FakeUpdate(12345, undo), None)
+            await bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(undo.replies, ["Restored structured memory: learning code 0816."])
+        self.assertEqual(query.replies, ["Remembered note: learning code 0816\nSource: Telegram."])
+
+    async def test_undo_after_update_does_not_overwrite_newer_memory_change(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            first_claw = FakeClaw()
+            second_claw = FakeClaw()
+            first_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                first_claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            second_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=67890),
+                second_claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("update learning code to 9911")),
+                None,
+            )
+            await second_bot.handle_message(
+                FakeUpdate(67890, FakeMessage("update learning code to 2222")),
+                None,
+            )
+            undo = FakeMessage("Undo")
+            query = FakeMessage("What is the learning code?")
+
+            await first_bot.handle_message(FakeUpdate(12345, undo), None)
+            await first_bot.handle_message(FakeUpdate(12345, query), None)
+
+        self.assertEqual(
+            undo.replies,
+            ["That structured memory changed after this action, so I did not undo it."],
+        )
+        self.assertEqual(query.replies, ["Remembered note: learning code 2222\nSource: Telegram."])
+
+    async def test_undo_after_update_does_not_restore_over_new_conflicting_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            first_claw = FakeClaw()
+            second_claw = FakeClaw()
+            first_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                first_claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            second_bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=67890),
+                second_claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            await first_bot.handle_message(
+                FakeUpdate(12345, FakeMessage("update learning code to 9911")),
+                None,
+            )
+            await second_bot.handle_message(
+                FakeUpdate(67890, FakeMessage("/remember learning code 2222")),
+                None,
+            )
+            undo = FakeMessage("Undo")
+
+            await first_bot.handle_message(FakeUpdate(12345, undo), None)
+
+        self.assertEqual(
+            undo.replies,
+            ["That structured memory changed after this action, so I did not undo it."],
+        )
+
+    async def test_active_chat_followup_skips_structured_memory_probe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            bot.chat_sessions.append(
+                "telegram:12345",
+                user_text="topic",
+                assistant_text="answer",
+            )
+            followup = FakeMessage("What is the learning code?")
+
+            with patch(
+                "telegram_bot.format_n4os_chat",
+                return_value=N4OSChatResult("chat answer", ["SOUL"], "gpt-5.4-mini"),
+            ) as chat, patch("telegram_bot.record_n4os_trajectory"):
+                await bot.handle_message(FakeUpdate(12345, followup), None)
+
+        chat.assert_called_once()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(followup.replies, ["chat answer"])
+
+    async def test_active_chat_allows_explicit_structured_memory_lookup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            bot.chat_sessions.append(
+                "telegram:12345",
+                user_text="topic",
+                assistant_text="answer",
+            )
+            lookup = FakeMessage("find memory learning code")
+
+            with patch("telegram_bot.format_n4os_chat") as chat:
+                await bot.handle_message(FakeUpdate(12345, lookup), None)
+
+        chat.assert_not_called()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(lookup.replies, ["Remembered note: learning code 0816\nSource: Telegram."])
+
+    async def test_explicit_structured_memory_lookup_miss_does_not_fall_through_to_router(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        lookup = FakeMessage("find remembered memory passport")
+
+        await bot.handle_message(FakeUpdate(12345, lookup), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(
+            lookup.replies,
+            ["I do not have a structured memory matching that yet. Use /remember to save it."],
+        )
+
+    async def test_plain_structured_memory_lookup_keeps_specificity_guard(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember Navya passport appointment confirmation is PX92")),
+                None,
+            )
+            lookup = FakeMessage("show me memory passport")
+
+            await bot.handle_message(FakeUpdate(12345, lookup), None)
+
+        self.assertEqual(claw.requests, ["show me memory passport"])
+        self.assertEqual(lookup.replies, ["router replied to: show me memory passport"])
+
+    async def test_broad_memory_like_phrases_fall_through_to_router(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        usage = FakeMessage("show memory usage")
+        notes_app = FakeMessage("find notes app")
+
+        await bot.handle_message(FakeUpdate(12345, usage), None)
+        await bot.handle_message(FakeUpdate(12345, notes_app), None)
+
+        self.assertEqual(claw.requests, ["show memory usage", "find notes app"])
+        self.assertEqual(usage.replies, ["router replied to: show memory usage"])
+        self.assertEqual(notes_app.replies, ["router replied to: find notes app"])
+
+    async def test_active_chat_explicit_structured_memory_lookup_miss_does_not_continue_chat(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        bot.chat_sessions.append(
+            "telegram:12345",
+            user_text="topic",
+            assistant_text="answer",
+        )
+        lookup = FakeMessage("find remembered memory passport")
+
+        with patch("telegram_bot.format_n4os_chat") as chat:
+            await bot.handle_message(FakeUpdate(12345, lookup), None)
+
+        chat.assert_not_called()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(
+            lookup.replies,
+            ["I do not have a structured memory matching that yet. Use /remember to save it."],
+        )
+
+    async def test_active_chat_allows_matching_remember_about_probe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember Navya is allergic to cashews")),
+                None,
+            )
+            bot.chat_sessions.append(
+                "telegram:12345",
+                user_text="topic",
+                assistant_text="answer",
+            )
+            lookup = FakeMessage("What do you remember about Navya allergy?")
+
+            with patch("telegram_bot.format_n4os_chat") as chat:
+                await bot.handle_message(FakeUpdate(12345, lookup), None)
+
+        chat.assert_not_called()
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(lookup.replies, ["Remembered note: Navya is allergic to cashews\nSource: Telegram."])
+
+    async def test_authorized_generic_memory_probe_errors_fall_through_to_router(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("What is the learning code?")
+
+        with patch("telegram_bot.has_structured_memory_query_match", side_effect=OSError("db")):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, ["What is the learning code?"])
+        self.assertEqual(message.replies, ["router replied to: What is the learning code?"])
 
     async def test_authorized_status_target_reports_without_routing(self):
         claw = FakeClaw()
@@ -1175,6 +2325,56 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(claw.requests, ["Add task buy milk"])
         self.assertEqual(message.replies, ["router replied to: Add task buy milk"])
+
+    async def test_high_confidence_natural_action_interrupts_active_chat(self):
+        library = FakeLibraryDomainClaw()
+        claw = N4OSClaw(library_claw=library)
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        bot.chat_sessions.append(
+            "telegram:12345",
+            user_text="topic",
+            assistant_text="answer",
+        )
+        message = FakeMessage("Nysha read 8 pages")
+
+        with patch("telegram_bot.format_n4os_chat") as chat:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        chat.assert_not_called()
+        self.assertEqual(library.calls[0][0], "record")
+        self.assertIn("Reading Garden", message.replies[0])
+
+    async def test_active_chat_ignores_stale_router_followup_context(self):
+        claw = N4OSClaw()
+        claw.route_context.last_route = "decisions"
+        claw.route_context.last_action = "create_decision"
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        bot.chat_sessions.append(
+            "telegram:12345",
+            user_text="topic",
+            assistant_text="answer",
+        )
+        message = FakeMessage("status")
+
+        with (
+            patch(
+                "telegram_bot.format_n4os_chat",
+                return_value=N4OSChatResult("chat status reply", ["SOUL"], "gpt-5.4-mini"),
+            ) as chat,
+            patch("telegram_bot.record_n4os_trajectory"),
+        ):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        chat.assert_called_once()
+        self.assertEqual(message.replies, ["chat status reply"])
 
     async def test_long_chat_reply_is_chunked(self):
         claw = FakeClaw()
@@ -1750,6 +2950,71 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         await bot.handle_message(FakeUpdate(12345, message), None)
 
         self.assertEqual(message.replies, [ERROR_MESSAGE])
+
+    async def test_failed_library_write_does_not_commit_photo(self):
+        claw = FailingLibraryRouteClaw()
+        extractor = FakeImageTextExtractor("Book title: unique failed upload")
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            image_text_extractor=extractor,
+        )
+        message = FakeMessage(
+            caption="Nysha read this",
+            photo=[FakeTelegramPhoto(FakeTelegramFile(b"unique failed library upload"))],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [ERROR_MESSAGE])
+        self.assertIsNotNone(claw.photo_path)
+        stored_file = READING_PHOTO_UPLOAD_DIR / Path(claw.photo_path).name
+        self.assertFalse(stored_file.exists())
+        self.assertTrue(all(not path.exists() for path in extractor.paths))
+
+    async def test_returned_library_storage_error_does_not_commit_photo(self):
+        library = FailedLibraryDomainClaw()
+        claw = N4OSClaw(library_claw=library)
+        extractor = FakeImageTextExtractor("Book title: failed result upload")
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            image_text_extractor=extractor,
+        )
+        message = FakeMessage(
+            caption="Nysha read this",
+            photo=[FakeTelegramPhoto(FakeTelegramFile(b"failed result library upload"))],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, ["Reading Garden storage failed."])
+        self.assertTrue(all(not path.exists() for path in extractor.paths))
+        self.assertIsNotNone(library.photo_path)
+        self.assertFalse((READING_PHOTO_UPLOAD_DIR / Path(library.photo_path).name).exists())
+
+    async def test_wrapped_library_failure_does_not_commit_photo(self):
+        claw = FailedLegacyLibraryRouteClaw()
+        extractor = FakeImageTextExtractor("Book title: wrapped failed upload")
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            image_text_extractor=extractor,
+        )
+        message = FakeMessage(
+            caption="Nysha read this",
+            photo=[FakeTelegramPhoto(FakeTelegramFile(b"wrapped failed library upload"))],
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, ["Reading Garden storage failed."])
+        photo_path = claw.calls[0][3]
+        self.assertIsNotNone(photo_path)
+        self.assertFalse((READING_PHOTO_UPLOAD_DIR / Path(photo_path).name).exists())
 
 
 class TelegramConfigTest(unittest.TestCase):

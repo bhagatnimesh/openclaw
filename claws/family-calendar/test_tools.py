@@ -7,6 +7,7 @@ class FakeProvider:
     def __init__(self):
         self.created = []
         self.deleted = []
+        self.updated = []
         self.events = [{"id": "event-1", "summary": "Dinner"}]
 
     def create_event(
@@ -18,16 +19,28 @@ class FakeProvider:
         description=None,
         location=None,
         recurrence=None,
+        attendees=None,
         private_extended_properties=None,
+        calendar_name=None,
+        notify_attendees=False,
+        all_day=False,
+        event_label_background_color=None,
     ):
+        start = {"date": start_time} if all_day else {"dateTime": start_time, "timeZone": timezone}
+        end = {"date": end_time} if all_day else {"dateTime": end_time, "timeZone": timezone}
         event = {
             "id": "created-1",
             "summary": title,
-            "start": {"dateTime": start_time, "timeZone": timezone},
-            "end": {"dateTime": end_time, "timeZone": timezone},
+            "start": start,
+            "end": end,
             "description": description,
             "location": location,
             "recurrence": recurrence,
+            "attendees": attendees,
+            "calendarName": calendar_name,
+            "notify_attendees": notify_attendees,
+            "all_day": all_day,
+            "event_label_background_color": event_label_background_color,
         }
         if private_extended_properties:
             event["extendedProperties"] = {
@@ -39,8 +52,41 @@ class FakeProvider:
     def list_events(self, time_min, time_max, max_results=10):
         return self.events[:max_results]
 
-    def delete_event(self, event_id):
+    def get_event(self, event_id, calendar_id=None):
+        return next(event for event in self.events if event["id"] == event_id)
+
+    def delete_event(self, event_id, calendar_id=None):
         self.deleted.append(event_id)
+
+    def update_event(
+        self,
+        event_id,
+        title,
+        start_time,
+        end_time,
+        timezone=DEFAULT_TIMEZONE,
+        description=None,
+        location=None,
+        attendees=None,
+        private_extended_properties=None,
+        calendar_id=None,
+        notify_attendees=False,
+    ):
+        self.updated.append(
+            {
+                "event_id": event_id,
+                "attendees": attendees,
+                "calendar_id": calendar_id,
+                "notify_attendees": notify_attendees,
+            }
+        )
+        return {
+            "id": event_id,
+            "summary": title,
+            "attendees": attendees,
+            "calendarId": calendar_id,
+            "notify_attendees": notify_attendees,
+        }
 
 
 class FailingProvider(FakeProvider):
@@ -54,7 +100,13 @@ class FailingProvider(FakeProvider):
     def list_events(self, *args, **kwargs):
         raise self.error
 
+    def get_event(self, *args, **kwargs):
+        raise self.error
+
     def delete_event(self, *args, **kwargs):
+        raise self.error
+
+    def update_event(self, *args, **kwargs):
         raise self.error
 
 
@@ -80,6 +132,48 @@ class CalendarToolsTest(unittest.TestCase):
         self.assertEqual(response["status"], "ok")
         self.assertEqual(provider.created[0]["start"]["timeZone"], DEFAULT_TIMEZONE)
 
+    def test_create_calendar_event_passes_attendees(self):
+        provider = FakeProvider()
+
+        response = CalendarTools(provider).create_calendar_event(
+            title="Dentist",
+            start_time="2026-08-29T12:20:00-07:00",
+            end_time="2026-08-29T13:20:00-07:00",
+            attendees=[{"email": "dad@example.test", "displayName": "Dad"}],
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(
+            provider.created[0]["attendees"],
+            [{"email": "dad@example.test", "displayName": "Dad"}],
+        )
+
+    def test_create_calendar_event_passes_target_calendar_name(self):
+        provider = FakeProvider()
+
+        response = CalendarTools(provider).create_calendar_event(
+            title="Art class",
+            start_time="2026-08-15T10:00:00-07:00",
+            end_time="2026-08-15T11:00:00-07:00",
+            calendar_name="Nysha school calendar",
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(provider.created[0]["calendarName"], "Nysha school calendar")
+
+    def test_create_calendar_event_passes_event_label_color(self):
+        provider = FakeProvider()
+
+        response = CalendarTools(provider).create_calendar_event(
+            title="Homework due",
+            start_time="2026-08-28T07:00:00-07:00",
+            end_time="2026-08-28T07:30:00-07:00",
+            event_label_background_color="#d81b60",
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(provider.created[0]["event_label_background_color"], "#d81b60")
+
     def test_list_calendar_events_returns_provider_events(self):
         tools = CalendarTools(FakeProvider())
 
@@ -93,6 +187,26 @@ class CalendarToolsTest(unittest.TestCase):
             response["data"]["events"],
             [{"id": "event-1", "summary": "Dinner"}],
         )
+
+    def test_get_calendar_event_returns_exact_provider_event(self):
+        response = CalendarTools(FakeProvider()).get_calendar_event("event-1")
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["event"]["id"], "event-1")
+
+    def test_update_calendar_event_does_not_notify_attendees_by_default(self):
+        provider = FakeProvider()
+
+        response = CalendarTools(provider).update_calendar_event(
+            event_id="event-1",
+            title="Dinner",
+            start_time="2026-07-02T19:00:00-07:00",
+            end_time="2026-07-02T20:00:00-07:00",
+            attendees=[{"email": "friend@example.com"}],
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertFalse(provider.updated[0]["notify_attendees"])
 
     def test_delete_calendar_event_requires_event_id(self):
         tools = CalendarTools(FakeProvider())

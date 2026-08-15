@@ -578,7 +578,11 @@ class LibraryTools:
         intent = extract_intent(request, now=now, source=source, photo_path=photo_path)
         action = intent.get("intent")
         if action == "status":
-            return self.status(now=now)
+            children = intent.get("children") or []
+            return self.status(
+                now=now,
+                child=str(children[0]) if len(children) == 1 else None,
+            )
         if action == "record_checkout":
             return self.record_checkout(request, now=now, source=source)
         if action == "update_reading":
@@ -804,7 +808,12 @@ class LibraryTools:
             "data": {"visit": visit},
         }
 
-    def status(self, *, now: datetime | None = None) -> ToolResponse:
+    def status(
+        self,
+        *,
+        now: datetime | None = None,
+        child: str | None = None,
+    ) -> ToolResponse:
         today = (now or datetime.now().astimezone()).date()
         try:
             events = self.provider.list_events(limit=500)
@@ -812,15 +821,25 @@ class LibraryTools:
         except Exception as error:
             return _error_response(error)
         summary = build_summary(events, today, latest_visit)
-        label = summary["today"]["label"]
-        week = summary["week"]
+        selected = summary
+        if child:
+            child_summary = summary["by_child"].get(child)
+            if child_summary is None:
+                return {
+                    "status": "needs_information",
+                    "message": f"I do not have a Reading Garden for {child}.",
+                    "data": {"child": child},
+                }
+            selected = child_summary
+        label = selected["today"]["label"]
+        week = selected["week"]
         return {
             "status": "ok",
             "message": (
                 f"{label}. This week: {week['reading_moments']} reading moments, "
                 f"{week['pages']} pages, {week['minutes']} minutes."
             ),
-            "data": {"summary": summary},
+            "data": {"summary": summary, "selected_child": child},
         }
 
 

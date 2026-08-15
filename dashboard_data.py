@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 import re
+import sqlite3
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -22,6 +25,25 @@ SHOPPING_LIST_LABELS = {
     "amazon": "Amazon",
     "others": "Others",
 }
+ROOT = Path(__file__).resolve().parent
+BEDTIME_ROUTINE_DB_FILE = ROOT / "data" / "n4os.db"
+BEDTIME_ROUTINE_DAYS = {6, 0, 1, 2, 3}
+BEDTIME_ROUTINE_STEPS = [
+    {
+        "id": "dinner-close",
+        "label": "Dinner close",
+        "time": "19:05",
+        "voice": "Dinner close. Five minutes to upstairs launch.",
+        "detail": "Last bites, cleanup, and transition.",
+    },
+    {
+        "id": "upstairs-launch",
+        "label": "Upstairs launch",
+        "time": "19:15",
+        "voice": "Upstairs launch. Nysha can pick reading or game score. Navya gets chitchat.",
+        "detail": "Nysha: reading or game score. Navya: chitchat.",
+    },
+]
 
 
 def _local_now(now: datetime | None = None) -> datetime:
@@ -462,9 +484,9 @@ def _home_board_context_label(context: str | None) -> str:
     return labels.get(context or "general", "General")
 
 
-def _home_board_today(
+def _home_board_items(
     sources: DashboardSources,
-    today: date,
+    item_date: date,
     now: datetime,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     tools = getattr(sources, "home_board_tools", None)
@@ -473,7 +495,7 @@ def _home_board_today(
 
     try:
         response = tools.list_items(
-            date=today.isoformat(),
+            date=item_date.isoformat(),
             status="pending",
             include_expired=False,
             now=now,
@@ -502,6 +524,134 @@ def _home_board_today(
             },
         )
     return items, []
+
+
+def _home_board_for_portal(
+    sources: DashboardSources,
+    today: date,
+    now: datetime,
+) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    tomorrow = today + timedelta(days=1)
+    today_items, today_warnings = _home_board_items(sources, today, now)
+    tomorrow_items, tomorrow_warnings = _home_board_items(sources, tomorrow, now)
+    return {"today": today_items, "tomorrow": tomorrow_items}, [*today_warnings, *tomorrow_warnings]
+
+
+def _bedtime_routine_enabled(today: date) -> bool:
+    return today.weekday() in BEDTIME_ROUTINE_DAYS
+
+
+def _ensure_bedtime_routine_schema(db_path: Path = BEDTIME_ROUTINE_DB_FILE) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bedtime_routine_acks (
+                date TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                acked_at TEXT NOT NULL,
+                PRIMARY KEY (date, step_id)
+            )
+            """,
+        )
+        connection.commit()
+
+
+def _read_bedtime_routine_acks(
+    today: date,
+    *,
+    db_path: Path = BEDTIME_ROUTINE_DB_FILE,
+) -> dict[str, str]:
+    _ensure_bedtime_routine_schema(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT step_id, acked_at
+            FROM bedtime_routine_acks
+            WHERE date = :date
+            """,
+            {"date": today.isoformat()},
+        ).fetchall()
+    return {str(step_id): str(acked_at) for step_id, acked_at in rows}
+
+
+def _bedtime_routine_summary(
+    now: datetime,
+    *,
+    db_path: Path = BEDTIME_ROUTINE_DB_FILE,
+) -> dict[str, Any]:
+    today = now.date()
+    enabled = _bedtime_routine_enabled(today)
+    acks = _read_bedtime_routine_acks(today, db_path=db_path) if enabled else {}
+    steps = []
+    for step in BEDTIME_ROUTINE_STEPS:
+        acked_at = acks.get(step["id"], "")
+        steps.append(
+            {
+                **step,
+                "date": today.isoformat(),
+                "acknowledged": bool(acked_at),
+                "acked_at": acked_at,
+            },
+        )
+    return {
+        "enabled": enabled,
+        "date": today.isoformat(),
+        "days": ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"],
+        "voice_enabled": False,
+        "title": "Bedtime Launch",
+        "target": "7:15 PM upstairs",
+        "status": "School-night routine" if enabled else "Off tonight",
+        "steps": steps,
+    }
+
+
+def acknowledge_dashboard_bedtime_step(
+    step_id: str | None,
+    *,
+    now: datetime | None = None,
+    db_path: Path = BEDTIME_ROUTINE_DB_FILE,
+) -> dict[str, Any]:
+    cleaned_step_id = _clean_text(step_id)
+    valid_step_ids = {step["id"] for step in BEDTIME_ROUTINE_STEPS}
+    if cleaned_step_id not in valid_step_ids:
+        return {
+            "status": "error",
+            "message": "Missing or invalid bedtime routine step.",
+            "data": {"missing_fields": ["step_id"]},
+        }
+
+    local_now = _local_now(now)
+    if not _bedtime_routine_enabled(local_now.date()):
+        return {
+            "status": "error",
+            "message": "Bedtime routine is only active Sunday through Thursday.",
+            "data": {"step_id": cleaned_step_id},
+        }
+
+    _ensure_bedtime_routine_schema(db_path)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO bedtime_routine_acks(date, step_id, acked_at)
+            VALUES (:date, :step_id, :acked_at)
+            ON CONFLICT(date, step_id) DO UPDATE SET acked_at = excluded.acked_at
+            """,
+            {
+                "date": local_now.date().isoformat(),
+                "step_id": cleaned_step_id,
+                "acked_at": local_now.isoformat(),
+            },
+        )
+        connection.commit()
+
+    return {
+        "status": "ok",
+        "message": "Bedtime routine step acknowledged.",
+        "data": {
+            "bedtime": _bedtime_routine_summary(local_now, db_path=db_path),
+        },
+    }
 
 
 def _decision_due_label(decision: dict[str, Any], today: date) -> str:
@@ -1025,7 +1175,8 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "review": {"available": True, "callout": now.weekday() in {0, 6}, "item_ids": []},
             "lanes": {"discussion": [], "planning": [], "decision": []},
         },
-        "home_board": {"today": []},
+        "home_board": {"today": [], "tomorrow": []},
+        "bedtime": _bedtime_routine_summary(now),
         "decisions": {"open": [], "attention": []},
         "shopping": {"lists": [], "pending": [], "by_list": []},
         "reading_garden": _empty_reading_garden(now.date()),
@@ -1217,7 +1368,7 @@ def build_dashboard_data(
     except Exception as error:
         task_response = _source_error_response("Tasks", error)
 
-    home_board_items, home_board_warnings = _home_board_today(
+    home_board, home_board_warnings = _home_board_for_portal(
         sources,
         local_now.date(),
         local_now,
@@ -1376,7 +1527,7 @@ def build_dashboard_data(
             "prep_needed_count": len(prep_needed),
             "conflict_count": len(conflicts),
             "unassigned_count": unassigned_count,
-            "home_board_count": len(home_board_items),
+            "home_board_count": len(home_board["today"]),
             "open_decision_count": len(open_decisions),
             "shopping_count": len(shopping["pending"]),
         },
@@ -1417,7 +1568,8 @@ def build_dashboard_data(
         },
         "planning": {"items": planning_items},
         "backlog": backlog,
-        "home_board": {"today": home_board_items},
+        "home_board": home_board,
+        "bedtime": _bedtime_routine_summary(local_now),
         "decisions": {
             "open": open_decisions[:12],
             "attention": attention_decisions,
@@ -1454,7 +1606,7 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
                 shopping_tools=build_default_shopping_tools(),
                 reading_garden_tools=None,
             )
-            items, warnings = _home_board_today(
+            home_board, warnings = _home_board_for_portal(
                 home_board_sources,
                 local_now.date(),
                 local_now,
@@ -1463,8 +1615,9 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
         except Exception:
             return data
 
-        data["home_board"]["today"] = items
-        data["summary"]["home_board_count"] = len(items)
+        data["home_board"] = home_board
+        data["summary"]["home_board_count"] = len(home_board["today"])
+        data["bedtime"] = _bedtime_routine_summary(local_now)
         data["shopping"] = shopping
         data["summary"]["shopping_count"] = len(shopping["pending"])
         data["warnings"].extend(
@@ -1532,6 +1685,7 @@ def perform_dashboard_backlog_action(
         "park",
         "link_event",
         "link_task",
+        "create_task",
         "close",
     }
     missing = []
@@ -1546,7 +1700,8 @@ def perform_dashboard_backlog_action(
             "data": {"missing_fields": missing},
         }
     values = payload if isinstance(payload, dict) else {}
-    tools = (sources or default_sources()).decision_tools
+    active_sources = sources or default_sources()
+    tools = active_sources.decision_tools
     actor = "family dashboard"
     try:
         if action_code == "edit":
@@ -1577,6 +1732,46 @@ def perform_dashboard_backlog_action(
                 title=values.get("title"),
                 actor=actor,
             )
+        if action_code == "create_task":
+            task_title = _clean_text(values.get("title"))
+            if not task_title:
+                return {
+                    "status": "error",
+                    "message": "Missing required follow-up task information: title.",
+                    "data": {"missing_fields": ["title"]},
+                }
+            task_response = active_sources.task_tools.create_task(
+                title=task_title,
+                notes=_clean_text(values.get("notes")) or None,
+                due=_clean_text(values.get("due")) or None,
+                metadata={"source": "family_backlog", "backlog_item_id": cleaned_item_id},
+                task_list_id=_clean_text(values.get("container_id"), "@default"),
+            )
+            if task_response.get("status") != "ok":
+                return task_response
+            task = task_response.get("data", {}).get("task")
+            if not isinstance(task, dict) or not _clean_text(task.get("id")):
+                return {
+                    "status": "error",
+                    "message": "Task was created but did not include a linkable task id.",
+                    "data": {"missing_fields": ["task.id"]},
+                }
+            linked_response = tools.link_backlog_item(
+                cleaned_item_id,
+                source_type="google_task",
+                external_id=task.get("id"),
+                container_id=_clean_text(values.get("container_id"), "@default"),
+                title=task.get("title") or task_title,
+                actor=actor,
+            )
+            if linked_response.get("status") != "ok":
+                return linked_response
+            return {
+                **linked_response,
+                "message": "Follow-up task created and linked.",
+                "data": {**linked_response.get("data", {}), "task": task},
+            }
+        close_outcome = _clean_text(values.get("outcome"), "Closed from dashboard.")
         if values.get("confirmed") is not True:
             return {
                 "status": "needs_confirmation",
@@ -1585,7 +1780,7 @@ def perform_dashboard_backlog_action(
             }
         return tools.close_backlog_item(
             cleaned_item_id,
-            values.get("outcome"),
+            close_outcome,
             rationale=values.get("rationale"),
             confirmed=True,
             actor=actor,

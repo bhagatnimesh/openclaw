@@ -8,7 +8,7 @@ from typing import Any
 from constants import SHOPPING_LISTS
 from intent import extract_intent, list_name
 from provider import ShoppingProvider, SQLiteShoppingStore
-from tools import ShoppingTools, build_default_tools
+from tools import ShoppingTools, ToolResponse, build_default_tools
 
 
 def _format_item(item: dict[str, Any]) -> str:
@@ -33,6 +33,7 @@ class ShoppingClaw:
     tools: ShoppingTools
     last_item: dict[str, Any] | None = None
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
+    last_result: ToolResponse | None = None
 
     @classmethod
     def from_provider(
@@ -94,6 +95,7 @@ class ShoppingClaw:
     ) -> str:
         del request, reference_time
         response = self.tools.list_shopping_lists()
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -118,6 +120,7 @@ class ShoppingClaw:
     ) -> str:
         intent = extract_intent(request, now=reference_time)
         response = self.tools.list_items(intent.get("list_slug"))
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -143,12 +146,17 @@ class ShoppingClaw:
         intent = extract_intent(request, now=reference_time)
         missing = intent.get("missing_fields", [])
         if missing and missing != ["list_name"]:
-            message = "Please provide: " + ", ".join(missing) + "."
+            self.last_result = {
+                "status": "needs_information",
+                "message": "Please provide: " + ", ".join(missing) + ".",
+            }
+            message = self.last_result["message"]
             print(message)
             return message
         items = list(intent.get("items") or [intent.get("item")])
         if len(items) > 1:
             response = self.tools.add_items(intent.get("list_slug"), items)
+            self.last_result = response
             if response["status"] != "ok":
                 message = response["message"]
                 print(message)
@@ -167,6 +175,7 @@ class ShoppingClaw:
             list_slug=intent.get("list_slug"),
             item=intent.get("item"),
         )
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -187,6 +196,7 @@ class ShoppingClaw:
             item=intent.get("item"),
             checked=checked,
         )
+        self.last_result = response
         if response["status"] == "ok":
             item = response.get("data", {}).get("item", {})
             self.last_item = item
@@ -208,6 +218,7 @@ class ShoppingClaw:
             list_slug=intent.get("list_slug"),
             item=intent.get("item"),
         )
+        self.last_result = response
         message = response["message"]
         print(message)
         return message
@@ -219,6 +230,7 @@ class ShoppingClaw:
     ) -> str:
         intent = extract_intent(request, now=reference_time)
         response = self.tools.clear_list(intent.get("list_slug"))
+        self.last_result = response
         if response["status"] == "ok":
             items = response.get("data", {}).get("items", [])
             if items:
@@ -234,6 +246,7 @@ class ShoppingClaw:
             item=intent.get("item"),
             target_list_slug=intent.get("target_list_slug"),
         )
+        self.last_result = response
         if response["status"] == "ok":
             item = response.get("data", {}).get("item", {})
             self.last_item = item

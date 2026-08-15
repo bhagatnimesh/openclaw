@@ -1,12 +1,15 @@
 import unittest
 from datetime import datetime
 from http.server import ThreadingHTTPServer
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Thread
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import dashboard_sources
 from dashboard_data import (
+    acknowledge_dashboard_bedtime_step,
     build_dashboard_data,
     clear_dashboard_shopping_list,
     complete_dashboard_decision,
@@ -16,6 +19,7 @@ from dashboard_data import (
     delete_dashboard_reading_event,
     perform_dashboard_backlog_action,
     update_dashboard_reading_event,
+    _bedtime_routine_summary,
 )
 from dashboard_server import DashboardRequestHandler
 from dashboard_sources import (
@@ -82,6 +86,7 @@ class FakeTaskTools:
     def __init__(self, tasks):
         self.tasks = tasks
         self.completed = []
+        self.created = []
 
     def list_tasks(self, show_completed=False):
         return {
@@ -111,6 +116,33 @@ class FakeTaskTools:
             "message": "task not found",
             "data": {"task_id": task_id},
         }
+
+    def create_task(
+        self,
+        title=None,
+        notes=None,
+        due=None,
+        metadata=None,
+        task_list_id="@default",
+    ):
+        task = {
+            "id": f"task-{len(self.created) + 1}",
+            "title": title,
+            "notes": notes,
+            "due": due,
+            "status": "needsAction",
+        }
+        self.created.append(
+            {
+                "title": title,
+                "notes": notes,
+                "due": due,
+                "metadata": metadata,
+                "task_list_id": task_list_id,
+            }
+        )
+        self.tasks.append(task)
+        return {"status": "ok", "message": "Task created.", "data": {"task": task}}
 
 
 class FailingCalendarTools:
@@ -147,10 +179,15 @@ class FakeHomeBoardTools:
                 "now": now,
             }
         )
+        items = [
+            item for item in self.items
+            if (date is None or item.get("date") == date)
+            and (status is None or item.get("status", "pending") == status)
+        ]
         return {
             "status": "ok",
             "message": "Home Board items returned.",
-            "data": {"items": self.items},
+            "data": {"items": items},
         }
 
 
@@ -201,6 +238,14 @@ class FakeBacklogTools(FakeDecisionTools):
     def move_backlog_item(self, item_id, kind, **kwargs):
         self.calls.append(("move", {"item_id": item_id, "kind": kind, **kwargs}))
         return {"status": "ok", "message": "Moved.", "data": {"item": {"id": item_id, "kind": kind}}}
+
+    def link_backlog_item(self, item_id, **kwargs):
+        self.calls.append(("link", {"item_id": item_id, **kwargs}))
+        return {"status": "ok", "message": "Source linked.", "data": {"item": {"id": item_id}}}
+
+    def close_backlog_item(self, item_id, outcome, **kwargs):
+        self.calls.append(("close", {"item_id": item_id, "outcome": outcome, **kwargs}))
+        return {"status": "ok", "message": "Backlog item closed.", "data": {"item": {"id": item_id, "status": "closed"}}}
 
 
 class FakeShoppingTools:
@@ -596,6 +641,53 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data["tasks"]["pending"], [])
         self.assertEqual(data["planning"]["items"], [])
         self.assertEqual(data["best_next_action"]["source"], "empty")
+        self.assertIn("bedtime", data)
+
+    def test_bedtime_routine_summary_active_on_school_nights(self):
+        with TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "n4os.db"
+
+            data = _bedtime_routine_summary(
+                datetime.fromisoformat("2026-08-11T18:30:00-07:00"),
+                db_path=db_path,
+            )
+
+            self.assertTrue(data["enabled"])
+            self.assertEqual(data["target"], "7:15 PM upstairs")
+            self.assertEqual(
+                [step["id"] for step in data["steps"]],
+                ["dinner-close", "upstairs-launch"],
+            )
+            self.assertFalse(data["steps"][0]["acknowledged"])
+            self.assertEqual(data["steps"][0]["time"], "19:05")
+
+    def test_bedtime_ack_persists_for_today(self):
+        with TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "n4os.db"
+            now = datetime.fromisoformat("2026-08-11T19:06:00-07:00")
+
+            response = acknowledge_dashboard_bedtime_step(
+                "dinner-close",
+                now=now,
+                db_path=db_path,
+            )
+            summary = _bedtime_routine_summary(now, db_path=db_path)
+
+            self.assertEqual(response["status"], "ok")
+            dinner_close = summary["steps"][0]
+            self.assertTrue(dinner_close["acknowledged"])
+            self.assertEqual(dinner_close["acked_at"], now.isoformat())
+
+    def test_bedtime_ack_rejects_off_nights(self):
+        with TemporaryDirectory() as tmp_dir:
+            response = acknowledge_dashboard_bedtime_step(
+                "dinner-close",
+                now=datetime.fromisoformat("2026-08-14T19:06:00-07:00"),
+                db_path=Path(tmp_dir) / "n4os.db",
+            )
+
+            self.assertEqual(response["status"], "error")
+            self.assertIn("Sunday through Thursday", response["message"])
 
     def test_dashboard_includes_reading_garden_summary(self):
         data = build_dashboard_data(
@@ -779,6 +871,57 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(data["summary"]["home_board_count"], 1)
         self.assertEqual(data["home_board"]["today"][0]["person_or_group"], "Nysha")
         self.assertEqual(data["home_board"]["today"][0]["context_label"], "School")
+
+    def test_dashboard_includes_tomorrow_home_board_items_for_next_day_prep(self):
+        home_board_tools = FakeHomeBoardTools(
+            [
+                {
+                    "id": "home-1",
+                    "person_or_group": "Nysha",
+                    "message": "Take journal",
+                    "date": "2026-07-03",
+                    "context": "school",
+                    "trigger": None,
+                    "status": "pending",
+                    "priority": "high",
+                    "expires_at": "2026-07-04T00:00:00-07:00",
+                },
+                {
+                    "id": "home-2",
+                    "person_or_group": "Navya",
+                    "message": "Pack swim bag",
+                    "date": "2026-07-04",
+                    "context": "before_leave",
+                    "trigger": None,
+                    "status": "pending",
+                    "priority": "medium",
+                    "expires_at": "2026-07-05T00:00:00-07:00",
+                },
+            ],
+        )
+        data = build_dashboard_data(
+            DashboardSources(
+                calendar_tools=FakeCalendarTools([]),
+                task_tools=FakeTaskTools([]),
+                read_event_metadata=fallback_event_metadata,
+                read_task_metadata=fallback_task_metadata,
+                recommend_task_matches=fallback_recommend_task_matches,
+                home_board_tools=home_board_tools,
+                decision_tools=FakeDecisionTools(),
+                shopping_tools=FakeShoppingTools(),
+                reading_garden_tools=FakeReadingGardenTools(),
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["summary"]["home_board_count"], 1)
+        self.assertEqual([item["message"] for item in data["home_board"]["today"]], ["Take journal"])
+        self.assertEqual([item["message"] for item in data["home_board"]["tomorrow"]], ["Pack swim bag"])
+        self.assertEqual(data["home_board"]["tomorrow"][0]["context_label"], "Before leaving")
+        self.assertEqual(
+            [call["date"] for call in home_board_tools.list_calls],
+            ["2026-07-03", "2026-07-04"],
+        )
 
     def test_dashboard_includes_shopping_lists(self):
         data = build_dashboard_data(
@@ -964,6 +1107,18 @@ class DashboardDataTest(unittest.TestCase):
             payload={"kind": "planning", "confirmed": True},
             sources=active_sources,
         )
+        closed = perform_dashboard_backlog_action(
+            action="close",
+            item_id="item-1",
+            payload={"outcome": "Done", "confirmed": True},
+            sources=active_sources,
+        )
+        default_closed = perform_dashboard_backlog_action(
+            action="close",
+            item_id="item-2",
+            payload={"confirmed": True},
+            sources=active_sources,
+        )
         invalid = perform_dashboard_backlog_action(
             action="invent",
             item_id="item-1",
@@ -977,7 +1132,46 @@ class DashboardDataTest(unittest.TestCase):
         self.assertEqual(moved["status"], "ok")
         self.assertTrue(tools.calls[1][1]["confirmed"])
         self.assertEqual(tools.calls[1][1]["actor"], "family dashboard")
+        self.assertEqual(closed["status"], "ok")
+        self.assertEqual(tools.calls[2][0], "close")
+        self.assertEqual(tools.calls[2][1]["outcome"], "Done")
+        self.assertTrue(tools.calls[2][1]["confirmed"])
+        self.assertEqual(default_closed["status"], "ok")
+        self.assertEqual(tools.calls[3][0], "close")
+        self.assertEqual(tools.calls[3][1]["outcome"], "Closed from dashboard.")
         self.assertEqual(invalid["status"], "error")
+
+    def test_dashboard_backlog_action_creates_and_links_follow_up_task(self):
+        backlog_tools = FakeBacklogTools()
+        task_tools = FakeTaskTools([])
+        active_sources = sources()
+        active_sources = DashboardSources(
+            **{
+                **active_sources.__dict__,
+                "decision_tools": backlog_tools,
+                "task_tools": task_tools,
+            },
+        )
+
+        response = perform_dashboard_backlog_action(
+            action="create_task",
+            item_id="decision-1",
+            payload={"title": "Buy Nest subscription", "due": "2026-08-15"},
+            sources=active_sources,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["message"], "Follow-up task created and linked.")
+        self.assertEqual(task_tools.created[0]["title"], "Buy Nest subscription")
+        self.assertEqual(task_tools.created[0]["due"], "2026-08-15")
+        self.assertEqual(
+            task_tools.created[0]["metadata"],
+            {"source": "family_backlog", "backlog_item_id": "decision-1"},
+        )
+        self.assertEqual(backlog_tools.calls[0][0], "link")
+        self.assertEqual(backlog_tools.calls[0][1]["item_id"], "decision-1")
+        self.assertEqual(backlog_tools.calls[0][1]["source_type"], "google_task")
+        self.assertEqual(backlog_tools.calls[0][1]["external_id"], "task-1")
 
     def test_calendar_failure_preserves_task_and_home_board_data(self):
         data = build_dashboard_data(
@@ -1383,6 +1577,52 @@ class DashboardServerRouteTest(unittest.TestCase):
             self.assertEqual(calls, [{"task_id": "task-1", "task_list_id": None}])
         finally:
             dashboard_server.complete_dashboard_task = original_complete_dashboard_task
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_bedtime_ack_api_route_requires_token_and_acknowledges_step(self):
+        import dashboard_server
+
+        original_ack = dashboard_server.acknowledge_dashboard_bedtime_step
+        calls = []
+
+        def fake_ack(step_id=None):
+            calls.append({"step_id": step_id})
+            return {
+                "status": "ok",
+                "message": "Bedtime routine step acknowledged.",
+                "data": {"bedtime": {"steps": []}},
+            }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardRequestHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        try:
+            dashboard_server.acknowledge_dashboard_bedtime_step = fake_ack
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}/api/bedtime/ack"
+            unauthorized = Request(url, data=b'{}', headers={"Content-Type": "application/json"}, method="POST")
+            with self.assertRaises(HTTPError) as rejected:
+                urlopen(unauthorized, timeout=5)
+            self.assertEqual(rejected.exception.code, 403)
+            rejected.exception.close()
+
+            authorized = Request(
+                url,
+                data=b'{"step_id":"dinner-close"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-N4OS-Dashboard-Action-Token": dashboard_server.ACTION_TOKEN,
+                },
+                method="POST",
+            )
+            with urlopen(authorized, timeout=5) as response:
+                body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("acknowledged", body)
+            self.assertEqual(calls, [{"step_id": "dinner-close"}])
+        finally:
+            dashboard_server.acknowledge_dashboard_bedtime_step = original_ack
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)

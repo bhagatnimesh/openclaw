@@ -74,9 +74,9 @@ WEEKDAYS = {
 }
 BACKLOG_KINDS = {"discussion", "planning", "decision"}
 BACKLOG_PREFIX_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:add|create|capture|track|open)?\s*"
+    r"^\s*(?:please\s+)?(?:(?:add|create|capture|track|open)\s+(?:an?\s+)?)?"
     r"(?P<kind>discussion|planning|plan|decision)"
-    r"(?:\s+(?:topic|item))?\s*(?:about|for|on|:|-)\s*(?P<title>.+)$",
+    r"(?:\s+(?:topic|item))?\s*(?:(?:about|for|on|:|-)\s*)?(?P<title>.+)$",
     re.IGNORECASE,
 )
 BACKLOG_IMPORTANT_RE = re.compile(
@@ -584,12 +584,12 @@ def extract_intent(request: str, now: datetime | None = None) -> dict[str, Any]:
             "decision_index": _decision_index(text),
             "outcome": _closed_text(text),
         }
-    if _is_list_request(text):
-        return {"intent": "list_decisions", "status": None}
     if _is_brief_request(text):
         return {"intent": "decision_brief", "decision_id": decision_id}
+    if _is_list_request(text):
+        return {"intent": "list_decisions", "status": None}
     if not has_capture_prefix and (
-        re.search(r"^\s*(?:add\s+)?options?\b", lowered)
+        re.search(r"^\s*(?:add\s+)?(?:an?\s+)?options?\b", lowered)
         or OPTION_MARKER_RE.search(text)
     ):
         texts = _option_texts(text)

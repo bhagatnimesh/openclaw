@@ -391,8 +391,13 @@ def extract_intent(
         }
     if not raw:
         return {"intent": "unknown", "missing_fields": ["message"]}
-    if re.fullmatch(r"/?status|/?reading status|/?garden status", lowered):
-        return {"intent": "status", "children": list(CHILDREN)}
+    status_request = re.fullmatch(r"/?status|/?reading status|/?garden status", lowered)
+    if status_request or re.search(
+        r"\b(?:show|give|what(?:'s| is))\b.*\b(?:reading|garden)\s+status\b",
+        lowered,
+    ):
+        children = _children(raw)
+        return {"intent": "status", "children": children or list(CHILDREN)}
     reading_change_action = _reading_change_action(raw)
     if reading_change_action == "delete_reading":
         children = _children(raw)

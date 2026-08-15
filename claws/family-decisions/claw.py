@@ -108,6 +108,7 @@ class FamilyDecisionsClaw:
     tools: FamilyDecisionTools
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
     pending_action: dict[str, Any] | None = None
+    last_result: dict[str, Any] | None = None
 
     @classmethod
     def from_provider(cls, provider: FamilyDecisionProvider) -> "FamilyDecisionsClaw":
@@ -196,6 +197,7 @@ class FamilyDecisionsClaw:
             return False
         self.pending_action = None
         if lowered in {"no", "n", "cancel"}:
+            self.last_result = {"status": "not_counted"}
             print("Backlog move cancelled.")
             return True
         before = self.tools.read_backlog_item(pending.get("item_id"))
@@ -213,6 +215,7 @@ class FamilyDecisionsClaw:
                 confirmed=True,
                 actor=pending.get("actor") or "family",
             )
+        self.last_result = response
         if before.get("status") == "ok" and response.get("status") == "ok":
             snapshot = before.get("data", {}).get("item")
             if snapshot:
@@ -260,6 +263,7 @@ class FamilyDecisionsClaw:
 
     def list_backlog_from_request(self) -> str:
         response = self.tools.list_backlog_items()
+        self.last_result = response
         if response["status"] != "ok":
             print(response["message"])
             return response["message"]
@@ -297,6 +301,7 @@ class FamilyDecisionsClaw:
         intent = extract_intent(request, now=reference_time)
         item_id, error = self._resolve_backlog_target(intent)
         response = self.tools.add_backlog_note(item_id, intent.get("text"), actor=actor) if item_id else None
+        self.last_result = response or {"status": "needs_information"}
         message = response["message"] if response is not None else str(error)
         print(message)
         return message
@@ -305,6 +310,7 @@ class FamilyDecisionsClaw:
         intent = extract_intent(request, now=reference_time)
         item_id, error = self._resolve_backlog_target(intent)
         response = self.tools.set_backlog_position(item_id, intent.get("value"), actor=actor) if item_id else None
+        self.last_result = response or {"status": "needs_information"}
         message = response["message"] if response is not None else str(error)
         print(message)
         return message
@@ -313,9 +319,11 @@ class FamilyDecisionsClaw:
         intent = extract_intent(request, now=reference_time)
         item_id, error = self._resolve_backlog_target(intent)
         if item_id is None:
+            self.last_result = {"status": "needs_information"}
             message = str(error)
         else:
             response = self.tools.move_backlog_item(item_id, intent.get("kind"), actor=actor)
+            self.last_result = response
             message = response["message"]
             if response["status"] == "needs_confirmation":
                 self.pending_action = {
@@ -331,6 +339,7 @@ class FamilyDecisionsClaw:
         intent = extract_intent(request, now=reference_time)
         item_id, error = self._resolve_backlog_target(intent)
         response = self.tools.update_backlog_item(item_id, pinned=intent.get("pinned"), actor=actor) if item_id else None
+        self.last_result = response or {"status": "needs_information"}
         message = response["message"] if response is not None else str(error)
         print(message)
         return message
@@ -339,6 +348,7 @@ class FamilyDecisionsClaw:
         intent = extract_intent(request, now=reference_time)
         item_id, error = self._resolve_backlog_target(intent)
         response = self.tools.park_backlog_item(item_id, actor=actor) if item_id else None
+        self.last_result = response or {"status": "needs_information"}
         message = response["message"] if response is not None else str(error)
         print(message)
         return message
@@ -347,6 +357,7 @@ class FamilyDecisionsClaw:
         intent = extract_intent(request, now=reference_time)
         item_id, error = self._resolve_backlog_target(intent)
         response = self.tools.close_backlog_item(item_id, intent.get("outcome"), actor=actor) if item_id else None
+        self.last_result = response or {"status": "needs_information"}
         message = response["message"] if response is not None else str(error)
         if response is not None and response["status"] == "needs_confirmation":
             self.pending_action = {
@@ -407,6 +418,7 @@ class FamilyDecisionsClaw:
 
     def list_decisions_from_request(self, request: str) -> str:
         response = self.tools.list_decisions()
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -435,6 +447,7 @@ class FamilyDecisionsClaw:
     def decision_brief_from_request(self, request: str) -> str:
         decision_id = extract_intent(request).get("decision_id")
         response = self.tools.decision_brief(decision_id)
+        self.last_result = response
         message = response["message"]
         decision = response.get("data", {}).get("decision")
         if decision and decision_id is None:
@@ -535,6 +548,7 @@ class FamilyDecisionsClaw:
         return message
 
     def _format_mutation_response(self, response: dict[str, Any], prefix: str) -> str:
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)

@@ -587,6 +587,7 @@ class FamilyTasksClaw:
     pending_action: PendingAction | None = None
     auto_run_assistant_help: bool = True
     last_created_task: dict[str, Any] | None = None
+    last_result: dict[str, Any] | None = None
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -824,12 +825,40 @@ class FamilyTasksClaw:
         self,
         request: str,
         task_list_id: str = DEFAULT_TASK_LIST_ID,
+        *,
+        task_id: str | None = None,
     ) -> str:
+        self.last_result = {"status": "needs_information"}
         update = _task_update_from_request(request)
         if update is None:
             message = "Please say what to update on the task."
             print(message)
             return message
+
+        if task_id:
+            response = self.tools.list_tasks(
+                task_list_id=task_list_id,
+                show_completed=True,
+            )
+            if response["status"] != "ok":
+                self.last_result = response
+                message = response["message"]
+                print(message)
+                return message
+            task = next(
+                (
+                    candidate
+                    for candidate in response.get("data", {}).get("tasks", [])
+                    if str(candidate.get("id") or "") == task_id
+                ),
+                None,
+            )
+            if task is None:
+                self.last_result = {"status": "error"}
+                message = "I couldn't find the selected task."
+                print(message)
+                return message
+            return self._update_task(task, update, task_list_id)
 
         if update.target is None:
             task = self.last_created_task
@@ -841,6 +870,7 @@ class FamilyTasksClaw:
 
         response = self.tools.list_tasks(task_list_id=task_list_id)
         if response["status"] != "ok":
+            self.last_result = response
             message = response["message"]
             print(message)
             return message
@@ -908,6 +938,7 @@ class FamilyTasksClaw:
             metadata=metadata,
             task_list_id=task_list_id,
         )
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -1000,6 +1031,7 @@ class FamilyTasksClaw:
         intent = extract_intent(request, now=reference_time)
         filters = intent.get("filters", {})
         response = self.tools.recommend_tasks(filters=filters)
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -1036,6 +1068,7 @@ class FamilyTasksClaw:
     ) -> str:
         response = self.tools.list_tasks(task_list_id=task_list_id, show_completed=False)
         if response["status"] != "ok":
+            self.last_result = response
             message = response["message"]
             print(message)
             return message
@@ -1047,6 +1080,7 @@ class FamilyTasksClaw:
             if _is_pending_assistant_help_task(task)
         ]
         if not pending_tasks:
+            self.last_result = {"status": "not_counted"}
             message = "No pending Noah assistant help tasks found."
             print(message)
             return message
@@ -1054,6 +1088,7 @@ class FamilyTasksClaw:
         try:
             client = research_client or OpenClawNoahResearchClient.from_env()
         except RuntimeError as error:
+            self.last_result = {"status": "error"}
             message = str(error)
             print(message)
             return message
@@ -1128,6 +1163,7 @@ class FamilyTasksClaw:
             lines.append(f"{remaining} pending Noah assistant help task(s) still queued.")
 
         message = "\n".join(lines) if lines else "Noah had no assistant help updates."
+        self.last_result = {"status": "ok" if completed else "error"}
         print(message)
         return message
 
@@ -1135,22 +1171,28 @@ class FamilyTasksClaw:
         self,
         request: str,
         task_list_id: str = DEFAULT_TASK_LIST_ID,
+        *,
+        task_id: str | None = None,
     ) -> str:
         return self._destructive_task_from_request(
             request=request,
             action="complete",
             task_list_id=task_list_id,
+            task_id=task_id,
         )
 
     def delete_task_from_request(
         self,
         request: str,
         task_list_id: str = DEFAULT_TASK_LIST_ID,
+        *,
+        task_id: str | None = None,
     ) -> str:
         return self._destructive_task_from_request(
             request=request,
             action="delete",
             task_list_id=task_list_id,
+            task_id=task_id,
         )
 
     def _destructive_task_from_request(
@@ -1158,22 +1200,35 @@ class FamilyTasksClaw:
         request: str,
         action: str,
         task_list_id: str,
+        task_id: str | None = None,
     ) -> str:
+        self.last_result = {"status": "needs_information"}
         intent = extract_intent(request)
         query = intent.get("query")
-        if not query:
+        if not query and not task_id:
             message = f"Please provide which task to {action}."
             print(message)
             return message
 
-        response = self.tools.list_tasks(task_list_id=task_list_id)
+        response = self.tools.list_tasks(
+            task_list_id=task_list_id,
+            show_completed=bool(task_id),
+        )
         if response["status"] != "ok":
+            self.last_result = response
             message = response["message"]
             print(message)
             return message
 
-        matches = match_tasks(query, response.get("data", {}).get("tasks", []))
+        tasks = response.get("data", {}).get("tasks", [])
+        matches = (
+            [task for task in tasks if str(task.get("id") or "") == task_id]
+            if task_id
+            else match_tasks(query, tasks)
+        )
         if not matches:
+            if task_id:
+                self.last_result = {"status": "error"}
             message = "I couldn't find a matching task. Try including more of the title."
             print(message)
             return message
@@ -1209,6 +1264,7 @@ class FamilyTasksClaw:
         pending = self.pending_action
         if command in ("no", "n", "cancel"):
             self.pending_action = None
+            self.last_result = {"status": "not_counted"}
             print("Okay, I did not change any tasks.")
             return True
 
@@ -1238,6 +1294,7 @@ class FamilyTasksClaw:
         task_id = task.get("id")
         if not task_id:
             self.pending_action = None
+            self.last_result = {"status": "error"}
             print("Matching task has no Google Tasks id, so I did not change it.")
             return True
 
@@ -1273,6 +1330,7 @@ class FamilyTasksClaw:
             result = {"status": "error", "message": "Unknown pending task action."}
 
         self.pending_action = None
+        self.last_result = result
         print(result["message"])
         return True
 

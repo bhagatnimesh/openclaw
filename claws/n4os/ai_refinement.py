@@ -2,62 +2,25 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import logging
 import os
 import re
 from typing import Any, Callable
 import urllib.error
 import urllib.request
 
+try:
+    from .routing_contracts import is_valid_model_route_action, route_action_prompt
+except ImportError:
+    from routing_contracts import is_valid_model_route_action, route_action_prompt
+
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 DEFAULT_N4OS_INTENT_REFINEMENT_MODEL = "gpt-5.4-mini"
 DEFAULT_TIMEOUT_SECONDS = 8
-LOW_CONFIDENCE_THRESHOLD = 0.6
-MAX_NORMALIZED_REQUEST_CHARS = 1200
-
-VALID_ACTIONS_BY_ROUTE = {
-    "calendar": {
-        "create_event",
-        "list_events",
-        "update_event",
-        "delete_event",
-        "family_briefing",
-        "preparation_checklist",
-    },
-    "tasks": {
-        "create_task",
-        "recommend_tasks",
-        "update_task",
-        "complete_task",
-        "delete_task",
-        "run_assistant_help",
-    },
-    "shopping": {
-        "list_lists",
-        "list_items",
-        "add_item",
-        "add_items",
-        "check_item",
-        "uncheck_item",
-        "delete_item",
-        "move_item",
-        "clear_list",
-    },
-    "home_board": {"add_item", "add_items", "list_items", "mark_done"},
-    "decisions": {
-        "create_decision",
-        "list_decisions",
-        "decision_brief",
-        "add_option",
-        "add_evidence",
-        "add_next_step",
-        "record_decision",
-        "bulk_record_decisions",
-    },
-    "both": {"combined_planning", "calendar_and_tasks"},
-    "unknown": {"unknown"},
-}
-VALID_ROUTES = set(VALID_ACTIONS_BY_ROUTE)
+LOW_CONFIDENCE_THRESHOLD = 0.8
+INTENT_REFINEMENT_ENABLED_ENV = "N4OS_INTENT_REFINEMENT_ENABLED"
+LOGGER = logging.getLogger(__name__)
 VALID_FOLLOWUP_KINDS = {
     "none",
     "clarification",
@@ -68,14 +31,6 @@ VALID_FOLLOWUP_KINDS = {
     "add_note",
     "select_target",
 }
-
-UNSAFE_NORMALIZED_PATTERNS = (
-    re.compile(r"\b(?:ignore|disregard)\s+(?:all\s+)?(?:previous|system)\s+instructions?\b", re.I),
-    re.compile(r"\b(?:system|developer)\s+prompt\b", re.I),
-    re.compile(r"\b(?:tool_call|function_call|assistant to=|functions\.)\b", re.I),
-    re.compile(r"\b[A-Z][A-Z0-9_]{4,}\s*=\s*['\"]?[^'\"\s]+", re.I),
-    re.compile(r"\b(?:OPENAI|ANTHROPIC|GOOGLE|GEMINI|GITHUB|SLACK|TELEGRAM)_[A-Z0-9_]*(?:KEY|TOKEN)\b"),
-)
 
 UrlOpen = Callable[..., Any]
 
@@ -131,32 +86,16 @@ def _json_object_from_text(value: str) -> dict[str, Any]:
     return parsed
 
 
-def _validate_normalized_request(value: Any) -> str:
-    normalized = _clean_string(value)
-    if not normalized:
-        raise ValueError("AI refinement returned an empty normalized_request")
-    if len(normalized) > MAX_NORMALIZED_REQUEST_CHARS:
-        raise ValueError("AI refinement returned an oversized normalized_request")
-    for pattern in UNSAFE_NORMALIZED_PATTERNS:
-        if pattern.search(normalized):
-            raise ValueError("AI refinement returned unsafe normalized_request text")
-    return normalized
-
-
 def validate_ai_intent_frame(raw: dict[str, Any], request: str) -> dict[str, Any]:
     route = _clean_string(raw.get("route")) or "unknown"
-    if route not in VALID_ROUTES:
-        raise ValueError(f"AI refinement returned invalid route: {route}")
-
     action = _clean_string(raw.get("action")) or "unknown"
-    if action not in VALID_ACTIONS_BY_ROUTE[route]:
+    if not is_valid_model_route_action(route, action):
         raise ValueError(f"AI refinement returned invalid action for {route}: {action}")
 
     followup_kind = _clean_string(raw.get("followup_kind")) or "none"
     if followup_kind not in VALID_FOLLOWUP_KINDS:
         raise ValueError(f"AI refinement returned invalid followup_kind: {followup_kind}")
 
-    normalized_request = _validate_normalized_request(raw.get("normalized_request") or request)
     confidence = _round_confidence(raw.get("confidence"))
     if confidence < LOW_CONFIDENCE_THRESHOLD:
         raise ValueError("AI refinement confidence below routing threshold")
@@ -169,7 +108,10 @@ def validate_ai_intent_frame(raw: dict[str, Any], request: str) -> dict[str, Any
         "target": _clean_record(raw.get("target")),
         "slots": _clean_record(raw.get("slots")),
         "missing_fields": _clean_string_list(raw.get("missing_fields")),
-        "normalized_request": normalized_request,
+        # The model selects typed semantics only. Domain owners prepare commands
+        # from the original request so model-generated prose cannot become an
+        # executable mutation payload.
+        "normalized_request": request,
         "clarification_question": _clean_string(raw.get("clarification_question")) or None,
     }
 
@@ -184,23 +126,13 @@ def _reference_time_text(now: datetime | None) -> str:
 
 def _system_prompt() -> str:
     return (
-        "You are the N4OS intent refinement layer. Return only compact JSON. "
-        "Normalize household requests into commands for existing local parsers; "
+        "You are the N4OS intent selection layer. Return only compact JSON. "
         "do not execute actions, call tools, invent external facts, or include secrets. "
-        "Allowed routes/actions: calendar(create_event,list_events,update_event,delete_event,"
-        "family_briefing,preparation_checklist); tasks(create_task,recommend_tasks,update_task,"
-        "complete_task,delete_task,run_assistant_help); shopping(list_lists,list_items,"
-        "add_item,add_items,check_item,uncheck_item,delete_item,move_item,clear_list); "
-        "home_board(add_item,add_items,list_items,"
-        "mark_done); decisions(create_decision,list_decisions,decision_brief,add_option,"
-        "add_evidence,add_next_step,record_decision,bulk_record_decisions); "
-        "both(combined_planning,calendar_and_tasks); unknown(unknown). "
-        "For create/update requests, clean titles/messages, convert relative dates using the "
-        "reference time, preserve explicit owner/person/assistant-help intent, and put the result "
-        "in normalized_request as a natural command the local parser can understand. For tasks "
-        "with long dictated context, use this shape: `Add task: short readable title` followed by "
-        "`Notes: readable supporting body`; keep assistant research requests as assistant-help "
-        "text, not as the title."
+        f"Allowed routes/actions: {route_action_prompt()}. "
+        "Choose among the supplied deterministic candidates when possible. Return optional "
+        "slot hints copied or directly derived from the request, but never rewrite the request "
+        "into a command. Use unknown/unknown with a targeted clarification when the meaning "
+        "or required target is genuinely ambiguous."
     )
 
 
@@ -233,6 +165,14 @@ class OpenAIN4OSIntentInterpreter:
 
     @classmethod
     def from_env_or_none(cls) -> "OpenAIN4OSIntentInterpreter | None":
+        enabled = os.environ.get(INTENT_REFINEMENT_ENABLED_ENV, "").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            if os.environ.get("OPENAI_API_KEY", "").strip():
+                LOGGER.warning(
+                    "N4OS intent refinement is disabled; set %s=true to opt in to sending unresolved requests to OpenAI.",
+                    INTENT_REFINEMENT_ENABLED_ENV,
+                )
+            return None
         if not os.environ.get("OPENAI_API_KEY", "").strip():
             return None
         return cls.from_env()
@@ -261,7 +201,6 @@ class OpenAIN4OSIntentInterpreter:
                                 "route": "string",
                                 "action": "string",
                                 "confidence": "number 0..1",
-                                "normalized_request": "string",
                                 "followup_kind": "optional string",
                                 "target": "optional object",
                                 "slots": "optional object",

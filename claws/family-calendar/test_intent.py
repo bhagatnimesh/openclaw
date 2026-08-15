@@ -1,13 +1,25 @@
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from intent import (
     DEFAULT_TIMEZONE,
     extract_intent,
+    merge_ai_calendar_fields,
     read_metadata_from_description,
     write_metadata_to_description,
 )
+
+
+GUEST_EMAIL_ENV = {
+    "N4OS_CALENDAR_DAD_GUEST_EMAIL": "dad@example.test",
+    "N4OS_CALENDAR_MOM_GUEST_EMAIL": "mom@example.test",
+}
+FAMILY_ATTENDEES = [
+    {"email": "dad@example.test", "displayName": "Dad"},
+    {"email": "mom@example.test", "displayName": "Mom"},
+]
 
 
 class IntentExtractionTest(unittest.TestCase):
@@ -410,6 +422,20 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(intent["recurrence_label"], "every Saturday")
         self.assertEqual(intent["missing_fields"], [])
 
+    def test_recurring_weekday_time_range_intent(self):
+        now = datetime(2026, 8, 12, 22, 17, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("/event Sports for Navya every Monday 3 to 3:30 pm", now=now)
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Sports for Navya")
+        self.assertEqual(intent["date"], "2026-08-17")
+        self.assertEqual(intent["start_time"], "15:00")
+        self.assertEqual(intent["duration_minutes"], 30)
+        self.assertEqual(intent["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=MO"])
+        self.assertEqual(intent["recurrence_label"], "every Monday")
+        self.assertEqual(intent["missing_fields"], [])
+
     def test_nysha_dentist_metadata(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
@@ -557,6 +583,334 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(metadata["category"], "shopping")
         self.assertFalse(metadata["assistant_help_needed"])
 
+    def test_create_invite_with_family_guest_line(self):
+        now = datetime(2026, 8, 11, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            intent = extract_intent(
+                "/calendar Navya & Nysha are scheduled at 12:20 pm on 8/29 -Just Kids Pediatric Dentistry & Orthodontics - Downtown\n"
+                "Add guest: family",
+                now=now,
+            )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(
+            intent["title"],
+            "Navya & Nysha are scheduled -Just Kids Pediatric Dentistry & Orthodontics - Downtown",
+        )
+        self.assertEqual(intent["date"], "2026-08-29")
+        self.assertEqual(intent["start_time"], "12:20")
+        self.assertEqual(intent["attendees"], FAMILY_ATTENDEES)
+
+    def test_add_guests_intent_accepts_natural_invite_language(self):
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            dad_first = extract_intent("Or guest: dad and mom")
+            mom_first = extract_intent("add mom and dad to the invite")
+            guest_word = extract_intent("Add guest mom and dad to the invite")
+            polite = extract_intent("please add mom and dad to the invite")
+
+        self.assertEqual(dad_first["intent"], "add_guests")
+        self.assertEqual(dad_first["attendees"], FAMILY_ATTENDEES)
+        self.assertEqual(mom_first["intent"], "add_guests")
+        self.assertEqual(
+            mom_first["attendees"],
+            [
+                {"email": "mom@example.test", "displayName": "Mom"},
+                {"email": "dad@example.test", "displayName": "Dad"},
+            ],
+        )
+        self.assertEqual(guest_word["intent"], "add_guests")
+        self.assertEqual(
+            guest_word["attendees"],
+            [
+                {"email": "mom@example.test", "displayName": "Mom"},
+                {"email": "dad@example.test", "displayName": "Dad"},
+            ],
+        )
+        self.assertEqual(polite["intent"], "add_guests")
+        self.assertEqual(
+            polite["attendees"],
+            [
+                {"email": "mom@example.test", "displayName": "Mom"},
+                {"email": "dad@example.test", "displayName": "Dad"},
+            ],
+        )
+
+    def test_add_guests_intent_requires_configured_guest_contacts(self):
+        with patch.dict("os.environ", {}, clear=True):
+            intent = extract_intent("add mom and dad to the invite")
+
+        self.assertEqual(intent["intent"], "add_guests")
+        self.assertEqual(intent["missing_fields"], ["guest_contacts"])
+        self.assertEqual(intent["missing_guest_contacts"], ["mom", "dad"])
+
+    def test_invite_guests_to_event_title_is_not_guest_only_followup(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("invite mom and dad to dinner tomorrow at 6", now=now)
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Dinner")
+        self.assertEqual(intent["date"], "2026-08-13")
+        self.assertEqual(intent["start_time"], "18:00")
+        self.assertEqual(intent["attendees"], [])
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_create_event_with_unknown_guest_line_requires_contact(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Add dentist tomorrow at 3 PM\nAdd guest: Alex", now=now)
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Dentist")
+        self.assertEqual(intent["date"], "2026-08-13")
+        self.assertEqual(intent["start_time"], "15:00")
+        self.assertEqual(intent["missing_fields"], ["guest_contacts"])
+        self.assertEqual(intent["missing_guest_contacts"], ["Alex"])
+
+    def test_create_event_with_mixed_unknown_guest_line_requires_contact(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", {"N4OS_CALENDAR_MOM_GUEST_EMAIL": "mom@example.test"}, clear=False):
+            intent = extract_intent("Add dentist tomorrow at 3 PM\nAdd guest: Alex and mom", now=now)
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["attendees"], [{"email": "mom@example.test", "displayName": "Mom"}])
+        self.assertEqual(intent["missing_fields"], ["guest_contacts"])
+        self.assertEqual(intent["missing_guest_contacts"], ["Alex"])
+
+    def test_ai_calendar_fields_merge_create_slots_and_guest_aliases(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent("invite mom and dad to dinner tomorrow at 6", now=now)
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            refined = merge_ai_calendar_fields(
+                intent,
+                {
+                    "action": "create_event",
+                    "confidence": 0.92,
+                    "slots": {
+                        "title": "Dinner",
+                        "date": "2026-08-13",
+                        "start_time": "18:00",
+                        "guest_aliases": ["mom", "dad"],
+                    },
+                    "missing_fields": [],
+                },
+                "invite mom and dad to dinner tomorrow at 6",
+                now=now,
+            )
+
+        self.assertEqual(refined["intent"], "create_event")
+        self.assertEqual(refined["title"], "Dinner")
+        self.assertEqual(refined["date"], "2026-08-13")
+        self.assertEqual(refined["start_time"], "18:00")
+        self.assertEqual(refined["attendees"], [
+            {"email": "mom@example.test", "displayName": "Mom"},
+            {"email": "dad@example.test", "displayName": "Dad"},
+        ])
+        self.assertEqual(refined["missing_fields"], [])
+
+    def test_ai_calendar_fields_do_not_select_target_calendar(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent("Add Art class Saturday at 10 AM", now=now)
+
+        refined = merge_ai_calendar_fields(
+            intent,
+            {
+                "action": "create_event",
+                "confidence": 0.93,
+                "slots": {"calendar_name": "Nysha school calendar"},
+                "missing_fields": [],
+            },
+            "Add Art class Saturday at 10 AM",
+            now=now,
+        )
+
+        self.assertIsNone(refined["target_calendar"])
+
+    def test_ai_calendar_fields_do_not_override_deterministic_title(self):
+        now = datetime(2026, 8, 12, 19, 45, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        request = "/event learning bee parent teacher meeting 8/28 5 pm add to Nysha school calendar"
+        intent = extract_intent(request, now=now)
+
+        refined = merge_ai_calendar_fields(
+            intent,
+            {
+                "action": "create_event",
+                "confidence": 0.93,
+                "slots": {
+                    "title": "Learning bee parent teacher meeting add to Nysha school calendar"
+                },
+                "missing_fields": [],
+            },
+            request,
+            now=now,
+        )
+
+        self.assertEqual(refined["title"], "Learning bee parent teacher meeting")
+        self.assertEqual(refined["target_calendar"], "Nysha school calendar")
+
+    def test_ai_calendar_fields_cannot_switch_create_event_to_add_guests(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent("invite mom and dad to dinner tomorrow at 6", now=now)
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            refined = merge_ai_calendar_fields(
+                intent,
+                {
+                    "action": "add_guests",
+                    "confidence": 0.93,
+                    "slots": {"guest_aliases": ["mom", "dad"]},
+                    "missing_fields": [],
+                },
+                "invite mom and dad to dinner tomorrow at 6",
+                now=now,
+            )
+
+        self.assertEqual(refined["intent"], "create_event")
+        self.assertEqual(refined["title"], "Dinner")
+        self.assertEqual(refined["date"], "2026-08-13")
+        self.assertEqual(refined["start_time"], "18:00")
+        self.assertEqual(refined["attendees"], [
+            {"email": "mom@example.test", "displayName": "Mom"},
+            {"email": "dad@example.test", "displayName": "Dad"},
+        ])
+
+    def test_ai_calendar_fields_preserve_unknown_guest_contacts(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent("Add dentist tomorrow at 3 PM\nAdd guest: Alex", now=now)
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            refined = merge_ai_calendar_fields(
+                intent,
+                {
+                    "action": "create_event",
+                    "confidence": 0.93,
+                    "slots": {"guest_aliases": ["mom"]},
+                    "missing_fields": [],
+                },
+                "Add dentist tomorrow at 3 PM\nAdd guest: Alex",
+                now=now,
+            )
+
+        self.assertEqual(refined["intent"], "create_event")
+        self.assertEqual(refined["attendees"], [{"email": "mom@example.test", "displayName": "Mom"}])
+        self.assertEqual(refined["missing_guest_contacts"], ["Alex"])
+        self.assertEqual(refined["missing_fields"], ["guest_contacts"])
+
+    def test_ai_calendar_fields_merge_add_guests_action(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent("Add guest mom and dad to the invite", now=now)
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            refined = merge_ai_calendar_fields(
+                intent,
+                {
+                    "action": "add_guests",
+                    "confidence": 0.93,
+                    "slots": {"guest_aliases": ["mom", "dad"]},
+                    "missing_fields": [],
+                },
+                "Add guest mom and dad to the invite",
+                now=now,
+            )
+
+        self.assertEqual(refined["intent"], "add_guests")
+        self.assertEqual(refined["attendees"], [
+            {"email": "mom@example.test", "displayName": "Mom"},
+            {"email": "dad@example.test", "displayName": "Dad"},
+        ])
+        self.assertEqual(refined["missing_fields"], [])
+
+    def test_api_context_primary_keeps_create_action_when_notes_contain_list(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent(
+            "/calendar Add spelling test prep every Tuesday and Thursday at 6pm "
+            "starting Aug 18 for 45 minutes on Nysha school calendar, notes bring word list",
+            now=now,
+        )
+
+        refined = merge_ai_calendar_fields(
+            intent,
+            {
+                "action": "list_events",
+                "confidence": 0.91,
+                "slots": {
+                    "title": "Spelling test prep",
+                    "date": "2026-08-18",
+                    "start_time": "18:00",
+                    "duration_minutes": 45,
+                    "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TU"],
+                    "calendar_name": "Nysha school calendar",
+                },
+                "missing_fields": [],
+            },
+            "/calendar Add spelling test prep every Tuesday and Thursday at 6pm "
+            "starting Aug 18 for 45 minutes on Nysha school calendar, notes bring word list",
+            now=now,
+            primary=True,
+        )
+
+        self.assertEqual(refined["intent"], "create_event")
+        self.assertEqual(refined["description"], "bring word list")
+        self.assertEqual(refined["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=TU,TH"])
+        self.assertEqual(refined["missing_fields"], [])
+
+    def test_api_context_primary_repairs_guest_only_invite_updates(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent("/calendar Add dad to the invite for parent teacher conference", now=now)
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            refined = merge_ai_calendar_fields(
+                intent,
+                {
+                    "action": "create_event",
+                    "confidence": 0.88,
+                    "slots": {"guest_aliases": ["dad"]},
+                    "missing_fields": ["title", "date", "time"],
+                },
+                "/calendar Add dad to the invite for parent teacher conference",
+                now=now,
+                primary=True,
+            )
+
+        self.assertEqual(refined["intent"], "add_guests")
+        self.assertEqual(refined["query"], "parent teacher conference")
+        self.assertEqual(refined["attendees"], [{"email": "dad@example.test", "displayName": "Dad"}])
+        self.assertEqual(refined["missing_fields"], [])
+
+    def test_api_context_primary_repairs_ordinal_monthly_recurrence(self):
+        now = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent(
+            "/calendar Add school assembly every first Monday at 8:30am "
+            "starting Sep 7 for 45 minutes on Nysha school calendar",
+            now=now,
+        )
+
+        refined = merge_ai_calendar_fields(
+            intent,
+            {
+                "action": "create_event",
+                "confidence": 0.95,
+                "slots": {
+                    "title": "School assembly",
+                    "date": "2026-09-07",
+                    "start_time": "08:30",
+                    "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+                    "calendar_name": "Nysha school calendar",
+                },
+                "missing_fields": [],
+            },
+            "/calendar Add school assembly every first Monday at 8:30am "
+            "starting Sep 7 for 45 minutes on Nysha school calendar",
+            now=now,
+            primary=True,
+        )
+
+        self.assertEqual(refined["recurrence"], ["RRULE:FREQ=MONTHLY;BYDAY=MO;BYSETPOS=1"])
+        self.assertEqual(refined["missing_fields"], [])
+
     def test_metadata_description_helpers_preserve_assistant_help(self):
         description = write_metadata_to_description(
             "Assistant help: Find the teacher email",
@@ -616,6 +970,108 @@ class IntentExtractionTest(unittest.TestCase):
         self.assertEqual(intent["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SA"])
         self.assertEqual(intent["missing_fields"], [])
 
+    def test_recurring_event_to_named_calendar_for_subject(self):
+        now = datetime(2026, 8, 12, 9, 32, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add a recurring event to Nysha school calendar for Art class at 10 am every Saturday",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Art class")
+        self.assertEqual(intent["target_calendar"], "Nysha school calendar")
+        self.assertEqual(intent["date"], "2026-08-15")
+        self.assertEqual(intent["start_time"], "10:00")
+        self.assertEqual(intent["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SA"])
+        self.assertEqual(intent["metadata"]["person"], "Nysha")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_event_title_strips_trailing_add_to_named_calendar(self):
+        now = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "/event learning bee parent teacher meeting 8/28 5 pm add to Nysha school calendar",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Learning bee parent teacher meeting")
+        self.assertEqual(intent["target_calendar"], "Nysha school calendar")
+        self.assertEqual(intent["date"], "2026-08-28")
+        self.assertEqual(intent["start_time"], "17:00")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_calendar_title_words_do_not_become_target_calendar(self):
+        now = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add event to renew calendar subscription 8/28 5 pm",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Renew calendar subscription")
+        self.assertIsNone(intent["target_calendar"])
+        self.assertEqual(intent["date"], "2026-08-28")
+        self.assertEqual(intent["start_time"], "17:00")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_action_title_ending_in_calendar_stays_on_default_calendar(self):
+        now = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Add event to renew calendar 8/28 5 pm", now=now)
+        review = extract_intent("Add event to review calendar 8/28 5 pm", now=now)
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Renew calendar")
+        self.assertIsNone(intent["target_calendar"])
+        self.assertEqual(intent["date"], "2026-08-28")
+        self.assertEqual(intent["start_time"], "17:00")
+        self.assertEqual(intent["missing_fields"], [])
+        self.assertEqual(review["intent"], "create_event")
+        self.assertEqual(review["title"], "Review calendar")
+        self.assertIsNone(review["target_calendar"])
+        self.assertEqual(review["date"], "2026-08-28")
+        self.assertEqual(review["start_time"], "17:00")
+        self.assertEqual(review["missing_fields"], [])
+
+    def test_named_calendar_without_subject_asks_for_title(self):
+        now = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "Add event to Nysha school calendar 8/28 5 pm",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertIsNone(intent["title"])
+        self.assertEqual(intent["target_calendar"], "Nysha school calendar")
+        self.assertEqual(intent["date"], "2026-08-28")
+        self.assertEqual(intent["start_time"], "17:00")
+        self.assertEqual(intent["missing_fields"], ["title"])
+
+    def test_action_calendar_title_after_on_stays_on_default_calendar(self):
+        now = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Add event on call calendar 8/28 5 pm", now=now)
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "On call calendar")
+        self.assertIsNone(intent["target_calendar"])
+        self.assertEqual(intent["date"], "2026-08-28")
+        self.assertEqual(intent["start_time"], "17:00")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_title_words_that_look_like_command_prefixes_are_preserved(self):
+        now = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        calendar_review = extract_intent("Calendar review 8/28 5 pm", now=now)
+
+        self.assertEqual(calendar_review["intent"], "create_event")
+        self.assertEqual(calendar_review["title"], "Calendar review")
+        self.assertEqual(calendar_review["missing_fields"], [])
+
     def test_recurring_every_week_after_weekday_and_time(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
@@ -658,6 +1114,21 @@ class IntentExtractionTest(unittest.TestCase):
 
         self.assertEqual(intent["intent"], "create_event")
         self.assertIn("time", intent["missing_fields"])
+
+    def test_create_request_with_school_holiday_image_text_stays_create(self):
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "add event to Navya school calendar\n"
+            "Image text:\n"
+            "2026-2027 SCHOOL HOLIDAYS\n"
+            "December 21 - January 1 Winter Break\n"
+            "SCHOOL EVENTS\n"
+            "September 8 First Day of School",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
 
     def test_relative_update_event_intent_later(self):
         now = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))

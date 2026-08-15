@@ -76,7 +76,7 @@ SLASH_COMMAND_RE = re.compile(
     r"^\s*/(?P<command>calendar|calender|calnedar|event|schedule|tasks?|todos?|decisions?)"
     r"(?:@[A-Za-z0-9_]+)?"
     r"(?:\s+|:\s*)?(?P<body>.*)$",
-    re.IGNORECASE,
+    re.IGNORECASE | re.DOTALL,
 )
 TASK_LIST_BODY_RE = re.compile(
     r"^\s*(?:list|show|view|find|search|lookup|look\s+up)\b",
@@ -188,7 +188,7 @@ def _normalize_slash_command(text: str) -> str:
     body = match.group("body").strip()
     body_without_action = LEADING_ACTION_RE.sub("", body, count=1).strip()
     if command in ("calendar", "calender", "calnedar", "event", "schedule"):
-        if _is_calendar_read_body(body):
+        if body_without_action == body and _is_calendar_read_body(body):
             return f"show calendar {body}".strip()
         suffix = body_without_action or body
         return f"add event {suffix}".strip()
@@ -196,6 +196,8 @@ def _normalize_slash_command(text: str) -> str:
         if TASK_LIST_BODY_RE.search(body):
             return _normalize_task_list_body(body)
         suffix = LEADING_TASK_CREATE_RE.sub("", body, count=1).strip()
+        if suffix == body:
+            suffix = body_without_action
         suffix = suffix or body_without_action or body
         return f"add task {suffix}".strip()
     if command in ("decision", "decisions"):

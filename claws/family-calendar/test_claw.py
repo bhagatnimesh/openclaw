@@ -15,6 +15,37 @@ from intent import (
 from tools import DEFAULT_TIMEZONE
 
 
+GUEST_EMAIL_ENV = {
+    "N4OS_CALENDAR_DAD_GUEST_EMAIL": "dad@example.test",
+    "N4OS_CALENDAR_MOM_GUEST_EMAIL": "mom@example.test",
+}
+FAMILY_ATTENDEES = [
+    {"email": "dad@example.test", "displayName": "Dad"},
+    {"email": "mom@example.test", "displayName": "Mom"},
+]
+
+
+class FakeFieldExtractor:
+    def __init__(self, fields=None, error=None, primary=False):
+        self.fields = fields or {}
+        self.error = error
+        self.calls = []
+        self.primary_calendar_api_context = primary
+
+    def extract(self, request, now=None, baseline_intent=None, context=None):
+        self.calls.append(
+            {
+                "request": request,
+                "now": now,
+                "baseline_intent": baseline_intent,
+                "context": context,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        return self.fields
+
+
 class FakeProvider:
     def __init__(self):
         self.created = []
@@ -22,6 +53,10 @@ class FakeProvider:
         self.deleted = []
         self.updated = []
         self.events = []
+        self.get_calls = []
+        self.get_call_details = []
+        self.created_calendar_names = []
+        self.deleted_calls = []
 
     def create_event(
         self,
@@ -32,18 +67,30 @@ class FakeProvider:
         description=None,
         location=None,
         recurrence=None,
+        attendees=None,
         private_extended_properties=None,
+        calendar_name=None,
+        notify_attendees=False,
+        all_day=False,
     ):
+        self.created_calendar_names.append(calendar_name)
+        start = {"date": start_time} if all_day else {"dateTime": start_time, "timeZone": timezone}
+        end = {"date": end_time} if all_day else {"dateTime": end_time, "timeZone": timezone}
         event = {
             "id": "event-123",
             "htmlLink": "https://calendar.google.com/calendar/event?eid=event-123",
             "summary": title,
-            "start": {"dateTime": start_time, "timeZone": timezone},
-            "end": {"dateTime": end_time, "timeZone": timezone},
+            "start": start,
+            "end": end,
             "description": description,
             "location": location,
             "recurrence": recurrence,
+            "attendees": attendees,
+            "notify_attendees": notify_attendees,
+            "all_day": all_day,
         }
+        if calendar_name:
+            event["calendarId"] = calendar_name
         if private_extended_properties:
             event["extendedProperties"] = {
                 "private": private_extended_properties,
@@ -61,8 +108,14 @@ class FakeProvider:
         )
         return self.events[:max_results]
 
-    def delete_event(self, event_id):
+    def get_event(self, event_id, calendar_id=None):
+        self.get_calls.append(event_id)
+        self.get_call_details.append({"event_id": event_id, "calendar_id": calendar_id})
+        return next(event for event in self.events if event.get("id") == event_id)
+
+    def delete_event(self, event_id, calendar_id=None):
         self.deleted.append(event_id)
+        self.deleted_calls.append({"event_id": event_id, "calendar_id": calendar_id})
         return None
 
     def update_event(
@@ -74,7 +127,10 @@ class FakeProvider:
         timezone=DEFAULT_TIMEZONE,
         description=None,
         location=None,
+        attendees=None,
         private_extended_properties=None,
+        calendar_id=None,
+        notify_attendees=False,
     ):
         event = {
             "id": event_id,
@@ -83,7 +139,11 @@ class FakeProvider:
             "end": {"dateTime": end_time, "timeZone": timezone},
             "description": description,
             "location": location,
+            "attendees": attendees,
+            "notify_attendees": notify_attendees,
         }
+        if calendar_id:
+            event["calendarId"] = calendar_id
         if private_extended_properties:
             event["extendedProperties"] = {
                 "private": private_extended_properties,
@@ -119,6 +179,93 @@ def _fake_event(
 
 
 class FamilyCalendarClawTest(unittest.TestCase):
+    def test_typed_event_id_bypasses_request_search_window(self):
+        provider = FakeProvider()
+        event = _fake_event(
+            "Future planning",
+            "2026-10-01T15:00:00-07:00",
+            "2026-10-01T16:00:00-07:00",
+        )
+        provider.events = [event]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 11, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.update_event_from_request(
+            "move it to Friday at 3 PM",
+            reference_time=reference,
+            event_id=event["id"],
+        )
+
+        self.assertEqual(provider.get_calls, [event["id"]])
+        self.assertEqual(provider.list_calls, [])
+        self.assertIn("Future planning", message)
+
+    def test_typed_event_id_uses_named_calendar_id(self):
+        provider = FakeProvider()
+        event = _fake_event(
+            "Future planning",
+            "2026-10-01T15:00:00-07:00",
+            "2026-10-01T16:00:00-07:00",
+        )
+        event["calendarId"] = "nysha-school-id"
+        provider.events = [event]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 11, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        claw.assign_owner_from_request(
+            "assign it to nimesh",
+            reference_time=reference,
+            event_id=event["id"],
+            calendar_id="nysha-school-id",
+        )
+
+        self.assertEqual(
+            provider.get_call_details,
+            [{"event_id": event["id"], "calendar_id": "nysha-school-id"}],
+        )
+        self.assertEqual(provider.updated[0]["calendarId"], "nysha-school-id")
+
+    def test_pronoun_move_uses_last_named_calendar_event_without_default_search(self):
+        provider = FakeProvider()
+        event = _fake_event(
+            "Art class",
+            "2026-08-15T10:00:00-07:00",
+            "2026-08-15T11:00:00-07:00",
+        )
+        event["calendarId"] = "nysha-school-id"
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.last_created_event = event
+        reference = datetime(2026, 8, 12, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.update_event_from_request(
+            "move it to Friday at 3 PM",
+            reference_time=reference,
+        )
+
+        self.assertEqual(provider.list_calls, [])
+        self.assertIn("Art class", message)
+        self.assertIsNotNone(claw.pending_action)
+        self.assertEqual(claw.pending_action.event["calendarId"], "nysha-school-id")
+
+    def test_pronoun_delete_uses_last_named_calendar_event_without_default_search(self):
+        provider = FakeProvider()
+        event = _fake_event(
+            "Art class",
+            "2026-08-15T10:00:00-07:00",
+            "2026-08-15T11:00:00-07:00",
+        )
+        event["calendarId"] = "nysha-school-id"
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.last_created_event = event
+        reference = datetime(2026, 8, 12, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.delete_event_from_request("delete it", reference_time=reference)
+
+        self.assertEqual(provider.list_calls, [])
+        self.assertIn("Art class", message)
+        self.assertIsNotNone(claw.pending_action)
+        self.assertEqual(claw.pending_action.event["calendarId"], "nysha-school-id")
+
     def test_created_event_message_falls_back_to_event_id_without_link(self):
         start = datetime(2026, 7, 3, 19, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
         end = datetime(2026, 7, 3, 20, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -161,6 +308,417 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-03T19:00:00-07:00")
         self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-03T20:00:00-07:00")
 
+    def test_create_event_adds_family_guests_to_invite(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 11, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            message = claw.create_event_from_request(
+                "/calendar Navya & Nysha are scheduled at 12:20 pm on 8/29 -Just Kids Pediatric Dentistry & Orthodontics - Downtown\n"
+                "Add guest: family",
+                reference_time=reference,
+            )
+
+        self.assertIn("Created calendar event", message)
+        self.assertEqual(provider.created[0]["attendees"], FAMILY_ATTENDEES)
+
+    def test_create_recurring_event_uses_named_calendar_subject(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 12, 9, 32, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.create_event_from_request(
+            "Add a recurring event to Nysha school calendar for Art class at 10 am every Saturday",
+            reference_time=reference,
+        )
+
+        self.assertEqual(provider.created[0]["summary"], "Art class")
+        self.assertEqual(provider.created_calendar_names, ["Nysha school calendar"])
+        self.assertEqual(provider.created[0]["calendarId"], "Nysha school calendar")
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-08-15T10:00:00-07:00")
+        self.assertEqual(provider.created[0]["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SA"])
+        self.assertIn("Created calendar event: Art class", message)
+        self.assertNotIn("To Nysha school calendar", message)
+
+    def test_create_event_strips_trailing_add_to_named_calendar(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.create_event_from_request(
+            "/event learning bee parent teacher meeting 8/28 5 pm add to Nysha school calendar",
+            reference_time=reference,
+        )
+
+        self.assertEqual(provider.created[0]["summary"], "Learning bee parent teacher meeting")
+        self.assertEqual(provider.created_calendar_names, ["Nysha school calendar"])
+        self.assertEqual(provider.created[0]["calendarId"], "Nysha school calendar")
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-08-28T17:00:00-07:00")
+        self.assertIn("Created calendar event: Learning bee parent teacher meeting", message)
+        self.assertNotIn("add to Nysha school calendar", message)
+
+    def test_create_event_intent_strips_target_calendar_phrase_at_insert_boundary(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+
+        message = claw._create_event_from_intent(
+            {
+                "intent": "create_event",
+                "title": "Learning bee parent teacher meeting add to Nysha school calendar",
+                "date": "2026-08-28",
+                "start_time": "17:00",
+                "duration_minutes": 60,
+                "timezone": DEFAULT_TIMEZONE,
+                "description": None,
+                "location": None,
+                "recurrence": None,
+                "attendees": [],
+                "metadata": {},
+                "target_calendar": "Nysha school calendar",
+            }
+        )
+
+        self.assertEqual(provider.created[0]["summary"], "Learning bee parent teacher meeting")
+        self.assertEqual(provider.created_calendar_names, ["Nysha school calendar"])
+        self.assertIn("Created calendar event: Learning bee parent teacher meeting", message)
+        self.assertNotIn("add to Nysha school calendar", message)
+
+    def test_create_event_keeps_calendar_title_words_on_default_calendar(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.create_event_from_request(
+            "Add event to renew calendar subscription 8/28 5 pm",
+            reference_time=reference,
+        )
+
+        self.assertEqual(provider.created[0]["summary"], "Renew calendar subscription")
+        self.assertEqual(provider.created_calendar_names, [None])
+        self.assertNotIn("calendarId", provider.created[0])
+        self.assertIn("Created calendar event: Renew calendar subscription", message)
+
+    def test_create_event_keeps_action_title_ending_in_calendar(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.create_event_from_request(
+            "Add event to renew calendar 8/28 5 pm",
+            reference_time=reference,
+        )
+
+        self.assertEqual(provider.created[0]["summary"], "Renew calendar")
+        self.assertEqual(provider.created_calendar_names, [None])
+        self.assertNotIn("calendarId", provider.created[0])
+        self.assertIn("Created calendar event: Renew calendar", message)
+
+    def test_create_event_to_named_calendar_without_subject_asks_for_title(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 12, 17, 57, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.create_event_from_request(
+            "Add event to Nysha school calendar 8/28 5 pm",
+            reference_time=reference,
+        )
+
+        self.assertEqual(message, "Please provide: title.")
+        self.assertEqual(provider.created, [])
+
+    def test_add_guests_followup_updates_last_event(self):
+        provider = FakeProvider()
+        event = _fake_event(
+            "Dentist",
+            "2026-08-29T12:20:00-07:00",
+            "2026-08-29T13:20:00-07:00",
+        )
+        event["attendees"] = [{"email": "dad@example.test", "displayName": "Dad"}]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.last_created_event = event
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            message = claw.add_guests_from_request("add mom and dad to the invite")
+
+        self.assertIn("Added guests to Dentist", message)
+        self.assertEqual(
+            provider.updated[0]["attendees"],
+            [
+                {"email": "dad@example.test", "displayName": "Dad"},
+                {"email": "mom@example.test", "displayName": "Mom"},
+            ],
+        )
+        self.assertTrue(provider.updated[0]["notify_attendees"])
+
+    def test_ai_field_extractor_adds_guests_to_last_event(self):
+        provider = FakeProvider()
+        event = _fake_event(
+            "Learning bee parent teacher meeting",
+            "2026-08-28T17:00:00-07:00",
+            "2026-08-28T18:00:00-07:00",
+        )
+        extractor = FakeFieldExtractor(
+            {
+                "action": "add_guests",
+                "confidence": 0.94,
+                "slots": {"guest_aliases": ["mom", "dad"]},
+                "missing_fields": [],
+            }
+        )
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.field_extractor = extractor
+        claw.last_created_event = event
+        reference = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            message = claw.create_event_from_request(
+                "please add guests to the invite",
+                reference_time=reference,
+            )
+
+        self.assertEqual(
+            extractor.calls[0]["context"],
+            {
+                "last_created_event": {
+                    "event_id": "learning-bee-parent-teacher-meeting",
+                    "title": "Learning bee parent teacher meeting",
+                }
+            },
+        )
+        self.assertIn("Added guests to Learning bee parent teacher meeting", message)
+        self.assertEqual(provider.updated[0]["attendees"], [
+            {"email": "mom@example.test", "displayName": "Mom"},
+            {"email": "dad@example.test", "displayName": "Dad"},
+        ])
+
+    def test_ai_field_extractor_failure_falls_back_to_deterministic_parse(self):
+        provider = FakeProvider()
+        extractor = FakeFieldExtractor(error=RuntimeError("model unavailable"))
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.field_extractor = extractor
+        reference = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.create_event_from_request(
+            "Add dentist tomorrow at 3 PM",
+            reference_time=reference,
+        )
+
+        self.assertIn("Created calendar event: Dentist", message)
+        self.assertEqual(provider.created[0]["summary"], "Dentist")
+
+    def test_ai_field_extractor_cannot_turn_create_request_into_guest_update(self):
+        provider = FakeProvider()
+        event = _fake_event(
+            "Learning bee parent teacher meeting",
+            "2026-08-28T17:00:00-07:00",
+            "2026-08-28T18:00:00-07:00",
+        )
+        extractor = FakeFieldExtractor(
+            {
+                "action": "add_guests",
+                "confidence": 0.94,
+                "slots": {
+                    "title": "Dinner",
+                    "date": "2026-08-13",
+                    "start_time": "18:00",
+                    "guest_aliases": ["mom", "dad"],
+                },
+                "missing_fields": [],
+            }
+        )
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.field_extractor = extractor
+        claw.last_created_event = event
+        reference = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            message = claw.create_event_from_request(
+                "invite mom and dad to dinner tomorrow at 6",
+                reference_time=reference,
+            )
+
+        self.assertIn("Created calendar event: Dinner", message)
+        self.assertEqual(provider.created[0]["summary"], "Dinner")
+        self.assertEqual(provider.updated, [])
+
+    def test_ai_field_extractor_baseline_redacts_guest_emails(self):
+        provider = FakeProvider()
+        extractor = FakeFieldExtractor(
+            {
+                "action": "create_event",
+                "confidence": 0.94,
+                "slots": {},
+                "missing_fields": [],
+            }
+        )
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.field_extractor = extractor
+        reference = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            claw.create_event_from_request(
+                "Add dentist tomorrow at 3 PM\nAdd guest: family",
+                reference_time=reference,
+            )
+
+        baseline_intent = extractor.calls[0]["baseline_intent"]
+        self.assertEqual(
+            baseline_intent["attendees"],
+            [{"displayName": "Dad"}, {"displayName": "Mom"}],
+        )
+        self.assertNotIn("dad@example.test", repr(baseline_intent))
+
+    def test_api_context_ai_primary_creates_rich_calendar_event(self):
+        provider = FakeProvider()
+        extractor = FakeFieldExtractor(
+            {
+                "action": "create_event",
+                "confidence": 0.97,
+                "slots": {
+                    "title": "Soccer tournament",
+                    "date": "2026-09-05",
+                    "start_time": "09:00",
+                    "duration_minutes": 240,
+                    "calendar_name": "sports calendar",
+                    "location": "Memorial Park",
+                    "guest_aliases": ["parents"],
+                    "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=SA"],
+                },
+                "missing_fields": [],
+            },
+            primary=True,
+        )
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.field_extractor = extractor
+        reference = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=False):
+            message = claw.create_event_from_request(
+                "/calendar Put soccer tournament Sept 5 9am to 1pm on sports calendar at Memorial Park",
+                reference_time=reference,
+            )
+
+        self.assertIn("Created calendar event: Soccer tournament", message)
+        created = provider.created[0]
+        self.assertEqual(created["summary"], "Soccer tournament")
+        self.assertEqual(created["start"]["dateTime"], "2026-09-05T09:00:00-07:00")
+        self.assertEqual(created["end"]["dateTime"], "2026-09-05T13:00:00-07:00")
+        self.assertEqual(created["calendarId"], "sports calendar")
+        self.assertEqual(created["location"], "Memorial Park")
+        self.assertEqual(created["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SA"])
+        self.assertEqual(created["attendees"], FAMILY_ATTENDEES)
+        self.assertTrue(created["notify_attendees"])
+
+    def test_api_context_ai_primary_creates_all_day_event(self):
+        provider = FakeProvider()
+        extractor = FakeFieldExtractor(
+            {
+                "action": "create_event",
+                "confidence": 0.96,
+                "slots": {
+                    "title": "School holiday",
+                    "date": "2026-09-07",
+                    "all_day": True,
+                    "calendar_name": "kids calendar",
+                },
+                "missing_fields": [],
+            },
+            primary=True,
+        )
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.field_extractor = extractor
+        reference = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        message = claw.create_event_from_request(
+            "/calendar School holiday on Sep 7 all day to kids calendar",
+            reference_time=reference,
+        )
+
+        self.assertIn("Created calendar event: School holiday", message)
+        self.assertIn("all day", message)
+        created = provider.created[0]
+        self.assertEqual(created["start"], {"date": "2026-09-07"})
+        self.assertEqual(created["end"], {"date": "2026-09-08"})
+        self.assertTrue(created["all_day"])
+        self.assertEqual(created["calendarId"], "kids calendar")
+
+    def test_add_guests_followup_requires_configured_contacts(self):
+        provider = FakeProvider()
+        event = _fake_event(
+            "Dentist",
+            "2026-08-29T12:20:00-07:00",
+            "2026-08-29T13:20:00-07:00",
+        )
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.last_created_event = event
+
+        with patch.dict("os.environ", {}, clear=True):
+            message = claw.add_guests_from_request("add mom and dad to the invite")
+
+        self.assertIn("Please configure calendar guest email contacts", message)
+        self.assertEqual(provider.updated, [])
+
+    def test_create_event_with_guest_line_requires_configured_contacts(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 11, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", {}, clear=True):
+            message = claw.create_event_from_request(
+                "Add dentist Saturday at 10 AM\nAdd guest: family",
+                reference_time=reference,
+            )
+
+        self.assertIn("Please configure calendar guest email contacts", message)
+        self.assertEqual(provider.created, [])
+
+    def test_pending_create_keeps_missing_guest_contacts_after_followup(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 11, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", {}, clear=True):
+            first_message = claw.create_event_from_request(
+                "Add dentist\nAdd guest: family",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response(
+                "Saturday at 10 AM",
+                reference_time=reference,
+            )
+
+        self.assertIn("Please configure calendar guest email contacts", first_message)
+        self.assertTrue(handled)
+        self.assertIsNotNone(claw.pending_action)
+        self.assertEqual(claw.pending_action.payload["missing_fields"], ["guest_contacts"])
+        self.assertEqual(provider.created, [])
+
+    def test_pending_create_keeps_guest_contacts_added_in_followup(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 11, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", {}, clear=True):
+            first_message = claw.create_event_from_request(
+                "Add dentist Saturday",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response(
+                "10 AM\nAdd guest: family",
+                reference_time=reference,
+            )
+
+        self.assertEqual(first_message, "Please provide a time for Dentist on Saturday, August 15.")
+        self.assertTrue(handled)
+        self.assertIsNotNone(claw.pending_action)
+        self.assertEqual(claw.pending_action.payload["missing_fields"], ["guest_contacts"])
+        self.assertEqual(
+            claw.pending_action.payload["missing_guest_contacts"],
+            ["dad", "mom"],
+        )
+        self.assertEqual(provider.created, [])
+
     def test_assign_owner_followup_updates_last_created_event(self):
         provider = FakeProvider()
         claw = FamilyCalendarClaw.from_provider(provider)
@@ -175,6 +733,23 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertIn("Assigned event to dad", message)
         _, metadata = read_metadata_from_event(provider.updated[-1])
         self.assertEqual(metadata["owner"], "dad")
+
+    def test_assign_owner_preserves_attendees_without_notifications(self):
+        provider = FakeProvider()
+        event = _fake_event(
+            "Dentist",
+            "2026-08-29T12:20:00-07:00",
+            "2026-08-29T13:20:00-07:00",
+        )
+        event["attendees"] = [{"email": "friend@example.com", "displayName": "Friend"}]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.last_created_event = event
+
+        with redirect_stdout(StringIO()):
+            claw.assign_owner_from_request("assign it to nimesh")
+
+        self.assertEqual(provider.updated[0]["attendees"], event["attendees"])
+        self.assertFalse(provider.updated[0]["notify_attendees"])
 
     def test_assign_owner_by_title_updates_matching_event(self):
         provider = FakeProvider()
@@ -382,6 +957,27 @@ class FamilyCalendarClawTest(unittest.TestCase):
             ],
         )
 
+    def test_bulk_date_event_request_full_day_followup_creates_all_day_events(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add events to pay driver for below days\n10/1\n12/1\n2/1\n4/1",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("Whenever time is missing make them full day")
+
+        self.assertTrue(handled)
+        self.assertIsNone(claw.pending_action)
+        self.assertEqual(len(provider.created), 4)
+        self.assertEqual(
+            [event["start"]["date"] for event in provider.created],
+            ["2026-10-01", "2026-12-01", "2027-02-01", "2027-04-01"],
+        )
+        self.assertTrue(all(event["all_day"] for event in provider.created))
+
     def test_bulk_date_event_request_with_time_creates_all_events(self):
         provider = FakeProvider()
         claw = FamilyCalendarClaw.from_provider(provider)
@@ -471,6 +1067,25 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-03T12:00:00-07:00")
         self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-07-03T13:00:00-07:00")
 
+    def test_missing_time_full_day_followup_creates_all_day_event(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 7, 2, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add appointment Friday",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("Whenever time is missing make it full day")
+
+        self.assertTrue(handled)
+        self.assertIsNone(claw.pending_action)
+        self.assertEqual(provider.created[0]["summary"], "Appointment")
+        self.assertEqual(provider.created[0]["start"]["date"], "2026-07-03")
+        self.assertEqual(provider.created[0]["end"]["date"], "2026-07-04")
+        self.assertTrue(provider.created[0]["all_day"])
+
     def test_preparation_followup_updates_last_created_event(self):
         provider = FakeProvider()
         claw = FamilyCalendarClaw.from_provider(provider)
@@ -529,6 +1144,30 @@ class FamilyCalendarClawTest(unittest.TestCase):
             metadata["preparation_notes"],
             "carry snacks for the kids they will be hungry",
         )
+
+    def test_telegram_photo_text_does_not_update_previous_event_as_context(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.last_created_event = _fake_event(
+            "Back to School Event",
+            "2026-08-15T10:00:00-07:00",
+            "2026-08-15T15:00:00-07:00",
+        )
+        reference = datetime(2026, 8, 15, 18, 3, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar in Nysha school calendar\n\n"
+                "Image text:\n"
+                "Second Grade Homework\n"
+                "This homework packet is due Friday morning.\n"
+                "All About Me project is due Friday, August 28.",
+                reference_time=reference,
+            )
+
+        self.assertIn("Please provide a time for", message)
+        self.assertEqual(provider.updated, [])
+        self.assertIsNotNone(claw.pending_action)
 
     def test_create_recurring_weekday_event(self):
         provider = FakeProvider()
@@ -1726,6 +2365,7 @@ class MilestoneOneRegressionTest(unittest.TestCase):
         self.assertTrue(handled)
         self.assertIsNone(claw.pending_action)
         self.assertEqual(provider.created[0]["summary"], "Back to school night")
+        self.assertEqual(provider.created_calendar_names, ["Nysha school calendar"])
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-08-11T16:30:00-07:00")
         self.assertIn("Created calendar event: Back to school night", output.getvalue())
 

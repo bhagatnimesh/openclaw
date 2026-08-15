@@ -40,6 +40,7 @@ class ScienceLabClaw:
     """Entry point for N4OS Science Lab planning from chat channels."""
 
     tools: ScienceLabTools
+    last_result: dict[str, Any] | None = None
 
     @classmethod
     def from_provider(cls, provider: ScienceLabProvider) -> "ScienceLabClaw":
@@ -61,6 +62,7 @@ class ScienceLabClaw:
     ) -> str:
         del reference_time
         response = self.tools.plan_next(count=_requested_count(request))
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)

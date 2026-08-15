@@ -100,6 +100,32 @@ class LibraryClawTest(unittest.TestCase):
         self.assertEqual(status["data"]["summary"]["week"]["pages"], 5)
         self.assertEqual(status["data"]["summary"]["week"]["minutes"], 12)
 
+    def test_named_child_status_uses_only_that_child(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = SQLiteLibraryProvider(Path(temp_dir) / "library.db")
+            claw = LibraryClaw.from_provider(provider)
+            claw.record_from_request(
+                "Nysha read 5 pages of Magic Tree House herself.",
+                reference_time=REFERENCE_TIME,
+            )
+            claw.record_from_request(
+                "Navya read 12 pages of Frog and Toad herself.",
+                reference_time=REFERENCE_TIME,
+            )
+
+            message = claw.status_from_request(
+                "Show Nysha reading status",
+                reference_time=REFERENCE_TIME,
+            )
+            aggregate_entrypoint_message = claw.record_from_request(
+                "Show Nysha reading status",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertIn("5 pages", message)
+        self.assertNotIn("17 pages", message)
+        self.assertEqual(aggregate_entrypoint_message, message)
+
     def test_checkout_email_saves_lightweight_library_bag(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = SQLiteLibraryProvider(Path(temp_dir) / "library.db")

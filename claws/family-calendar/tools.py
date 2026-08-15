@@ -23,7 +23,12 @@ class CalendarProvider(Protocol):
         description: str | None = None,
         location: str | None = None,
         recurrence: list[str] | None = None,
+        attendees: list[dict[str, Any]] | None = None,
         private_extended_properties: dict[str, str] | None = None,
+        calendar_name: str | None = None,
+        notify_attendees: bool = False,
+        all_day: bool = False,
+        event_label_background_color: str | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -35,7 +40,10 @@ class CalendarProvider(Protocol):
     ) -> list[dict[str, Any]]:
         ...
 
-    def delete_event(self, event_id: str) -> None:
+    def get_event(self, event_id: str, calendar_id: str | None = None) -> dict[str, Any]:
+        ...
+
+    def delete_event(self, event_id: str, calendar_id: str | None = None) -> None:
         ...
 
     def update_event(
@@ -47,7 +55,10 @@ class CalendarProvider(Protocol):
         timezone: str = DEFAULT_TIMEZONE,
         description: str | None = None,
         location: str | None = None,
+        attendees: list[dict[str, Any]] | None = None,
         private_extended_properties: dict[str, str] | None = None,
+        calendar_id: str | None = None,
+        notify_attendees: bool = False,
     ) -> dict[str, Any]:
         ...
 
@@ -123,7 +134,12 @@ class CalendarTools:
         description: str | None = None,
         location: str | None = None,
         recurrence: list[str] | None = None,
+        attendees: list[dict[str, Any]] | None = None,
         private_extended_properties: dict[str, str] | None = None,
+        calendar_name: str | None = None,
+        notify_attendees: bool = False,
+        all_day: bool = False,
+        event_label_background_color: str | None = None,
     ) -> ToolResponse:
         missing_fields: list[str] = []
         cleaned_title = _clean_optional(title)
@@ -149,7 +165,12 @@ class CalendarTools:
                 description=_clean_optional(description),
                 location=_clean_optional(location),
                 recurrence=recurrence,
+                attendees=attendees,
                 private_extended_properties=private_extended_properties,
+                calendar_name=_clean_optional(calendar_name),
+                notify_attendees=notify_attendees,
+                all_day=all_day,
+                event_label_background_color=_clean_optional(event_label_background_color),
             )
         except Exception as error:
             return _provider_error_response(error)
@@ -193,13 +214,41 @@ class CalendarTools:
             "data": {"events": events},
         }
 
-    def delete_calendar_event(self, event_id: str | None = None) -> ToolResponse:
+    def get_calendar_event(
+        self,
+        event_id: str | None = None,
+        calendar_id: str | None = None,
+    ) -> ToolResponse:
+        cleaned_event_id = _clean_optional(event_id)
+        if cleaned_event_id is None:
+            return _missing_response(["event_id"])
+        try:
+            event = self.provider.get_event(
+                cleaned_event_id,
+                calendar_id=_clean_optional(calendar_id),
+            )
+        except Exception as error:
+            return _provider_error_response(error)
+        return {
+            "status": "ok",
+            "message": "Calendar event returned from Google Calendar.",
+            "data": {"event": event},
+        }
+
+    def delete_calendar_event(
+        self,
+        event_id: str | None = None,
+        calendar_id: str | None = None,
+    ) -> ToolResponse:
         cleaned_event_id = _clean_optional(event_id)
         if cleaned_event_id is None:
             return _missing_response(["event_id"])
 
         try:
-            self.provider.delete_event(cleaned_event_id)
+            self.provider.delete_event(
+                cleaned_event_id,
+                calendar_id=_clean_optional(calendar_id),
+            )
         except Exception as error:
             return _provider_error_response(error)
 
@@ -218,7 +267,10 @@ class CalendarTools:
         timezone: str | None = DEFAULT_TIMEZONE,
         description: str | None = None,
         location: str | None = None,
+        attendees: list[dict[str, Any]] | None = None,
         private_extended_properties: dict[str, str] | None = None,
+        calendar_id: str | None = None,
+        notify_attendees: bool = False,
     ) -> ToolResponse:
         missing_fields: list[str] = []
         cleaned_event_id = _clean_optional(event_id)
@@ -247,7 +299,10 @@ class CalendarTools:
                 timezone=_clean_optional(timezone) or DEFAULT_TIMEZONE,
                 description=_clean_optional(description),
                 location=_clean_optional(location),
+                attendees=attendees,
                 private_extended_properties=private_extended_properties,
+                calendar_id=_clean_optional(calendar_id),
+                notify_attendees=notify_attendees,
             )
         except Exception as error:
             return _provider_error_response(error)

@@ -22,6 +22,7 @@ class HomeBoardClaw:
 
     tools: HomeBoardTools
     last_item: dict[str, Any] | None = None
+    last_result: dict[str, Any] | None = None
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -130,6 +131,7 @@ class HomeBoardClaw:
             status="pending",
             now=reference_time,
         )
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -148,13 +150,19 @@ class HomeBoardClaw:
         print(message)
         return message
 
-    def mark_done_from_request(self, request: str) -> str:
+    def mark_done_from_request(
+        self,
+        request: str,
+        *,
+        item_id: str | None = None,
+    ) -> str:
         intent = extract_intent(request)
-        item_id = intent.get("item_id")
+        item_id = item_id or intent.get("item_id")
         if not item_id and self.last_item is not None:
             item_id = self.last_item.get("id")
         before = self.last_item if item_id and self.last_item and self.last_item.get("id") == item_id else None
         response = self.tools.mark_done(item_id)
+        self.last_result = response
         if response["status"] == "ok":
             item = response.get("data", {}).get("item", {})
             if item.get("id"):

@@ -12,13 +12,20 @@ from intent import (
     METADATA_MARKER,
     OWNER_ALIAS_PATTERN,
     OWNER_NAME_ALIASES,
+    _strip_calendar_target_phrase,
     extract_intent,
+    merge_ai_calendar_fields,
     read_metadata_from_event,
     write_human_description,
     write_metadata_to_private_extended_properties,
 )
 from prompts import SYSTEM_PROMPT, TOOL_GUIDANCE
 from tools import DEFAULT_TIMEZONE, CalendarProvider, CalendarTools, build_default_tools
+
+try:
+    from ai_field_extraction import CalendarAIFieldExtractor
+except ImportError:
+    CalendarAIFieldExtractor = None
 
 
 SYNONYMS = {
@@ -80,6 +87,10 @@ PRONOUN_TARGETS = {
     "the event",
     "calendar event",
 }
+AI_FIELD_EXTRACTION_CUE_RE = re.compile(
+    r"\b(?:invite|guest|guests?|calendar|attendee|attendees?)\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_event_time(value: str | None) -> datetime | None:
@@ -322,6 +333,75 @@ def _private_extended_properties_for_event(
 
     _, metadata = read_metadata_from_event(event)
     return write_metadata_to_private_extended_properties(metadata)
+
+
+def _event_attendees(event: dict[str, Any]) -> list[dict[str, Any]] | None:
+    attendees = event.get("attendees")
+    if not isinstance(attendees, list):
+        return None
+
+    valid = [
+        dict(attendee)
+        for attendee in attendees
+        if isinstance(attendee, dict) and isinstance(attendee.get("email"), str)
+    ]
+    return valid or None
+
+
+def _event_calendar_id(event: dict[str, Any]) -> str | None:
+    calendar_id = event.get("calendarId")
+    return calendar_id if isinstance(calendar_id, str) and calendar_id.strip() else None
+
+
+def _event_context_for_ai(event: dict[str, Any] | None) -> dict[str, str]:
+    if not event:
+        return {}
+    context = {}
+    for source_key, target_key in (
+        ("id", "event_id"),
+        ("summary", "title"),
+        ("calendarId", "calendar_id"),
+    ):
+        value = event.get(source_key)
+        if isinstance(value, str) and value.strip():
+            context[target_key] = value.strip()
+    return context
+
+
+def _intent_context_for_ai(intent: dict[str, Any]) -> dict[str, Any]:
+    context = dict(intent)
+    attendees = []
+    for attendee in intent.get("attendees") or []:
+        if not isinstance(attendee, dict):
+            continue
+        display_name = attendee.get("displayName")
+        if isinstance(display_name, str) and display_name.strip():
+            attendees.append({"displayName": display_name.strip()})
+        else:
+            attendees.append({"configured": True})
+    if attendees:
+        context["attendees"] = attendees
+    else:
+        context.pop("attendees", None)
+    return context
+
+
+def _merge_attendees(
+    existing: list[dict[str, Any]] | None,
+    additions: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    merged = []
+    seen = set()
+    for attendee in (existing or []) + (additions or []):
+        email = str(attendee.get("email") or "").strip()
+        if not email:
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(attendee))
+    return merged or None
 
 
 def _owner_label(owner: str) -> str:
@@ -646,6 +726,7 @@ def _format_created_event_message(
     recurrence_label: str | None,
     event_link: str | None,
     event_id: str | None,
+    all_day: bool = False,
 ) -> str:
     if event_link:
         event_suffix = f" (open: {event_link})"
@@ -668,6 +749,12 @@ def _format_created_event_message(
     recurrence_suffix = ""
     if recurrence_label:
         recurrence_suffix = f", repeating {recurrence_label}"
+    if all_day:
+        return (
+            f"Created calendar event: {event_title} on "
+            f"{start.strftime('%A, %B %-d')} all day"
+            f"{recurrence_suffix}{event_suffix}."
+        )
     return (
         f"Created calendar event: {event_title} on "
         f"{start.strftime('%A, %B %-d')} from {start.strftime('%-I:%M %p')} "
@@ -676,6 +763,13 @@ def _format_created_event_message(
 
 
 def _format_missing_create_message(intent: dict[str, Any], missing: list[str]) -> str:
+    if "guest_contacts" in missing:
+        missing_contacts = intent.get("missing_guest_contacts") or []
+        if missing_contacts:
+            labels = ", ".join(str(contact) for contact in missing_contacts)
+            return f"Please configure calendar guest email contacts for: {labels}."
+        return "Please configure calendar guest email contacts before adding guests."
+
     if missing == ["time"] and intent.get("title") and intent.get("date"):
         timezone = intent.get("timezone") or DEFAULT_TIMEZONE
         event_date = datetime.fromisoformat(f"{intent['date']}T00:00:00")
@@ -698,14 +792,36 @@ def _merge_create_intent(
             merged[field] = followup[field]
     if followup.get("duration_minutes") and not merged.get("duration_minutes"):
         merged["duration_minutes"] = followup["duration_minutes"]
+    merged["attendees"] = _merge_attendees(
+        merged.get("attendees"),
+        followup.get("attendees"),
+    )
+    missing_guest_contacts = []
+    seen_guest_contacts = set()
+    for contact in (merged.get("missing_guest_contacts") or []) + (
+        followup.get("missing_guest_contacts") or []
+    ):
+        contact_key = str(contact).strip()
+        if not contact_key or contact_key in seen_guest_contacts:
+            continue
+        seen_guest_contacts.add(contact_key)
+        missing_guest_contacts.append(contact_key)
+    merged["missing_guest_contacts"] = missing_guest_contacts
+    if not merged.get("target_calendar") and followup.get("target_calendar"):
+        merged["target_calendar"] = followup["target_calendar"]
+    if followup.get("all_day"):
+        merged["all_day"] = True
+        merged.pop("start_time", None)
 
     missing_fields = []
     if merged.get("title") is None:
         missing_fields.append("title")
     if merged.get("date") is None:
         missing_fields.append("date")
-    if merged.get("start_time") is None:
+    if not merged.get("all_day") and merged.get("start_time") is None:
         missing_fields.append("time")
+    if merged.get("missing_guest_contacts"):
+        missing_fields.append("guest_contacts")
     merged["missing_fields"] = missing_fields
     return merged
 
@@ -921,12 +1037,18 @@ def _extract_recent_event_context_followup(request: str) -> str | None:
     explicit = _extract_context_followup(request)
     if explicit is not None:
         return explicit
+    if _has_telegram_image_text(request):
+        return None
     if not _is_likely_recent_event_context(request):
         return None
 
     cleaned = request.strip().lstrip("> ").strip().strip(".")
     cleaned = re.sub(r"^(?:please\s+)?(?:add|include)\s+", "", cleaned, flags=re.IGNORECASE)
     return cleaned[:1].upper() + cleaned[1:] if cleaned else None
+
+
+def _has_telegram_image_text(request: str) -> bool:
+    return bool(re.search(r"(?im)^\s*Image text:\s*$", request))
 
 
 def _append_context_note(existing_notes: str, context_note: str) -> str:
@@ -1201,7 +1323,9 @@ class FamilyCalendarClaw:
     tool_guidance: str = TOOL_GUIDANCE
     pending_action: PendingAction | None = None
     last_created_event: dict[str, Any] | None = None
+    last_result: dict[str, Any] | None = None
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
+    field_extractor: Any | None = None
 
     @classmethod
     def from_provider(cls, provider: CalendarProvider) -> "FamilyCalendarClaw":
@@ -1209,7 +1333,8 @@ class FamilyCalendarClaw:
 
     @classmethod
     def default(cls, calendar_id: str = "primary") -> "FamilyCalendarClaw":
-        return cls(tools=build_default_tools(calendar_id=calendar_id))
+        extractor = CalendarAIFieldExtractor.from_env_or_none() if CalendarAIFieldExtractor is not None else None
+        return cls(tools=build_default_tools(calendar_id=calendar_id), field_extractor=extractor)
 
     def tool_map(self) -> dict[str, Any]:
         """Return the OpenClaw-visible tool names and their handlers."""
@@ -1222,10 +1347,56 @@ class FamilyCalendarClaw:
             "undo_calendar_action": self.undo_last_action,
         }
 
+    def _should_extract_ai_fields(
+        self,
+        request: str,
+        intent: dict[str, Any],
+    ) -> bool:
+        if self.field_extractor is None:
+            return False
+        if getattr(self.field_extractor, "primary_calendar_api_context", False):
+            return True
+        if intent.get("missing_fields"):
+            return True
+        if AI_FIELD_EXTRACTION_CUE_RE.search(request):
+            return True
+        return False
+
+    def _extract_intent_from_request(
+        self,
+        request: str,
+        reference_time: datetime | None,
+    ) -> dict[str, Any]:
+        intent = extract_intent(request, now=reference_time)
+        if not self._should_extract_ai_fields(request, intent):
+            return intent
+
+        try:
+            ai_fields = self.field_extractor.extract(
+                request,
+                now=reference_time,
+                baseline_intent=_intent_context_for_ai(intent),
+                context={
+                    "last_created_event": _event_context_for_ai(self.last_created_event),
+                },
+            )
+        except Exception:
+            return intent
+        return merge_ai_calendar_fields(
+            intent,
+            ai_fields,
+            request,
+            now=reference_time,
+            primary=bool(getattr(self.field_extractor, "primary_calendar_api_context", False)),
+        )
+
     def create_event_from_request(
         self,
         request: str,
         reference_time: datetime | None = None,
+        *,
+        event_id: str | None = None,
+        calendar_id: str | None = None,
     ) -> str:
         """Parse one simple add-event request and create it through the tool.
 
@@ -1244,22 +1415,38 @@ class FamilyCalendarClaw:
 
             return self._create_events_from_intents(bulk_intent["intents"])
 
-        intent = extract_intent(request, now=reference_time)
+        intent = self._extract_intent_from_request(request, reference_time)
+        if intent.get("intent") == "add_guests" and hasattr(self, "add_guests_from_request"):
+            return self.add_guests_from_intent(
+                intent,
+                event_id=event_id,
+                calendar_id=calendar_id,
+            )
         missing = intent.get("missing_fields", [])
         if missing:
             preparation_note = _extract_preparation_followup(request)
-            if preparation_note is not None and self.last_created_event is not None:
+            context_note = _extract_recent_event_context_followup(request)
+            target_event = self.last_created_event
+            if event_id and (preparation_note is not None or context_note is not None):
+                response = self.tools.get_calendar_event(event_id, calendar_id=calendar_id)
+                self.last_result = response
+                if response["status"] != "ok":
+                    message = response["message"]
+                    print(message)
+                    return message
+                target_event = response.get("data", {}).get("event")
+
+            if preparation_note is not None and target_event is not None:
                 message = self._add_preparation_to_event(
-                    self.last_created_event,
+                    target_event,
                     preparation_note,
                 )
                 print(message)
                 return message
 
-            context_note = _extract_recent_event_context_followup(request)
-            if context_note is not None and self.last_created_event is not None:
+            if context_note is not None and target_event is not None:
                 message = self._add_context_to_event(
-                    self.last_created_event,
+                    target_event,
                     context_note,
                 )
                 print(message)
@@ -1302,22 +1489,39 @@ class FamilyCalendarClaw:
         intent: dict[str, Any],
         print_message: bool = True,
     ) -> str:
+        title = _strip_calendar_target_phrase(str(intent["title"]))
         timezone = intent.get("timezone") or DEFAULT_TIMEZONE
-        start = datetime.fromisoformat(f"{intent['date']}T{intent['start_time']}:00")
-        start = start.replace(tzinfo=ZoneInfo(timezone))
-        end = start + timedelta(minutes=int(intent["duration_minutes"]))
+        all_day = bool(intent.get("all_day"))
+        if all_day:
+            start = datetime.fromisoformat(f"{intent['date']}T00:00:00").replace(
+                tzinfo=ZoneInfo(timezone),
+            )
+            end = start + timedelta(days=1)
+            start_value = start.date().isoformat()
+            end_value = end.date().isoformat()
+        else:
+            start = datetime.fromisoformat(f"{intent['date']}T{intent['start_time']}:00")
+            start = start.replace(tzinfo=ZoneInfo(timezone))
+            end = start + timedelta(minutes=int(intent["duration_minutes"]))
+            start_value = start.isoformat()
+            end_value = end.isoformat()
         response = self.tools.create_calendar_event(
-            title=intent["title"],
-            start_time=start.isoformat(),
-            end_time=end.isoformat(),
+            title=title or intent["title"],
+            start_time=start_value,
+            end_time=end_value,
             timezone=timezone,
             description=write_human_description(intent.get("description")),
             location=intent.get("location"),
             recurrence=intent.get("recurrence"),
+            attendees=intent.get("attendees"),
+            calendar_name=intent.get("target_calendar"),
+            notify_attendees=bool(intent.get("attendees")),
+            all_day=all_day,
             private_extended_properties=write_metadata_to_private_extended_properties(
                 intent.get("metadata"),
             ),
         )
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -1339,6 +1543,7 @@ class FamilyCalendarClaw:
             recurrence_label=intent.get("recurrence_label"),
             event_link=event_link,
             event_id=event_id,
+            all_day=all_day,
         )
         if print_message:
             print(message)
@@ -1355,6 +1560,7 @@ class FamilyCalendarClaw:
         start_time = start.get("dateTime")
         end_time = end.get("dateTime")
         if not event_id or not start_time or not end_time:
+            self.last_result = {"status": "error"}
             return "I could not update the previous event because it is missing Google Calendar details."
 
         notes, metadata = read_metadata_from_event(event)
@@ -1371,10 +1577,13 @@ class FamilyCalendarClaw:
             timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
             description=description,
             location=event.get("location"),
+            attendees=_event_attendees(event),
+            calendar_id=_event_calendar_id(event),
             private_extended_properties=write_metadata_to_private_extended_properties(
                 metadata,
             ),
         )
+        self.last_result = response
         if response["status"] != "ok":
             return response["message"]
 
@@ -1399,6 +1608,7 @@ class FamilyCalendarClaw:
         start_time = start.get("dateTime")
         end_time = end.get("dateTime")
         if not event_id or not start_time or not end_time:
+            self.last_result = {"status": "error"}
             return "I could not update the previous event because it is missing Google Calendar details."
 
         notes, metadata = read_metadata_from_event(event)
@@ -1411,10 +1621,13 @@ class FamilyCalendarClaw:
             timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
             description=description,
             location=event.get("location"),
+            attendees=_event_attendees(event),
+            calendar_id=_event_calendar_id(event),
             private_extended_properties=write_metadata_to_private_extended_properties(
                 metadata,
             ),
         )
+        self.last_result = response
         if response["status"] != "ok":
             return response["message"]
 
@@ -1432,10 +1645,27 @@ class FamilyCalendarClaw:
         self,
         request: str,
         reference_time: datetime | None = None,
+        *,
+        event_id: str | None = None,
+        calendar_id: str | None = None,
     ) -> str:
         owner, target = _assignment_parts(request)
         if owner is None or owner == "unknown":
             message = "Please say who should own the event."
+            print(message)
+            return message
+
+        if event_id:
+            response = self.tools.get_calendar_event(event_id, calendar_id=calendar_id)
+            self.last_result = response
+            if response["status"] != "ok":
+                message = response["message"]
+                print(message)
+                return message
+            message = self._assign_owner_to_event(
+                response.get("data", {}).get("event", {}),
+                owner,
+            )
             print(message)
             return message
 
@@ -1456,6 +1686,7 @@ class FamilyCalendarClaw:
             max_results=50,
         )
         if response["status"] != "ok":
+            self.last_result = response
             message = response["message"]
             print(message)
             return message
@@ -1484,6 +1715,107 @@ class FamilyCalendarClaw:
         print(message)
         return message
 
+    def add_guests_from_request(
+        self,
+        request: str,
+        reference_time: datetime | None = None,
+        *,
+        event_id: str | None = None,
+        calendar_id: str | None = None,
+    ) -> str:
+        intent = self._extract_intent_from_request(request, reference_time)
+        return self.add_guests_from_intent(
+            intent,
+            event_id=event_id,
+            calendar_id=calendar_id,
+        )
+
+    def add_guests_from_intent(
+        self,
+        intent: dict[str, Any],
+        *,
+        event_id: str | None = None,
+        calendar_id: str | None = None,
+    ) -> str:
+        attendees = intent.get("attendees") or []
+        if "guest_contacts" in intent.get("missing_fields", []):
+            message = _format_missing_create_message(
+                intent,
+                intent.get("missing_fields", []),
+            )
+            print(message)
+            return message
+        if not attendees:
+            message = "Please say which guest to add: mom, dad, or family."
+            print(message)
+            return message
+
+        if event_id:
+            response = self.tools.get_calendar_event(event_id, calendar_id=calendar_id)
+            self.last_result = response
+            if response["status"] != "ok":
+                message = response["message"]
+                print(message)
+                return message
+            target_event = response.get("data", {}).get("event", {})
+        else:
+            target_event = self.last_created_event
+
+        if target_event is None:
+            message = "I do not know which event to update."
+            print(message)
+            return message
+
+        message = self._add_guests_to_event(target_event, attendees)
+        print(message)
+        return message
+
+    def _add_guests_to_event(
+        self,
+        event: dict[str, Any],
+        attendees: list[dict[str, Any]],
+    ) -> str:
+        event_id = event.get("id")
+        start = event.get("start", {})
+        end = event.get("end", {})
+        start_time = start.get("dateTime")
+        end_time = end.get("dateTime")
+        if not event_id or not start_time or not end_time:
+            self.last_result = {"status": "error"}
+            return "I could not update the event because it is missing Google Calendar details."
+
+        merged_attendees = _merge_attendees(_event_attendees(event), attendees)
+        response = self.tools.update_calendar_event(
+            event_id=event_id,
+            title=event.get("summary") or "Untitled event",
+            start_time=start_time,
+            end_time=end_time,
+            timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
+            description=write_human_description(event.get("description")),
+            location=event.get("location"),
+            attendees=merged_attendees,
+            calendar_id=_event_calendar_id(event),
+            notify_attendees=True,
+            private_extended_properties=_private_extended_properties_for_event(event),
+        )
+        self.last_result = response
+        if response["status"] != "ok":
+            return response["message"]
+
+        updated = deepcopy(event)
+        updated.update(response.get("data", {}).get("event", {}))
+        updated["attendees"] = merged_attendees or []
+        self.last_created_event = updated
+        self.undo_stack.append({"action": "restore_event", "event": deepcopy(event)})
+        names = ", ".join(str(attendee.get("displayName") or attendee["email"]) for attendee in attendees)
+        return f"Added guest{'s' if len(attendees) != 1 else ''} to {updated.get('summary') or 'the event'}: {names}."
+
+    def _contextual_event_from_intent(self, intent: dict[str, Any]) -> dict[str, Any] | None:
+        query = str(intent.get("query") or "").strip().lower()
+        if query in PRONOUN_TARGETS:
+            return self.last_created_event
+        return None
+
     def _assign_owner_to_event(self, event: dict[str, Any], owner: str) -> str:
         event_id = event.get("id")
         start = event.get("start", {})
@@ -1491,6 +1823,7 @@ class FamilyCalendarClaw:
         start_time = start.get("dateTime")
         end_time = end.get("dateTime")
         if not event_id or not start_time or not end_time:
+            self.last_result = {"status": "error"}
             return "I could not update the event because it is missing Google Calendar details."
 
         notes, metadata = read_metadata_from_event(event)
@@ -1504,10 +1837,13 @@ class FamilyCalendarClaw:
             timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
             description=description,
             location=event.get("location"),
+            attendees=_event_attendees(event),
+            calendar_id=_event_calendar_id(event),
             private_extended_properties=write_metadata_to_private_extended_properties(
                 metadata,
             ),
         )
+        self.last_result = response
         if response["status"] != "ok":
             return response["message"]
 
@@ -1531,6 +1867,7 @@ class FamilyCalendarClaw:
         intent = extract_intent(request, now=reference_time)
         missing = intent.get("missing_fields", [])
         if missing:
+            self.last_result = {"status": "needs_information"}
             message = "Please provide: " + ", ".join(missing) + "."
             print(message)
             return message
@@ -1540,6 +1877,7 @@ class FamilyCalendarClaw:
             time_max=intent["end"],
             max_results=50,
         )
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -1607,6 +1945,7 @@ class FamilyCalendarClaw:
             time_max=intent["end"],
             max_results=100,
         )
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -1633,6 +1972,7 @@ class FamilyCalendarClaw:
             time_max=intent["end"],
             max_results=100,
         )
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -1651,36 +1991,64 @@ class FamilyCalendarClaw:
         self,
         request: str,
         reference_time: datetime | None = None,
+        *,
+        event_id: str | None = None,
+        calendar_id: str | None = None,
     ) -> str:
         """Find a matching Google Calendar event and delete only one strong match."""
 
+        self.last_result = {"status": "needs_information"}
+
         intent = extract_intent(request, now=reference_time)
-        missing = intent.get("missing_fields", [])
+        contextual_event = None if event_id else self._contextual_event_from_intent(intent)
+        missing = [
+            field
+            for field in intent.get("missing_fields", [])
+            if not ((event_id or contextual_event is not None) and field in {"event", "query", "target"})
+        ]
         if missing:
             message = "Please provide: " + ", ".join(missing) + "."
             print(message)
             return message
 
-        response = self.tools.list_calendar_events(
-            time_min=intent["search_start"],
-            time_max=intent["search_end"],
-            max_results=50,
-        )
+        if event_id:
+            response = self.tools.get_calendar_event(event_id, calendar_id=calendar_id)
+        elif contextual_event is not None:
+            response = {
+                "status": "ok",
+                "message": "Calendar event returned from context.",
+                "data": {"event": contextual_event},
+            }
+        else:
+            response = self.tools.list_calendar_events(
+                time_min=intent["search_start"],
+                time_max=intent["search_end"],
+                max_results=50,
+            )
         if response["status"] != "ok":
+            self.last_result = response
             message = response["message"]
             print(message)
             return message
 
-        events = sorted(
-            response.get("data", {}).get("events", []),
-            key=_event_start,
+        events = (
+            [response.get("data", {}).get("event", {})]
+            if event_id or contextual_event is not None
+            else sorted(response.get("data", {}).get("events", []), key=_event_start)
         )
-        ranked_matches = match_events(request, events)
-        matches = [
-            item["event"]
-            for item in ranked_matches
-            if item["score"] >= MIN_CONFIDENT_SCORE
-        ]
+        if event_id or contextual_event is not None:
+            matches = [
+                event
+                for event in events
+                if contextual_event is not None or str(event.get("id") or "") == event_id
+            ]
+        else:
+            ranked_matches = match_events(request, events)
+            matches = [
+                item["event"]
+                for item in ranked_matches
+                if item["score"] >= MIN_CONFIDENT_SCORE
+            ]
         if not matches:
             message = "I couldn't find a matching event. Try including the event name or date."
             print(message)
@@ -1708,36 +2076,64 @@ class FamilyCalendarClaw:
         self,
         request: str,
         reference_time: datetime | None = None,
+        *,
+        event_id: str | None = None,
+        calendar_id: str | None = None,
     ) -> str:
         """Find a matching event and ask before moving it."""
 
+        self.last_result = {"status": "needs_information"}
+
         intent = extract_intent(request, now=reference_time)
-        missing = intent.get("missing_fields", [])
+        contextual_event = None if event_id else self._contextual_event_from_intent(intent)
+        missing = [
+            field
+            for field in intent.get("missing_fields", [])
+            if not ((event_id or contextual_event is not None) and field in {"event", "query", "target"})
+        ]
         if missing:
             message = "Please provide: " + ", ".join(missing) + "."
             print(message)
             return message
 
-        response = self.tools.list_calendar_events(
-            time_min=intent["search_start"],
-            time_max=intent["search_end"],
-            max_results=50,
-        )
+        if event_id:
+            response = self.tools.get_calendar_event(event_id, calendar_id=calendar_id)
+        elif contextual_event is not None:
+            response = {
+                "status": "ok",
+                "message": "Calendar event returned from context.",
+                "data": {"event": contextual_event},
+            }
+        else:
+            response = self.tools.list_calendar_events(
+                time_min=intent["search_start"],
+                time_max=intent["search_end"],
+                max_results=50,
+            )
         if response["status"] != "ok":
+            self.last_result = response
             message = response["message"]
             print(message)
             return message
 
-        events = sorted(
-            response.get("data", {}).get("events", []),
-            key=_event_start,
+        events = (
+            [response.get("data", {}).get("event", {})]
+            if event_id or contextual_event is not None
+            else sorted(response.get("data", {}).get("events", []), key=_event_start)
         )
-        ranked_matches = match_events(request, events)
-        matches = [
-            item["event"]
-            for item in ranked_matches
-            if item["score"] >= MIN_CONFIDENT_SCORE
-        ]
+        if event_id or contextual_event is not None:
+            matches = [
+                event
+                for event in events
+                if contextual_event is not None or str(event.get("id") or "") == event_id
+            ]
+        else:
+            ranked_matches = match_events(request, events)
+            matches = [
+                item["event"]
+                for item in ranked_matches
+                if item["score"] >= MIN_CONFIDENT_SCORE
+            ]
         if not matches:
             message = "I couldn't find a matching event. Try including the event name or date."
             print(message)
@@ -1815,6 +2211,7 @@ class FamilyCalendarClaw:
     ) -> str:
         event_id = event.get("id")
         if not event_id:
+            self.last_result = {"status": "error"}
             message = "Matching event has no Google Calendar event id, so I did not move it."
             print(message)
             return message
@@ -1828,10 +2225,13 @@ class FamilyCalendarClaw:
             timezone=updated["start"].get("timeZone") or DEFAULT_TIMEZONE,
             description=write_human_description(updated.get("description")),
             location=updated.get("location"),
+            attendees=_event_attendees(updated),
+            calendar_id=_event_calendar_id(event),
             private_extended_properties=_private_extended_properties_for_event(
                 updated,
             ),
         )
+        self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
             print(message)
@@ -1845,11 +2245,16 @@ class FamilyCalendarClaw:
     def _delete_confirmed_event(self, event: dict[str, Any]) -> str:
         event_id = event.get("id")
         if not event_id:
+            self.last_result = {"status": "error"}
             message = "Matching event has no Google Calendar event id, so I did not delete it."
             print(message)
             return message
 
-        delete_response = self.tools.delete_calendar_event(event_id)
+        delete_response = self.tools.delete_calendar_event(
+            event_id,
+            calendar_id=_event_calendar_id(event),
+        )
+        self.last_result = delete_response
         if delete_response["status"] != "ok":
             message = delete_response["message"]
             print(message)
@@ -1870,7 +2275,10 @@ class FamilyCalendarClaw:
         event = undo.get("event", {})
         action = undo.get("action")
         if action == "delete_event":
-            response = self.tools.delete_calendar_event(event.get("id"))
+            response = self.tools.delete_calendar_event(
+                event.get("id"),
+                calendar_id=_event_calendar_id(event),
+            )
             message = (
                 f"Undid calendar event creation: deleted {_format_event_choice(event)}."
                 if response["status"] == "ok"
@@ -1923,6 +2331,8 @@ class FamilyCalendarClaw:
             timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
             description=write_human_description(event.get("description")),
             location=event.get("location"),
+            attendees=_event_attendees(event),
+            calendar_id=_event_calendar_id(event),
             private_extended_properties=_private_extended_properties_for_event(event),
         )
 
@@ -1944,6 +2354,8 @@ class FamilyCalendarClaw:
             description=write_human_description(event.get("description")),
             location=event.get("location"),
             recurrence=event.get("recurrence"),
+            attendees=_event_attendees(event),
+            calendar_name=_event_calendar_id(event),
             private_extended_properties=_private_extended_properties_for_event(event),
         )
 
@@ -2068,6 +2480,8 @@ def run_cli(claw: FamilyCalendarClaw | None = None) -> None:
             active_claw.delete_event_from_request(command)
         elif intent["intent"] == "update_event":
             active_claw.update_event_from_request(command)
+        elif intent["intent"] == "add_guests":
+            active_claw.add_guests_from_request(command)
         else:
             active_claw.create_event_from_request(command)
 

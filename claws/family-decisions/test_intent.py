@@ -9,6 +9,16 @@ REFERENCE_TIME = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo("America/Los_Angeles
 
 
 class FamilyDecisionIntentTest(unittest.TestCase):
+    def test_show_latest_decision_brief_prefers_brief_over_list(self):
+        intent = extract_intent("Show the latest decision brief")
+
+        self.assertEqual(intent["intent"], "decision_brief")
+
+    def test_add_an_option_accepts_article(self):
+        intent = extract_intent("Add an option to the summer camp decision")
+
+        self.assertEqual(intent["intent"], "add_option")
+
     def test_extracts_decision_capture(self):
         intent = extract_intent(
             "Track decision about summer camp plan by next Monday owner mom",
@@ -151,6 +161,15 @@ class FamilyDecisionIntentTest(unittest.TestCase):
         self.assertEqual(discussion["title"], "Should we attend the birthday?")
         self.assertEqual((planning["kind"], planning["title"], planning["due"]), ("planning", "Camping trip", "2026-09-12"))
         self.assertEqual((decision["kind"], decision["title"]), ("decision", "Choose Nysha's school next year"))
+
+    def test_classifies_add_discussion_without_separator_as_backlog_item(self):
+        intent = extract_intent(
+            "Add a discussion write, rehearse night, morning routines.",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual((intent["intent"], intent["kind"]), ("create_backlog_item", "discussion"))
+        self.assertEqual(intent["title"], "Write, rehearse night, morning routines")
 
     def test_natural_questions_default_to_discussion_unless_consequential(self):
         lightweight = extract_intent("Should we go to the birthday this weekend?", now=REFERENCE_TIME)
