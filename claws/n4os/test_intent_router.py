@@ -4,6 +4,8 @@ from datetime import datetime
 from io import StringIO
 import json
 import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -12,6 +14,7 @@ from ai_refinement import OpenAIN4OSIntentInterpreter, validate_ai_intent_frame
 from claw import N4OSClaw, PendingRouteClarification
 from input_normalizer import improve_entered_text
 from intent_router import N4OSIntentFrame, interpret_request, route_request
+import note_capture
 
 
 REFERENCE_TIME = datetime(2026, 7, 3, 9, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -2814,6 +2817,41 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(decision["route"], "unknown")
         self.assertEqual(decision["action"], "unknown")
+
+    def test_explicit_note_command_routes_to_capture(self):
+        decision = route_request(
+            "/note quick Patrick Collison: learning still matters",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(decision["route"], "capture")
+        self.assertEqual(decision["action"], "capture_note")
+        self.assertEqual(decision["source"], "explicit")
+
+    def test_note_quick_appends_to_quick_notes_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            n4os_root = Path(temp_dir) / "n4os"
+            quick_notes = n4os_root / "learnings" / "Quick Notes.md"
+            with (
+                patch.object(note_capture, "N4OS_ROOT", n4os_root),
+                patch.object(note_capture, "LEARNINGS_ROOT", n4os_root / "learnings"),
+                patch.object(note_capture, "QUICK_NOTES_PATH", quick_notes),
+                patch.object(note_capture, "INBOX_PATH", n4os_root / "learnings" / "Inbox.md"),
+            ):
+                result = N4OSClaw().handle_turn(
+                    "/note quick Patrick Collison: learning still matters",
+                    reference_time=REFERENCE_TIME,
+                    source="telegram_text:nimesh",
+                )
+
+                self.assertEqual(result.status, "success")
+                self.assertEqual(result.effect, "mutation")
+                self.assertEqual(result.decision.route, "capture")
+                saved = quick_notes.read_text(encoding="utf-8")
+                self.assertIn("## 2026-07-03", saved)
+                self.assertIn("### Patrick Collison", saved)
+                self.assertIn("learning still matters", saved)
+                self.assertIn("Source: telegram_text:nimesh", saved)
 
     def test_routes_science_lab_planning_without_family_clarification(self):
         decision = route_request(

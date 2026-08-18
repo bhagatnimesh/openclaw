@@ -1,24 +1,169 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
 
 from n4os_structured_memory import (
+    SQLiteStructuredMemoryStore,
     format_structured_memory_query,
     has_structured_memory_mutation_match,
     has_structured_memory_query_match,
     is_structured_memory_mutation_message,
     is_structured_memory_query,
     is_structured_remember_message,
+    looks_like_natural_structured_memory_query,
     mutate_structured_memory,
     remember_structured_memory,
 )
 
 
+def assert_memory_reply(
+    test: unittest.TestCase,
+    reply: str,
+    remembered: str,
+    source: str,
+    *,
+    updated: bool = False,
+) -> None:
+    lines = reply.splitlines()
+    test.assertEqual(lines[0], remembered)
+    test.assertEqual(lines[1], source)
+    test.assertRegex(lines[2], r"^Stored: [A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2} [AP]M\.$")
+    if updated:
+        test.assertRegex(lines[3], r"^Updated: [A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2} [AP]M\.$")
+        test.assertEqual(len(lines), 4)
+    else:
+        test.assertEqual(len(lines), 3)
+
+
 class N4OSStructuredMemoryTest(unittest.TestCase):
+    def test_recent_memory_query_lists_items_by_created_at_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            store = SQLiteStructuredMemoryStore(Path(tmpdir) / "data" / "n4os.db")
+            now = datetime.now().astimezone()
+            store.add_item(
+                kind="note",
+                subject="general",
+                actor=None,
+                value="older school code is 1111",
+                happened_on=None,
+                applies_on=None,
+                status="active",
+                confidence="low",
+                source="Telegram",
+                text="older school code is 1111",
+                created_at=now - timedelta(days=8),
+            )
+            store.add_item(
+                kind="note",
+                subject="general",
+                actor=None,
+                value="Nysha school gate code is 4812",
+                happened_on=None,
+                applies_on=None,
+                status="active",
+                confidence="low",
+                source="Telegram",
+                text="Nysha school gate code is 4812",
+                created_at=now - timedelta(days=2),
+            )
+            store.add_item(
+                kind="note",
+                subject="general",
+                actor=None,
+                value="guest wifi password is mango-2026",
+                happened_on=None,
+                applies_on=None,
+                status="active",
+                confidence="low",
+                source="Telegram",
+                text="guest wifi password is mango-2026",
+                created_at=now - timedelta(hours=1),
+            )
+
+            reply = format_structured_memory_query(
+                "/remember last 7 days",
+                n4os_root=n4os_root,
+            )
+
+        self.assertIn("Remembered in the last 7 days:", reply)
+        self.assertIn("guest wifi password is mango-2026", reply)
+        self.assertIn("Nysha school gate code is 4812", reply)
+        self.assertNotIn("older school code is 1111", reply)
+        self.assertLess(
+            reply.index("guest wifi password is mango-2026"),
+            reply.index("Nysha school gate code is 4812"),
+        )
+
+    def test_recent_memory_query_supports_default_week_and_month_windows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            store = SQLiteStructuredMemoryStore(Path(tmpdir) / "data" / "n4os.db")
+            now = datetime.now().astimezone()
+            store.add_item(
+                kind="note",
+                subject="general",
+                actor=None,
+                value="camp form code is CAMP-9",
+                happened_on=None,
+                applies_on=None,
+                status="active",
+                confidence="low",
+                source="Telegram",
+                text="camp form code is CAMP-9",
+                created_at=now - timedelta(days=20),
+            )
+
+            recent_reply = format_structured_memory_query(
+                "/remember recent",
+                n4os_root=n4os_root,
+            )
+            month_reply = format_structured_memory_query(
+                "what did I remember in the last month?",
+                n4os_root=n4os_root,
+            )
+
+        self.assertEqual(recent_reply, "No structured memories stored in the last 7 days.")
+        self.assertIn("Remembered in the last month:", month_reply)
+        self.assertIn("camp form code is CAMP-9", month_reply)
+
+    def test_recent_memory_query_truncates_after_default_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            store = SQLiteStructuredMemoryStore(Path(tmpdir) / "data" / "n4os.db")
+            now = datetime.now().astimezone()
+            for index in range(21):
+                store.add_item(
+                    kind="note",
+                    subject="general",
+                    actor=None,
+                    value=f"recent memory {index:02d}",
+                    happened_on=None,
+                    applies_on=None,
+                    status="active",
+                    confidence="low",
+                    source="Telegram",
+                    text=f"recent memory {index:02d}",
+                    created_at=now - timedelta(minutes=index),
+                )
+
+            reply = format_structured_memory_query(
+                "/remember last 1 day",
+                n4os_root=n4os_root,
+            )
+
+        self.assertIn("recent memory 00", reply)
+        self.assertIn("recent memory 19", reply)
+        self.assertNotIn("recent memory 20", reply)
+        self.assertIn("Showing the newest 20", reply)
+
     def test_twenty_family_memory_examples_retrieve_by_natural_language(self):
         cases = [
             (
@@ -256,7 +401,12 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
                 n4os_root=n4os_root,
             )
 
-        self.assertEqual(reply, "Remembered memory: Next dinner pickup: Niyati\nSource: Telegram.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered memory: Next dinner pickup: Niyati",
+            "Source: Telegram.",
+        )
 
     def test_explicit_dinner_pickup_owner_search_uses_assignment_fallback(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -272,7 +422,12 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
                 n4os_root=n4os_root,
             )
 
-        self.assertEqual(reply, "Remembered memory: Next dinner pickup: Niyati\nSource: Telegram.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered memory: Next dinner pickup: Niyati",
+            "Source: Telegram.",
+        )
 
     def test_explicit_memory_query_match_sees_dinner_assignment(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -306,7 +461,12 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
                 n4os_root=n4os_root,
             )
 
-        self.assertEqual(reply, "Remembered note: learning code 0816\nSource: Telegram Nimesh.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered note: learning code 0816",
+            "Source: Telegram Nimesh.",
+        )
 
     def test_generic_query_does_not_return_dinner_assignment(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -379,6 +539,13 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
         self.assertEqual(result.reply, "Updated structured memory: learning code 9911.")
         self.assertIn("9911", reply)
         self.assertNotIn("0816", reply)
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered note: learning code 9911",
+            "Source: Telegram.",
+            updated=True,
+        )
 
     def test_update_structured_memory_preserves_omitted_note_context(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -855,7 +1022,12 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
                 n4os_root=n4os_root,
             )
 
-        self.assertEqual(reply, "Remembered note: dinner pickup gate code is 1234\nSource: Telegram.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered note: dinner pickup gate code is 1234",
+            "Source: Telegram.",
+        )
 
     def test_find_memory_does_not_require_find_token_match(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -871,7 +1043,12 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
                 n4os_root=n4os_root,
             )
 
-        self.assertEqual(reply, "Remembered note: learning code 0816\nSource: Telegram.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered note: learning code 0816",
+            "Source: Telegram.",
+        )
 
     def test_explicit_memory_query_with_dinner_pickup_returns_note_before_owner(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -891,7 +1068,12 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
                 n4os_root=n4os_root,
             )
 
-        self.assertEqual(reply, "Remembered note: dinner pickup gate code is 1234\nSource: Telegram.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered note: dinner pickup gate code is 1234",
+            "Source: Telegram.",
+        )
 
     def test_explicit_dinner_pickup_search_miss_does_not_return_owner(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -977,11 +1159,31 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
 
         self.assertEqual(
             assignment_reply,
-            "Remembered memory: Next dinner pickup: Niyati\nSource: Telegram.",
+            "\n".join(
+                [
+                    "Remembered memory: Next dinner pickup: Niyati",
+                    "Source: Telegram.",
+                    assignment_reply.splitlines()[2],
+                ]
+            ),
+        )
+        self.assertRegex(
+            assignment_reply.splitlines()[2],
+            r"^Stored: [A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2} [AP]M\.$",
         )
         self.assertEqual(
             event_reply,
-            "Remembered memory: Dinner pickup: 2026-08-12: Nimesh\nSource: Telegram.",
+            "\n".join(
+                [
+                    "Remembered memory: Dinner pickup: 2026-08-12: Nimesh",
+                    "Source: Telegram.",
+                    event_reply.splitlines()[2],
+                ]
+            ),
+        )
+        self.assertRegex(
+            event_reply.splitlines()[2],
+            r"^Stored: [A-Z][a-z]{2} \d{1,2}, \d{4} \d{1,2}:\d{2} [AP]M\.$",
         )
 
     def test_explicit_dinner_pickup_content_miss_does_not_return_owner(self):
@@ -1229,7 +1431,12 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
                 n4os_root=n4os_root,
             )
 
-        self.assertEqual(reply, "Remembered note: learning code 0816\nSource: Telegram.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered note: learning code 0816",
+            "Source: Telegram.",
+        )
 
     def test_structured_memory_wrapper_word_is_not_required_content(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1242,12 +1449,230 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
                 n4os_root=n4os_root,
             )
 
-        self.assertEqual(reply, "Remembered note: learning code 0816\nSource: Telegram.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered note: learning code 0816",
+            "Source: Telegram.",
+        )
+
+    def test_voice_style_remember_punctuation_saves_note(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+
+            result = remember_structured_memory(
+                "Remember, learning bee teacher name Ms. Kelly and Ms. Peggy.",
+                n4os_root=n4os_root,
+            )
+            reply = format_structured_memory_query(
+                "find structured memory learning bee teacher name",
+                n4os_root=n4os_root,
+            )
+
+        self.assertEqual(result.reply, "Remembered. Structured note saved.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered note: learning bee teacher name Ms. Kelly and Ms. Peggy",
+            "Source: Telegram.",
+        )
+
+    def test_natural_teacher_name_question_routes_to_matching_note(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+
+            remember_structured_memory(
+                "/remember learning bee teacher name Ms. Kelly and Ms. Peggy.",
+                n4os_root=n4os_root,
+            )
+            reply = format_structured_memory_query(
+                "What is learning bee teacher name?",
+                n4os_root=n4os_root,
+            )
+
+            self.assertTrue(looks_like_natural_structured_memory_query("What is learning bee teacher name?"))
+            self.assertTrue(
+                has_structured_memory_query_match(
+                    "What is learning bee teacher name?",
+                    n4os_root=n4os_root,
+                )
+            )
+            assert_memory_reply(
+                self,
+                reply,
+                "Remembered note: learning bee teacher name Ms. Kelly and Ms. Peggy",
+                "Source: Telegram.",
+            )
+
+    def test_who_and_where_natural_questions_match_saved_notes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+
+            remember_structured_memory(
+                "/remember piano teacher Ms. Rivera.",
+                n4os_root=n4os_root,
+            )
+            remember_structured_memory(
+                "/remember dentist office Smile Kids on Main Street.",
+                n4os_root=n4os_root,
+            )
+
+            self.assertTrue(
+                has_structured_memory_query_match(
+                    "Who is the piano teacher?",
+                    n4os_root=n4os_root,
+                )
+            )
+            self.assertTrue(
+                has_structured_memory_query_match(
+                    "Where is dentist office?",
+                    n4os_root=n4os_root,
+                )
+            )
+
+    def test_voice_style_natural_teacher_name_question_matches_note(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+
+            remember_structured_memory(
+                "/remember learning bee teacher name Ms. Kelly and Ms. Peggy.",
+                n4os_root=n4os_root,
+            )
+
+            self.assertTrue(looks_like_natural_structured_memory_query("What it learning bee teacher name"))
+            self.assertTrue(
+                has_structured_memory_query_match(
+                    "What it learning bee teacher name",
+                    n4os_root=n4os_root,
+                )
+            )
+
+    def test_find_memory_matches_learn_learning_variant(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+
+            remember_structured_memory(
+                "/remember learning bee teacher name Ms. Kelly and Ms. Peggy.",
+                n4os_root=n4os_root,
+            )
+            reply = format_structured_memory_query(
+                "Find memory learn bee teacher name",
+                n4os_root=n4os_root,
+            )
+
+            self.assertTrue(
+                has_structured_memory_query_match(
+                    "Find memory learn bee teacher name",
+                    n4os_root=n4os_root,
+                )
+            )
+            assert_memory_reply(
+                self,
+                reply,
+                "Remembered note: learning bee teacher name Ms. Kelly and Ms. Peggy",
+                "Source: Telegram.",
+            )
+
+    def test_single_subject_find_memory_matches_saved_person_note(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+
+            remember_structured_memory(
+                "/remember Sriram suggested taking the earlier flight.",
+                n4os_root=n4os_root,
+            )
+            reply = format_structured_memory_query(
+                "Find memory sriram",
+                n4os_root=n4os_root,
+            )
+
+            self.assertTrue(is_structured_memory_query("Find memory sriram"))
+            self.assertTrue(
+                has_structured_memory_query_match(
+                    "Find memory sriram",
+                    n4os_root=n4os_root,
+                )
+            )
+            assert_memory_reply(
+                self,
+                reply,
+                "Remembered note: Sriram suggested taking the earlier flight",
+                "Source: Telegram.",
+            )
+
+    def test_natural_past_question_matches_saved_person_note(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+
+            remember_structured_memory(
+                "/remember Sriram suggested taking the earlier flight.",
+                n4os_root=n4os_root,
+            )
+            reply = format_structured_memory_query(
+                "What did Sriram suggest?",
+                n4os_root=n4os_root,
+            )
+
+            self.assertTrue(looks_like_natural_structured_memory_query("What did Sriram suggest?"))
+            self.assertTrue(
+                has_structured_memory_query_match(
+                    "What did Sriram suggest?",
+                    n4os_root=n4os_root,
+                )
+            )
+            assert_memory_reply(
+                self,
+                reply,
+                "Remembered note: Sriram suggested taking the earlier flight",
+                "Source: Telegram.",
+            )
+
+    def test_natural_suggest_question_matches_recommended_memory_wording(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+
+            remember_structured_memory(
+                "/remember beast academy Brain teaser recommended by Sriram",
+                n4os_root=n4os_root,
+            )
+            reply = format_structured_memory_query(
+                "What did Sriram suggest?",
+                n4os_root=n4os_root,
+            )
+
+            self.assertTrue(
+                has_structured_memory_query_match(
+                    "What did Sriram suggest?",
+                    n4os_root=n4os_root,
+                )
+            )
+            assert_memory_reply(
+                self,
+                reply,
+                "Remembered note: beast academy Brain teaser recommended by Sriram",
+                "Source: Telegram.",
+            )
 
     def test_message_detection(self):
         self.assertTrue(is_structured_remember_message("/remember Niyati picked up dinner"))
         self.assertTrue(is_structured_remember_message("remember Niyati picked up dinner"))
+        self.assertTrue(is_structured_remember_message("Remember, learning bee teacher name Ms. Kelly"))
+        self.assertTrue(is_structured_remember_message("remember: learning bee teacher name Ms. Kelly"))
         self.assertFalse(is_structured_remember_message("remember to add milk"))
+        self.assertFalse(is_structured_remember_message("remember, to add milk"))
+        self.assertFalse(is_structured_remember_message("/remember recent"))
+        self.assertFalse(is_structured_remember_message("/remember last 7 days"))
+        self.assertTrue(is_structured_memory_query("/remember recent"))
+        self.assertTrue(is_structured_memory_query("/remember last 5 days"))
+        self.assertTrue(is_structured_memory_query("what did I remember in the last 2 weeks?"))
         self.assertTrue(is_structured_memory_query("who picked the last 3 dinners?"))
         self.assertFalse(is_structured_memory_query("What is code for learning bee?"))
         self.assertTrue(is_structured_memory_query("Find memory learning code"))
@@ -1264,7 +1689,13 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
         self.assertFalse(is_structured_memory_query("find notes app"))
         self.assertFalse(is_structured_memory_query("find memory code"))
         self.assertFalse(is_structured_memory_query("show memory password"))
+        self.assertTrue(is_structured_memory_query("Find memory sriram"))
         self.assertFalse(is_structured_memory_query("what are my current goals?"))
+        self.assertTrue(looks_like_natural_structured_memory_query("What is learning bee teacher name?"))
+        self.assertTrue(looks_like_natural_structured_memory_query("What did Sriram suggest?"))
+        self.assertTrue(looks_like_natural_structured_memory_query("What it learning bee teacher name"))
+        self.assertFalse(looks_like_natural_structured_memory_query("what are my current goals?"))
+        self.assertFalse(looks_like_natural_structured_memory_query("show memory usage"))
 
     def test_remember_about_probe_routes_only_with_matching_memory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1478,7 +1909,12 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
                 n4os_root=n4os_root,
             )
 
-        self.assertEqual(reply, "Remembered note: learning code 0816\nSource: Telegram.")
+        assert_memory_reply(
+            self,
+            reply,
+            "Remembered note: learning code 0816",
+            "Source: Telegram.",
+        )
 
     def test_generic_value_query_matches_lookup_alias_phrasing(self):
         with tempfile.TemporaryDirectory() as tmpdir:

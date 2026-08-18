@@ -83,16 +83,41 @@ class FakeCalendarTools:
 
 
 class FakeTaskTools:
-    def __init__(self, tasks):
-        self.tasks = tasks
+    def __init__(self, tasks, task_lists=None):
+        self.task_lists = task_lists or [{"id": "@default", "title": "My Tasks"}]
+        self.tasks_by_list = {
+            entry["id"]: [dict(task, task_list_id=entry["id"]) for task in (tasks or [])]
+            for entry in self.task_lists
+        }
+        if task_lists is not None:
+            self.tasks_by_list = {
+                entry["id"]: [
+                    dict(task, task_list_id=entry["id"])
+                    for task in entry.get("tasks", [])
+                ]
+                for entry in task_lists
+            }
+        self.tasks = self.tasks_by_list.get("@default", [])
         self.completed = []
         self.created = []
 
-    def list_tasks(self, show_completed=False):
+    def list_task_lists(self):
+        return {
+            "status": "ok",
+            "message": "Task lists returned from Google Tasks.",
+            "data": {
+                "task_lists": [
+                    {"id": entry["id"], "title": entry.get("title", entry["id"])}
+                    for entry in self.task_lists
+                ],
+            },
+        }
+
+    def list_tasks(self, task_list_id="@default", show_completed=False):
         return {
             "status": "ok",
             "message": "ok",
-            "data": {"tasks": self.tasks},
+            "data": {"tasks": self.tasks_by_list.get(task_list_id, [])},
         }
 
     def complete_task(self, task_id=None, task_list_id="@default", confirmed=False):
@@ -103,7 +128,7 @@ class FakeTaskTools:
                 "data": {"task_id": task_id, "action": "complete"},
             }
         self.completed.append((task_list_id, task_id))
-        for task in self.tasks:
+        for task in self.tasks_by_list.get(task_list_id, []):
             if task.get("id") == task_id:
                 task["status"] = "completed"
                 return {
@@ -141,7 +166,9 @@ class FakeTaskTools:
                 "task_list_id": task_list_id,
             }
         )
-        self.tasks.append(task)
+        self.tasks_by_list.setdefault(task_list_id, []).append(task)
+        if task_list_id == "@default":
+            self.tasks = self.tasks_by_list["@default"]
         return {"status": "ok", "message": "Task created.", "data": {"task": task}}
 
 
@@ -153,6 +180,21 @@ class FailingCalendarTools:
 class FailingTaskTools:
     def list_tasks(self, show_completed=False):
         raise ConnectionResetError("tasks reset")
+
+
+class PartiallyFailingTaskTools(FakeTaskTools):
+    def __init__(self, *args, failing_task_list_id: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.failing_task_list_id = failing_task_list_id
+
+    def list_tasks(self, task_list_id="@default", show_completed=False):
+        if task_list_id == self.failing_task_list_id:
+            return {
+                "status": "error",
+                "message": "Task list unavailable.",
+                "data": {"task_list_id": task_list_id},
+            }
+        return super().list_tasks(task_list_id=task_list_id, show_completed=show_completed)
 
 
 class StartupUnavailableCalendarTools(FailingCalendarTools):
@@ -312,6 +354,33 @@ class FakeShoppingTools:
         }
 
 
+class FakeHomeworkTools:
+    def __init__(self, items=None):
+        self.items = items or []
+
+    def list_homework(self, child=None, limit=10):
+        rows = [
+            item for item in self.items
+            if child is None or item.get("child") == child
+        ][:limit]
+        return {
+            "status": "ok",
+            "message": "Homework returned.",
+            "data": {"items": rows},
+        }
+
+
+class PartiallyFailingHomeworkTools(FakeHomeworkTools):
+    def __init__(self, items=None, failing_child="Navya"):
+        super().__init__(items)
+        self.failing_child = failing_child
+
+    def list_homework(self, child=None, limit=10):
+        if child == self.failing_child:
+            raise RuntimeError("homework unavailable")
+        return super().list_homework(child=child, limit=limit)
+
+
 class FakeReadingGardenTools:
     def __init__(self, summary=None):
         self.summary = summary or {
@@ -373,7 +442,7 @@ class FakeReadingGardenTools:
         }
 
 
-def sources(events=None, tasks=None, home_board_items=None, decisions=None, backlog_items=None, shopping_items=None, reading_garden=None):
+def sources(events=None, tasks=None, home_board_items=None, decisions=None, backlog_items=None, shopping_items=None, reading_garden=None, homework_items=None):
     return DashboardSources(
         calendar_tools=FakeCalendarTools(events or []),
         task_tools=FakeTaskTools(tasks or []),
@@ -384,10 +453,134 @@ def sources(events=None, tasks=None, home_board_items=None, decisions=None, back
         decision_tools=FakeBacklogTools(backlog_items) if backlog_items is not None else FakeDecisionTools(decisions),
         shopping_tools=FakeShoppingTools(shopping_items),
         reading_garden_tools=FakeReadingGardenTools(reading_garden),
+        homework_tools=FakeHomeworkTools(homework_items),
     )
 
 
 class DashboardDataTest(unittest.TestCase):
+    def test_task_source_failure_keeps_task_unavailable_state_visible(self):
+        data = build_dashboard_data(
+            DashboardSources(
+                calendar_tools=FakeCalendarTools([]),
+                task_tools=FailingTaskTools(),
+                read_event_metadata=fallback_event_metadata,
+                read_task_metadata=fallback_task_metadata,
+                recommend_task_matches=fallback_recommend_task_matches,
+                home_board_tools=FakeHomeBoardTools([]),
+                decision_tools=FakeDecisionTools([]),
+                shopping_tools=FakeShoppingTools([]),
+                reading_garden_tools=FakeReadingGardenTools({}),
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:20:00-07:00"),
+        )
+
+        self.assertFalse(data["tasks"]["available"])
+        self.assertEqual(data["tasks"]["pending"], [])
+        self.assertIn("Tasks source unavailable", data["tasks"]["message"])
+
+    def test_dashboard_reads_open_tasks_from_all_google_task_lists(self):
+        data = build_dashboard_data(
+            DashboardSources(
+                calendar_tools=FakeCalendarTools([]),
+                task_tools=FakeTaskTools(
+                    [],
+                    task_lists=[
+                        {
+                            "id": "@default",
+                            "title": "My Tasks",
+                            "tasks": [
+                                task("Default task", task_id="default-task"),
+                            ],
+                        },
+                        {
+                            "id": "finance-list",
+                            "title": "Finance",
+                            "tasks": [
+                                task(
+                                    "Set order for SaaS",
+                                    due="2026-07-03T00:00:00.000Z",
+                                    task_id="finance-task",
+                                ),
+                            ],
+                        },
+                        {
+                            "id": "shopping-list",
+                            "title": "Shopping",
+                            "tasks": [
+                                task("Buy apples", task_id="shopping-task"),
+                            ],
+                        },
+                    ],
+                ),
+                read_event_metadata=fallback_event_metadata,
+                read_task_metadata=fallback_task_metadata,
+                recommend_task_matches=fallback_recommend_task_matches,
+                home_board_tools=FakeHomeBoardTools([]),
+                decision_tools=FakeDecisionTools([]),
+                shopping_tools=FakeShoppingTools([]),
+                reading_garden_tools=FakeReadingGardenTools({}),
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:20:00-07:00"),
+        )
+
+        self.assertEqual(
+            [(entry["id"], entry["title"], entry["count"]) for entry in data["tasks"]["lists"]],
+            [("@default", "My Tasks", 1), ("finance-list", "Finance", 1)],
+        )
+        self.assertNotIn(
+            "Buy apples",
+            [task["title"] for task in data["tasks"]["pending"]],
+        )
+        finance_tasks = [
+            task
+            for task in data["tasks"]["pending"]
+            if task["task_list_id"] == "finance-list"
+        ]
+        self.assertEqual([task["title"] for task in finance_tasks], ["Set order for SaaS"])
+
+    def test_dashboard_keeps_tasks_from_readable_lists_when_one_list_fails(self):
+        data = build_dashboard_data(
+            DashboardSources(
+                calendar_tools=FakeCalendarTools([]),
+                task_tools=PartiallyFailingTaskTools(
+                    [],
+                    task_lists=[
+                        {
+                            "id": "@default",
+                            "title": "My Tasks",
+                            "tasks": [
+                                task("Default task", task_id="default-task"),
+                            ],
+                        },
+                        {
+                            "id": "finance-list",
+                            "title": "Finance",
+                            "tasks": [],
+                        },
+                    ],
+                    failing_task_list_id="finance-list",
+                ),
+                read_event_metadata=fallback_event_metadata,
+                read_task_metadata=fallback_task_metadata,
+                recommend_task_matches=fallback_recommend_task_matches,
+                home_board_tools=FakeHomeBoardTools([]),
+                decision_tools=FakeDecisionTools([]),
+                shopping_tools=FakeShoppingTools([]),
+                reading_garden_tools=FakeReadingGardenTools({}),
+            ),
+            now=datetime.fromisoformat("2026-07-03T09:20:00-07:00"),
+        )
+
+        self.assertTrue(data["tasks"]["available"])
+        self.assertIn("Default task", [item["title"] for item in data["tasks"]["pending"]])
+        self.assertNotIn(
+            "Finance task list unavailable",
+            [item["title"] for item in data["tasks"]["pending"]],
+        )
+        self.assertTrue(
+            any("Finance task list unavailable" in warning["detail"] for warning in data["warnings"])
+        )
+
     def test_best_next_action_prefers_prep_needed_upcoming_event(self):
         data = build_dashboard_data(
             sources(
@@ -946,6 +1139,76 @@ class DashboardDataTest(unittest.TestCase):
         by_list = {shopping_list["slug"]: shopping_list for shopping_list in data["shopping"]["by_list"]}
         self.assertEqual(by_list["indian"]["pending_count"], 1)
         self.assertEqual(by_list["costco"]["items"][0]["title"], "milk")
+
+    def test_dashboard_includes_homework_by_child_and_class(self):
+        data = build_dashboard_data(
+            sources(
+                homework_items=[
+                    {
+                        "id": "hw-1",
+                        "child": "Nysha",
+                        "title": "Fractions packet",
+                        "subject": "Math",
+                        "assigned_date": "2026-08-14",
+                        "due_date": "2026-08-15",
+                        "status": "assigned",
+                    },
+                    {
+                        "id": "hw-2",
+                        "child": "Navya",
+                        "title": "Color wheel",
+                        "subject": "Art",
+                        "assigned_date": "2026-08-14",
+                        "due_date": "2026-08-18",
+                        "status": "assigned",
+                    },
+                ],
+            ),
+            now=datetime.fromisoformat("2026-08-15T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["summary"]["homework_count"], 2)
+        self.assertEqual(data["homework"]["due_now_count"], 1)
+        by_child = {entry["child"]: entry for entry in data["homework"]["children"]}
+        self.assertEqual(by_child["Nysha"]["open_count"], 1)
+        self.assertEqual(by_child["Nysha"]["classes"][0]["class_name"], "Math")
+        self.assertEqual(by_child["Navya"]["classes"][0]["class_name"], "Art")
+        self.assertEqual(data["homework"]["upcoming"][0]["due_label"], "Due today")
+
+    def test_dashboard_homework_partial_failure_keeps_loaded_upcoming_items(self):
+        data = build_dashboard_data(
+            DashboardSources(
+                calendar_tools=FakeCalendarTools([]),
+                task_tools=FakeTaskTools([]),
+                read_event_metadata=fallback_event_metadata,
+                read_task_metadata=fallback_task_metadata,
+                recommend_task_matches=fallback_recommend_task_matches,
+                home_board_tools=FakeHomeBoardTools([]),
+                decision_tools=FakeDecisionTools([]),
+                shopping_tools=FakeShoppingTools(),
+                reading_garden_tools=FakeReadingGardenTools(),
+                homework_tools=PartiallyFailingHomeworkTools(
+                    [
+                        {
+                            "id": "hw-1",
+                            "child": "Nysha",
+                            "title": "Reading log",
+                            "subject": "Reading",
+                            "assigned_date": "2026-08-14",
+                            "due_date": "2026-08-21",
+                            "status": "assigned",
+                        },
+                    ],
+                    failing_child="Navya",
+                ),
+            ),
+            now=datetime.fromisoformat("2026-08-15T09:00:00-07:00"),
+        )
+
+        self.assertEqual(data["source_status"], "partial")
+        self.assertTrue(data["homework"]["available"])
+        self.assertTrue(data["homework"]["partial"])
+        self.assertEqual(data["homework"]["upcoming"][0]["title"], "Reading log")
 
     def test_complete_dashboard_shopping_item_updates_source(self):
         shopping_tools = FakeShoppingTools(

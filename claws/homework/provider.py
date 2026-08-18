@@ -104,6 +104,22 @@ class SQLiteHomeworkProvider:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS homework_class_schedules (
+                    id TEXT PRIMARY KEY,
+                    child TEXT NOT NULL,
+                    class_name TEXT NOT NULL,
+                    weekday INTEGER NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+                    start_time TEXT,
+                    due_rule TEXT NOT NULL CHECK (due_rule IN ('next_class', 'friday')),
+                    calendar_name TEXT,
+                    source TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(child, class_name)
+                )
+                """,
+            )
+            connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_homework_items_child_due
                 ON homework_items(child, due_date, updated_at)
                 """,
@@ -118,6 +134,12 @@ class SQLiteHomeworkProvider:
                 """
                 CREATE INDEX IF NOT EXISTS idx_homework_assets_item
                 ON homework_assets(homework_item_id, created_at)
+                """,
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_homework_class_schedules_child_class
+                ON homework_class_schedules(child, class_name)
                 """,
             )
 
@@ -287,6 +309,174 @@ class SQLiteHomeworkProvider:
             ).fetchone()
         return dict(updated) if updated is not None else None
 
+    def update_due_date(
+        self,
+        *,
+        homework_item_id: str,
+        due_date: str | Date,
+        note: str | None = None,
+        updated_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        timestamp = updated_at or datetime.now().astimezone().isoformat()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM homework_items WHERE id = :id",
+                {"id": homework_item_id},
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE homework_items
+                SET due_date = :due_date, updated_at = :updated_at
+                WHERE id = :id
+                """,
+                {
+                    "id": homework_item_id,
+                    "due_date": _date_text(due_date),
+                    "updated_at": timestamp,
+                },
+            )
+            self._insert_event(connection, homework_item_id, "note", note or "Due date updated.", timestamp)
+            updated = connection.execute(
+                "SELECT * FROM homework_items WHERE id = :id",
+                {"id": homework_item_id},
+            ).fetchone()
+        return dict(updated) if updated is not None else None
+
+    def update_assignment_details(
+        self,
+        *,
+        homework_item_id: str,
+        title: str | None = None,
+        subject: str | None = None,
+        due_date: str | Date | None = None,
+        notes: str | None = None,
+        grade: str | None = None,
+        week_range: str | None = None,
+        daily_work: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        event_note: str | None = None,
+        updated_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        timestamp = updated_at or datetime.now().astimezone().isoformat()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM homework_items WHERE id = :id",
+                {"id": homework_item_id},
+            ).fetchone()
+            if row is None:
+                return None
+            current = dict(row)
+            merged_metadata = _merge_metadata(current.get("metadata_json"), metadata)
+            connection.execute(
+                """
+                UPDATE homework_items
+                SET
+                    title = COALESCE(:title, title),
+                    subject = COALESCE(:subject, subject),
+                    due_date = COALESCE(:due_date, due_date),
+                    notes = COALESCE(:notes, notes),
+                    grade = COALESCE(:grade, grade),
+                    week_range = COALESCE(:week_range, week_range),
+                    daily_work = COALESCE(:daily_work, daily_work),
+                    metadata_json = COALESCE(:metadata_json, metadata_json),
+                    updated_at = :updated_at
+                WHERE id = :id
+                """,
+                {
+                    "id": homework_item_id,
+                    "title": _clean_update_text(title),
+                    "subject": _clean_update_text(subject),
+                    "due_date": _date_text(due_date),
+                    "notes": _clean_update_text(notes),
+                    "grade": _clean_update_text(grade),
+                    "week_range": _clean_update_text(week_range),
+                    "daily_work": _clean_update_text(daily_work),
+                    "metadata_json": _metadata_json(merged_metadata),
+                    "updated_at": timestamp,
+                },
+            )
+            self._insert_event(connection, homework_item_id, "note", event_note or "Homework details updated.", timestamp)
+            updated = connection.execute(
+                "SELECT * FROM homework_items WHERE id = :id",
+                {"id": homework_item_id},
+            ).fetchone()
+        return dict(updated) if updated is not None else None
+
+    def upsert_class_schedule(
+        self,
+        *,
+        child: str,
+        class_name: str,
+        weekday: int,
+        start_time: str | None = None,
+        due_rule: str = "next_class",
+        calendar_name: str | None = None,
+        source: str = "manual",
+        updated_at: str | None = None,
+    ) -> dict[str, Any]:
+        timestamp = updated_at or datetime.now().astimezone().isoformat()
+        item = {
+            "id": f"{_schedule_key(child)}:{_schedule_key(class_name)}",
+            "child": child,
+            "class_name": class_name,
+            "weekday": int(weekday),
+            "start_time": start_time,
+            "due_rule": due_rule if due_rule in {"next_class", "friday"} else "next_class",
+            "calendar_name": calendar_name,
+            "source": source,
+            "updated_at": timestamp,
+        }
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO homework_class_schedules (
+                    id, child, class_name, weekday, start_time, due_rule,
+                    calendar_name, source, updated_at
+                )
+                VALUES (
+                    :id, :child, :class_name, :weekday, :start_time, :due_rule,
+                    :calendar_name, :source, :updated_at
+                )
+                ON CONFLICT(child, class_name) DO UPDATE SET
+                    weekday = excluded.weekday,
+                    start_time = excluded.start_time,
+                    due_rule = excluded.due_rule,
+                    calendar_name = excluded.calendar_name,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                item,
+            )
+            row = connection.execute(
+                """
+                SELECT *
+                FROM homework_class_schedules
+                WHERE child = :child AND class_name = :class_name
+                """,
+                {"child": child, "class_name": class_name},
+            ).fetchone()
+        return dict(row)
+
+    def list_class_schedules(self, *, child: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        where = ""
+        if child:
+            where = " WHERE child = :child"
+            params["child"] = child
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM homework_class_schedules
+                """
+                + where
+                + " ORDER BY child ASC, weekday ASC, COALESCE(start_time, '99:99') ASC, class_name ASC",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_items(
         self,
         *,
@@ -438,3 +628,31 @@ def _metadata_json(metadata: dict[str, Any] | None) -> str | None:
     if not metadata:
         return None
     return json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+
+
+def _metadata_from_json(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _merge_metadata(current_json: Any, update: dict[str, Any] | None) -> dict[str, Any] | None:
+    current = _metadata_from_json(current_json)
+    if update:
+        current.update(update)
+    return current or None
+
+
+def _clean_update_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = " ".join(str(value).split()).strip()
+    return cleaned or None
+
+
+def _schedule_key(value: str) -> str:
+    return "-".join(str(value).lower().split())

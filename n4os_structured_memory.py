@@ -16,7 +16,12 @@ DEFAULT_DB_FILE = ROOT / "data" / "n4os.db"
 
 MemoryKind = Literal["dinner_pickup_event", "dinner_pickup_assignment", "note"]
 
-REMEMBER_RE = re.compile(r"^\s*/?remember(?:@\w+)?(?!\s+to\b)(?=\s|$)", re.I)
+REMEMBER_RE = re.compile(
+    r"^\s*/?remember(?:@\w+)?"
+    r"(?!\s*(?:[,:;.-]\s*)?to\b)"
+    r"(?=$|\s|[,:;.-])(?:\s*[,:;.-]\s*)?",
+    re.I,
+)
 FORGET_RE = re.compile(
     r"^\s*/?(?:forget|delete|remove)\s+(?:the\s+)?(?:(?:remembered|structured)\s+)?"
     r"(?:(?:note|notes|memory|memories)\s+)?(?P<query>.+)",
@@ -65,6 +70,14 @@ GENERIC_VALUE_QUERY_RE = re.compile(
     r"(?:code|combination|confirmation|email|ending|login|number|passcode|password|pin|username)\b",
     re.I,
 )
+NATURAL_NOTE_QUERY_RE = re.compile(
+    r"^\s*(?:"
+    r"what(?:'s|\s+is|\s+was|\s+did|\s+it)|whats|"
+    r"who(?:'s|\s+is|\s+was)|whose|"
+    r"where(?:'s|\s+is|\s+was)|when(?:'s|\s+is|\s+was)"
+    r")\b.+",
+    re.I,
+)
 EXPLICIT_MEMORY_QUERY_RE = re.compile(
     r"^\s*(?:"
     r"(?:find|look\s+up|lookup|search|show(?:\s+me)?)\s+"
@@ -82,50 +95,55 @@ MEMORY_QUERY_STOP_WORDS = frozenset(
     {
         "a",
         "about",
-    "an",
-    "and",
-    "any",
-    "again",
-    "current",
-    "currently",
-    "do",
-    "does",
-    "find",
-    "for",
+        "again",
+        "an",
+        "and",
+        "any",
+        "current",
+        "currently",
+        "did",
+        "do",
+        "does",
+        "find",
+        "for",
         "have",
         "i",
-        "is",
         "it",
+        "is",
         "look",
         "lookup",
         "me",
-    "memory",
-    "memories",
-    "my",
-    "now",
-    "note",
-    "notes",
-    "of",
-    "please",
-    "remember",
-    "remembered",
-    "saved",
-    "search",
-    "show",
-    "still",
-    "stored",
-    "structured",
-    "that",
-    "the",
-    "today",
-    "tomorrow",
-    "to",
-    "up",
-    "was",
-    "what",
-    "whats",
-    "yesterday",
-    "you",
+        "memories",
+        "memory",
+        "my",
+        "note",
+        "notes",
+        "now",
+        "of",
+        "please",
+        "remember",
+        "remembered",
+        "saved",
+        "search",
+        "show",
+        "still",
+        "stored",
+        "structured",
+        "that",
+        "the",
+        "to",
+        "today",
+        "tomorrow",
+        "up",
+        "was",
+        "when",
+        "where",
+        "what",
+        "whats",
+        "who",
+        "whose",
+        "yesterday",
+        "you",
     }
 )
 NON_MEMORY_VALUE_TERMS = frozenset({"area", "auth", "barcode", "qr", "verification", "zip", "zipcode"})
@@ -176,6 +194,7 @@ class MemoryItem:
     source: str
     text: str
     created_at: str
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +208,12 @@ class StructuredMemoryMutationResult:
     reply: str
     item: MemoryItem | None = None
     previous_item: MemoryItem | None = None
+
+
+@dataclass(frozen=True)
+class RecentMemoryWindow:
+    days: int
+    label: str
 
 
 class SQLiteStructuredMemoryStore:
@@ -233,8 +258,22 @@ class SQLiteStructuredMemoryStore:
                     confidence TEXT NOT NULL,
                     source TEXT NOT NULL,
                     text TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT
                 )
+                """,
+            )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(n4os_memory_items)").fetchall()
+            }
+            if "updated_at" not in columns:
+                connection.execute("ALTER TABLE n4os_memory_items ADD COLUMN updated_at TEXT")
+            connection.execute(
+                """
+                UPDATE n4os_memory_items
+                SET updated_at = created_at
+                WHERE updated_at IS NULL
                 """,
             )
             connection.execute(
@@ -259,6 +298,7 @@ class SQLiteStructuredMemoryStore:
         text: str,
         created_at: datetime | None = None,
     ) -> MemoryItem:
+        stored_at = (created_at or datetime.now().astimezone()).isoformat(timespec="microseconds")
         item = MemoryItem(
             id=uuid4().hex,
             kind=kind,
@@ -271,18 +311,19 @@ class SQLiteStructuredMemoryStore:
             confidence=confidence,
             source=source,
             text=text,
-            created_at=(created_at or datetime.now().astimezone()).isoformat(timespec="microseconds"),
+            created_at=stored_at,
+            updated_at=stored_at,
         )
         with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO n4os_memory_items (
                     id, kind, subject, actor, value, happened_on, applies_on,
-                    status, confidence, source, text, created_at
+                    status, confidence, source, text, created_at, updated_at
                 )
                 VALUES (
                     :id, :kind, :subject, :actor, :value, :happened_on, :applies_on,
-                    :status, :confidence, :source, :text, :created_at
+                    :status, :confidence, :source, :text, :created_at, :updated_at
                 )
                 """,
                 item.__dict__,
@@ -295,11 +336,11 @@ class SQLiteStructuredMemoryStore:
                 """
                 INSERT OR REPLACE INTO n4os_memory_items (
                     id, kind, subject, actor, value, happened_on, applies_on,
-                    status, confidence, source, text, created_at
+                    status, confidence, source, text, created_at, updated_at
                 )
                 VALUES (
                     :id, :kind, :subject, :actor, :value, :happened_on, :applies_on,
-                    :status, :confidence, :source, :text, :created_at
+                    :status, :confidence, :source, :text, :created_at, :updated_at
                 )
                 """,
                 item.__dict__,
@@ -331,6 +372,7 @@ class SQLiteStructuredMemoryStore:
         return item
 
     def replace_item(self, item: MemoryItem, *, text: str, value: str) -> MemoryItem:
+        updated_at = datetime.now().astimezone().isoformat(timespec="microseconds")
         updated = MemoryItem(
             id=item.id,
             kind=item.kind,
@@ -343,7 +385,8 @@ class SQLiteStructuredMemoryStore:
             confidence=item.confidence,
             source=item.source,
             text=text,
-            created_at=datetime.now().astimezone().isoformat(timespec="microseconds"),
+            created_at=item.created_at,
+            updated_at=updated_at,
         )
         self.restore_item(updated)
         return updated
@@ -399,6 +442,17 @@ class SQLiteStructuredMemoryStore:
     def search_memories(self, *, query: str, limit: int) -> list[MemoryItem]:
         return self._search_items(query=query, limit=limit, notes_only=False)
 
+    def recent_items(self, *, since: datetime, limit: int) -> list[MemoryItem]:
+        return self._items(
+            """
+            SELECT * FROM n4os_memory_items
+            WHERE created_at >= :since
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit
+            """,
+            {"since": since.isoformat(timespec="microseconds"), "limit": limit},
+        )
+
     def _search_items(self, *, query: str, limit: int, notes_only: bool) -> list[MemoryItem]:
         terms = _memory_query_terms(query)
         if not terms:
@@ -431,11 +485,19 @@ class SQLiteStructuredMemoryStore:
     def _items(self, query: str, params: dict[str, object]) -> list[MemoryItem]:
         with self._connection() as connection:
             rows = connection.execute(query, params).fetchall()
-        return [MemoryItem(**dict(row)) for row in rows]
+        items: list[MemoryItem] = []
+        for row in rows:
+            values = dict(row)
+            values.setdefault("updated_at", values.get("created_at"))
+            items.append(MemoryItem(**values))
+        return items
 
 
 def is_structured_remember_message(text: str) -> bool:
-    return bool(REMEMBER_RE.match(text.strip()))
+    stripped = text.strip()
+    if _parse_recent_memory_window(stripped):
+        return False
+    return bool(REMEMBER_RE.match(stripped))
 
 
 def is_structured_memory_mutation_message(text: str) -> bool:
@@ -505,7 +567,8 @@ def has_structured_memory_mutation_match(
 def is_structured_memory_query(text: str) -> bool:
     stripped = text.strip()
     return bool(
-        LAST_PICKUPS_RE.search(stripped)
+        _parse_recent_memory_window(stripped)
+        or LAST_PICKUPS_RE.search(stripped)
         or PICKUP_QUERY_RE.search(stripped)
         or _is_explicit_memory_search_query(stripped)
         or _is_memory_search_command_query(stripped)
@@ -518,12 +581,15 @@ def has_structured_memory_query_match(
     n4os_root: Path = DEFAULT_N4OS_ROOT,
 ) -> bool:
     stripped = text.strip()
+    if _parse_recent_memory_window(stripped):
+        return True
     if _looks_like_explicit_memory_query(stripped) and not _is_explicit_memory_search_query(stripped):
         return False
     if (
         not _looks_like_generic_memory_query(stripped)
         and not _is_memory_search_command_query(stripped)
         and not _looks_like_remember_about_query(stripped)
+        and not looks_like_natural_structured_memory_query(stripped)
     ):
         return False
     db_path = _db_path(n4os_root)
@@ -696,6 +762,9 @@ def format_structured_memory_query(
     *,
     n4os_root: Path = DEFAULT_N4OS_ROOT,
 ) -> str:
+    recent_window = _parse_recent_memory_window(text)
+    if recent_window:
+        return _format_recent_memory_query(recent_window, n4os_root=n4os_root)
     count_match = LAST_PICKUPS_RE.search(text)
     is_pickup_query = bool(count_match or PICKUP_QUERY_RE.search(text) or DINNER_PICKUP_RE.search(text))
     if _looks_like_explicit_memory_query(text) and not _is_explicit_memory_search_query(text):
@@ -712,6 +781,7 @@ def format_structured_memory_query(
         is_explicit_memory_query
         or _looks_like_generic_memory_query(text)
         or _looks_like_remember_about_query(text)
+        or looks_like_natural_structured_memory_query(text)
     )
     if read_only_query and (not db_path.exists() or not _memory_table_exists(db_path)):
         return "I do not have a structured memory matching that yet. Use /remember to save it."
@@ -791,7 +861,14 @@ def _format_memory_matches(matches: list[MemoryItem]) -> str:
     if len(matches) == 1:
         match = matches[0]
         label = "note" if match.kind == "note" else "memory"
-        return f"Remembered {label}: {_memory_display_value(match)}\nSource: {match.source}."
+        lines = [
+            f"Remembered {label}: {_memory_display_value(match)}",
+            f"Source: {match.source}.",
+            f"Stored: {_format_memory_timestamp(match.created_at)}.",
+        ]
+        if match.updated_at and match.updated_at != match.created_at:
+            lines.append(f"Updated: {_format_memory_timestamp(match.updated_at)}.")
+        return "\n".join(lines)
     lines = ["Matching structured memories:"]
     for index, match in enumerate(matches, start=1):
         lines.append(f"{index}. {_memory_display_value(match)}")
@@ -805,6 +882,31 @@ def _format_ambiguous_memory_matches(matches: list[MemoryItem]) -> str:
     return "\n".join(lines)
 
 
+def _format_recent_memory_query(
+    window: RecentMemoryWindow,
+    *,
+    n4os_root: Path,
+    limit: int = 20,
+) -> str:
+    db_path = _db_path(n4os_root)
+    if not db_path.exists() or not _memory_table_exists(db_path):
+        return f"No structured memories stored in {window.label}."
+    capped_limit = max(1, min(100, limit))
+    since = datetime.now().astimezone() - timedelta(days=window.days)
+    store = SQLiteStructuredMemoryStore(db_path, read_only=True)
+    items = store.recent_items(since=since, limit=capped_limit + 1)
+    visible_items = items[:capped_limit]
+    if not visible_items:
+        return f"No structured memories stored in {window.label}."
+    lines = [f"Remembered in {window.label}:"]
+    for item in visible_items:
+        lines.append(f"- {_format_memory_timestamp(item.created_at)}: {_memory_display_value(item)}")
+    if len(items) > capped_limit:
+        lines.append("")
+        lines.append(f"Showing the newest {capped_limit}; ask with a narrower window to see fewer.")
+    return "\n".join(lines)
+
+
 def _memory_display_value(match: MemoryItem) -> str:
     if match.kind == "dinner_pickup_assignment":
         label = "Next dinner pickup"
@@ -815,6 +917,17 @@ def _memory_display_value(match: MemoryItem) -> str:
         date_label = f"{match.happened_on}: " if match.happened_on else ""
         return f"Dinner pickup: {date_label}{match.actor or match.value}"
     return match.value
+
+
+def _format_memory_timestamp(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+    hour = parsed.hour % 12 or 12
+    return f"{parsed.strftime('%b')} {parsed.day}, {parsed.year} {hour}:{parsed.minute:02d} {parsed.strftime('%p')}"
 
 
 def _updated_memory_text(previous: MemoryItem, *, query: str, new_value: str) -> str:
@@ -953,7 +1066,67 @@ def _memory_table_exists(db_path: Path) -> bool:
 
 
 def _strip_remember_prefix(text: str) -> str:
-    return REMEMBER_RE.sub("", text.strip(), count=1).strip(" :-")
+    return REMEMBER_RE.sub("", text.strip(), count=1).strip(" ,:;.-")
+
+
+def _parse_recent_memory_window(text: str) -> RecentMemoryWindow | None:
+    stripped = text.strip().rstrip("?.!")
+    remember_body = _remember_recent_body(stripped)
+    if remember_body is not None:
+        return _parse_recent_memory_body(remember_body)
+    natural_match = re.match(
+        r"^\s*(?:"
+        r"what\s+did\s+i\s+remember|"
+        r"show(?:\s+me)?\s+(?:my\s+)?(?:recent\s+)?(?:remembered\s+)?(?:note|notes|memory|memories)|"
+        r"list\s+(?:my\s+)?(?:recent\s+)?(?:remembered\s+)?(?:note|notes|memory|memories)"
+        r")\b(?P<body>.*)$",
+        stripped,
+        flags=re.I,
+    )
+    if not natural_match:
+        return None
+    return _parse_recent_memory_body(natural_match.group("body"))
+
+
+def _remember_recent_body(text: str) -> str | None:
+    match = re.match(r"^\s*/?remember(?:@\w+)?\b(?P<body>.*)$", text, flags=re.I)
+    if not match:
+        return None
+    body = match.group("body").strip(" ,:;.-")
+    if not body:
+        return None
+    return body
+
+
+def _parse_recent_memory_body(body: str) -> RecentMemoryWindow | None:
+    normalized = body.strip().lower()
+    normalized = re.sub(r"^(?:in|from|for|during|within)\s+", "", normalized)
+    normalized = re.sub(r"^(?:the\s+)?", "", normalized)
+    if normalized in {"recent", "recently", "latest"}:
+        return RecentMemoryWindow(days=7, label="the last 7 days")
+    match = re.search(
+        r"\b(?:last|past)\s+(?:(?P<count>\d+)\s+)?(?P<unit>day|days|week|weeks|month|months)\b",
+        normalized,
+        flags=re.I,
+    )
+    if not match:
+        return None
+    count = int(match.group("count") or "1")
+    unit = match.group("unit").lower()
+    if count < 1:
+        return None
+    if unit.startswith("day"):
+        days = count
+        label_unit = "day" if count == 1 else "days"
+    elif unit.startswith("week"):
+        days = count * 7
+        label_unit = "week" if count == 1 else "weeks"
+    else:
+        days = count * 30
+        label_unit = "month" if count == 1 else "months"
+    if count == 1:
+        return RecentMemoryWindow(days=days, label=f"the last {label_unit}")
+    return RecentMemoryWindow(days=days, label=f"the last {count} {label_unit}")
 
 
 def _memory_query_terms(text: str) -> list[str]:
@@ -976,8 +1149,11 @@ def _normalize_memory_query_text(text: str) -> str:
     normalized = re.sub(r"\bwi[\s\-_]*fi\b", "wifi", normalized)
     normalized = re.sub(r"\be[\s\-_]*mail\b", "email", normalized)
     normalized = re.sub(r"\ballerg(?:y|ic|ies)\b", "allerg", normalized)
+    normalized = re.sub(r"\blearnings?\b", "learn", normalized)
     normalized = re.sub(r"\bpick(?:ed|ing)?\s+up\b", "pickup", normalized)
     normalized = re.sub(r"\bpicked\b", "pickup", normalized)
+    normalized = re.sub(r"\brecommend(?:ed|ing|s|ation|ations)?\b", "suggest", normalized)
+    normalized = re.sub(r"\bsuggest(?:ed|ing|s)?\b", "suggest", normalized)
     return normalized
 
 
@@ -992,6 +1168,19 @@ def _looks_like_generic_memory_query(text: str) -> bool:
     return any(term in GENERIC_LOOKUP_TERMS for term in terms) and any(
         term not in GENERIC_LOOKUP_TERMS for term in terms
     )
+
+
+def looks_like_natural_structured_memory_query(text: str) -> bool:
+    if _looks_like_explicit_memory_query(text) or _is_memory_search_command_query(text):
+        return False
+    if not NATURAL_NOTE_QUERY_RE.search(text):
+        return False
+    terms = _specific_memory_terms(text)
+    if any(term in NON_MEMORY_VALUE_TERMS for term in terms):
+        return False
+    if any(term in {"goals", "memory", "notes", "tasks", "usage"} for term in terms):
+        return False
+    return len(terms) >= 2
 
 
 def _looks_like_explicit_memory_query(text: str) -> bool:
@@ -1056,7 +1245,7 @@ def _term_context_after(term: str, text: str) -> str:
 def _is_memory_search_command_query(text: str) -> bool:
     if not MEMORY_SEARCH_COMMAND_RE.search(text):
         return False
-    return _has_search_command_specificity(text)
+    return _has_search_command_specificity(text) or _has_single_subject_memory_search(text)
 
 
 def _has_search_command_specificity(text: str) -> bool:
@@ -1065,6 +1254,37 @@ def _has_search_command_specificity(text: str) -> bool:
     if any(term in GENERIC_LOOKUP_TERMS for term in terms):
         return bool(specific_terms)
     return len(specific_terms) >= 2
+
+
+def _has_single_subject_memory_search(text: str) -> bool:
+    if _looks_like_explicit_memory_query(text):
+        return False
+    if not re.match(
+        r"^\s*(?:find|look\s+up|lookup|search)\s+(?:my\s+)?(?:note|notes|memory|memories)\b",
+        text,
+        flags=re.I,
+    ):
+        return False
+    specific_terms = _specific_memory_terms(text)
+    if len(specific_terms) != 1:
+        return False
+    term = specific_terms[0]
+    if term in {
+        "allerg",
+        "allergy",
+        "app",
+        "goal",
+        "goals",
+        "memory",
+        "note",
+        "notes",
+        "passport",
+        "task",
+        "tasks",
+        "usage",
+    }:
+        return False
+    return len(term) >= 3
 
 
 def _has_specific_memory_terms(text: str) -> bool:

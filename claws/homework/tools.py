@@ -10,6 +10,7 @@ import re
 from typing import Any, Literal, Protocol, TypedDict
 from zoneinfo import ZoneInfo
 
+from .ai_field_extraction import HomeworkAIFieldExtractor, merge_ai_homework_fields
 from .intent import DEFAULT_CHILD, extract_intent
 from .provider import SQLiteHomeworkProvider
 
@@ -22,6 +23,62 @@ DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_HOMEWORK_DUE_TIME = "07:00"
 HOMEWORK_CALENDAR_DURATION_MINUTES = 30
 CHERRY_BLOSSOM_EVENT_LABEL_COLOR = "#d81b60"
+WEEKDAY_LABELS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+DEFAULT_CLASS_SCHEDULES = (
+    {
+        "child": "Nysha",
+        "class_name": "Art",
+        "weekday": 5,
+        "start_time": "10:00",
+        "due_rule": "next_class",
+        "calendar_name": "Nysha School Calendar",
+        "source": "manual",
+    },
+    {
+        "child": "Navya",
+        "class_name": "Art",
+        "weekday": 5,
+        "start_time": "10:00",
+        "due_rule": "next_class",
+        "calendar_name": "Navya School Calendar",
+        "source": "manual",
+    },
+    {
+        "child": "Nysha",
+        "class_name": "RSM Math",
+        "weekday": 1,
+        "start_time": "15:30",
+        "due_rule": "next_class",
+        "calendar_name": "Nysha School Calendar",
+        "source": "manual",
+    },
+    {
+        "child": "Nysha",
+        "class_name": "School",
+        "weekday": 4,
+        "start_time": None,
+        "due_rule": "friday",
+        "calendar_name": "Nysha School Calendar",
+        "source": "manual",
+    },
+    {
+        "child": "Navya",
+        "class_name": "School",
+        "weekday": 4,
+        "start_time": None,
+        "due_rule": "friday",
+        "calendar_name": "Navya School Calendar",
+        "source": "manual",
+    },
+)
+SCHOOL_SCHEDULE_SUBJECT_KEYS = {
+    "math",
+    "reading",
+    "writing",
+    "spelling",
+    "science",
+    "social studies",
+}
 
 
 class HomeworkProvider(Protocol):
@@ -32,6 +89,18 @@ class HomeworkProvider(Protocol):
         ...
 
     def capture_submission(self, **kwargs: Any) -> dict[str, Any] | None:
+        ...
+
+    def update_due_date(self, **kwargs: Any) -> dict[str, Any] | None:
+        ...
+
+    def update_assignment_details(self, **kwargs: Any) -> dict[str, Any] | None:
+        ...
+
+    def upsert_class_schedule(self, **kwargs: Any) -> dict[str, Any]:
+        ...
+
+    def list_class_schedules(self, *, child: str | None = None) -> list[dict[str, Any]]:
         ...
 
     def list_items(
@@ -70,6 +139,18 @@ class CalendarToolsLike(Protocol):
         ...
 
 
+class HomeworkFieldExtractorLike(Protocol):
+    def extract(
+        self,
+        request: str,
+        *,
+        now: datetime | None = None,
+        baseline_intent: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        ...
+
+
 class ToolResponse(TypedDict, total=False):
     status: Literal["ok", "needs_information", "error"]
     message: str
@@ -84,6 +165,14 @@ def _homework_source(value: Any) -> str:
 def _clean_optional_text(value: Any) -> str | None:
     cleaned = " ".join(str(value or "").split()).strip()
     return cleaned or None
+
+
+def _local_date(now: datetime | None) -> Date:
+    if now is None:
+        return datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).date()
+    if now.tzinfo is None:
+        return now.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE)).date()
+    return now.astimezone(ZoneInfo(DEFAULT_TIMEZONE)).date()
 
 
 GENERIC_HOMEWORK_TITLES = {
@@ -315,19 +404,197 @@ def _match_score(item: dict[str, Any], intent: dict[str, Any], today: Date) -> i
 
 def _title_line(item: dict[str, Any]) -> str:
     subject = f" ({item['subject']})" if item.get("subject") else ""
-    due = item.get("due_date") or "due unknown"
+    due = item.get("due_date") or "unknown"
     return f"{item['title']}{subject} - {item['status']}, due {due}"
 
 
-def _write_markdown(
+def _schedule_name_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _default_class_schedule_rows(child: str | None = None) -> list[dict[str, Any]]:
+    rows = [dict(schedule) for schedule in DEFAULT_CLASS_SCHEDULES]
+    if child:
+        rows = [row for row in rows if str(row["child"]) == child]
+    return rows
+
+
+def _effective_class_schedules(
+    provider: HomeworkProvider,
+    *,
+    child: str | None = None,
+) -> list[dict[str, Any]]:
+    schedules = provider.list_class_schedules(child=child)
+    seen = {
+        (str(schedule.get("child")), _schedule_name_key(schedule.get("class_name")))
+        for schedule in schedules
+    }
+    for schedule in _default_class_schedule_rows(child):
+        key = (str(schedule["child"]), _schedule_name_key(schedule["class_name"]))
+        if key not in seen:
+            schedules.append(schedule)
+            seen.add(key)
+    return schedules
+
+
+def _schedule_due_date(today: Date, schedule: dict[str, Any]) -> str:
+    weekday = int(schedule["weekday"])
+    days_ahead = (weekday - today.weekday()) % 7
+    if str(schedule.get("due_rule") or "").lower() != "friday" and days_ahead == 0:
+        days_ahead = 7
+    return (today + timedelta(days=days_ahead)).isoformat()
+
+
+def _matching_class_schedule(
     provider: HomeworkProvider,
     *,
     child: str,
-    homework_root: Path,
-) -> None:
-    homework_root.mkdir(parents=True, exist_ok=True)
-    items = provider.list_items(child=child, limit=100)
-    path = homework_root / f"{child}.md"
+    class_name: str | None,
+) -> dict[str, Any] | None:
+    schedules = _effective_class_schedules(provider, child=child)
+    requested = _schedule_name_key(class_name or "School")
+    if not requested:
+        requested = "school"
+    for schedule in schedules:
+        if _schedule_name_key(schedule.get("class_name")) == requested:
+            return schedule
+    if not class_name or requested in SCHOOL_SCHEDULE_SUBJECT_KEYS:
+        for schedule in schedules:
+            if _schedule_name_key(schedule.get("class_name")) == "school":
+                return schedule
+    for schedule in schedules:
+        schedule_key = _schedule_name_key(schedule.get("class_name"))
+        if schedule_key == "school":
+            continue
+        if requested in schedule_key or schedule_key in requested:
+            return schedule
+    return None
+
+
+def _infer_due_date_from_class_schedule(
+    provider: HomeworkProvider,
+    intent: dict[str, Any],
+    *,
+    now: datetime | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    schedule = _matching_class_schedule(
+        provider,
+        child=str(intent.get("child") or DEFAULT_CHILD),
+        class_name=_clean_optional_text(intent.get("subject")),
+    )
+    existing_due_date = _clean_optional_text(intent.get("due_date"))
+    caption_text = re.split(r"\bimage text\s*:", str(intent.get("raw_input") or ""), maxsplit=1, flags=re.IGNORECASE)[0]
+    explicit_due_text = bool(
+        re.search(r"\b(?:due|due date|due by)\b", str(intent.get("raw_input") or ""), flags=re.IGNORECASE)
+        or re.search(r"\b(?:today|tomorrow)\b", caption_text, flags=re.IGNORECASE)
+        or re.search(r"\b(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", caption_text, flags=re.IGNORECASE)
+        or re.search(r"\b(?:after|in)\s+(?:\d+|one|two|three|four)\s+weeks?\b", caption_text, flags=re.IGNORECASE)
+        or re.search(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}(?:/\d{2,4})?|[A-Za-z]{3,9}\s+\d{1,2})\b", caption_text)
+    )
+    if schedule is None:
+        return existing_due_date, None
+    if existing_due_date and (not intent.get("ai_field_extraction") or explicit_due_text):
+        return existing_due_date, schedule
+    due_date = _schedule_due_date(_local_date(now), schedule)
+    return due_date, schedule
+
+
+def _is_ai_refined_intent(intent: dict[str, Any]) -> bool:
+    return isinstance(intent.get("ai_field_extraction"), dict)
+
+
+def _schedule_note(schedule: dict[str, Any] | None) -> str | None:
+    if not schedule:
+        return None
+    time_text = _clean_optional_text(schedule.get("start_time"))
+    weekday = WEEKDAY_LABELS[int(schedule["weekday"])]
+    suffix = f" at {time_text}" if time_text else ""
+    return f"Inferred from {schedule['child']} {schedule['class_name']} schedule: {weekday}{suffix}."
+
+
+def _intent_context_for_ai(intent: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "intent",
+        "child",
+        "children",
+        "title",
+        "subject",
+        "assigned_date",
+        "due_date",
+        "due_time",
+        "status",
+        "notes",
+        "grade",
+        "week_range",
+        "daily_work",
+        "source",
+        "ocr_text",
+    }
+    return {key: value for key, value in intent.items() if key in allowed and value}
+
+
+def _homework_context_for_ai(provider: HomeworkProvider, child: str) -> dict[str, Any]:
+    return {
+        "class_schedules": _effective_class_schedules(provider, child=child),
+        "open_homework": [
+            {
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "child": item.get("child"),
+                "subject": item.get("subject"),
+                "due_date": item.get("due_date"),
+                "status": item.get("status"),
+            }
+            for item in provider.list_items(child=child, statuses=OPEN_STATUSES, limit=10)
+        ],
+    }
+
+
+def _pending_due_date_action(item: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action": "fill_homework_due_date",
+        "item_id": item["id"],
+        "child": item["child"],
+        "title": item["title"],
+        "intent": intent,
+        "due_date": item.get("due_date"),
+    }
+
+
+def _pending_clarify_action(
+    request: str,
+    intent: dict[str, Any],
+    *,
+    source: str,
+    photo_path: str | None,
+    photo_sha256: str | None,
+) -> dict[str, Any]:
+    return {
+        "action": "clarify_homework_capture",
+        "request": request,
+        "source": _homework_source(source),
+        "photo_path": photo_path,
+        "photo_sha256": photo_sha256,
+        "intent": intent,
+    }
+
+
+def _subject_label(item: dict[str, Any]) -> str:
+    return _clean_optional_text(item.get("subject")) or "Unsorted"
+
+
+def _markdown_filename(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
+    return cleaned or "unsorted"
+
+
+def _render_homework_markdown(
+    provider: HomeworkProvider,
+    *,
+    title: str,
+    child: str,
+    items: list[dict[str, Any]],
+) -> str:
     lines = [
         "---",
         "tags:",
@@ -335,13 +602,12 @@ def _write_markdown(
         f"child: {child}",
         "---",
         "",
-        f"# {child} Homework",
+        f"# {title}",
         "",
     ]
     if not items:
         lines.append("No homework captured yet.")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return
+        return "\n".join(lines) + "\n"
 
     for item in items:
         assets = provider.list_assets(str(item["id"]))
@@ -351,7 +617,7 @@ def _write_markdown(
                 f"## {item['title']}",
                 "",
                 f"- Status: {item['status']}",
-                f"- Subject/class: {item.get('subject') or 'Unknown'}",
+                f"- Subject/class: {_subject_label(item)}",
                 f"- Assigned: {item['assigned_date']}",
                 f"- Due: {item.get('due_date') or 'Unknown'}",
             ],
@@ -401,7 +667,122 @@ def _write_markdown(
             for event in submitted_events:
                 lines.append(f"- {event['created_at']}: {event.get('note') or 'Submitted work captured.'}")
         lines.append("")
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_schedule_markdown(provider: HomeworkProvider, child: str | None = None) -> str:
+    schedules = _effective_class_schedules(provider, child=child)
+    title = f"{child} Homework Class Schedule" if child else "Homework Class Schedules"
+    lines = [
+        "---",
+        "tags:",
+        '  - "n4os/homework"',
+        '  - "n4os/homework/class-schedule"',
+        "---",
+        "",
+        f"# {title}",
+        "",
+    ]
+    if not schedules:
+        lines.append("No class schedules captured yet.")
+        return "\n".join(lines) + "\n"
+    for schedule in schedules:
+        weekday = WEEKDAY_LABELS[int(schedule["weekday"])]
+        time_text = schedule.get("start_time") or "no fixed time"
+        lines.extend(
+            [
+                f"## {schedule['child']} - {schedule['class_name']}",
+                "",
+                f"- Day: {weekday}",
+                f"- Time: {time_text}",
+                f"- Due rule: {schedule['due_rule']}",
+                f"- Calendar: {schedule.get('calendar_name') or 'Unknown'}",
+                f"- Source: {schedule['source']}",
+                "",
+            ],
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_class_schedule_markdown(provider: HomeworkProvider, homework_root: Path) -> None:
+    homework_root.mkdir(parents=True, exist_ok=True)
+    (homework_root / "class-schedules.md").write_text(
+        _render_schedule_markdown(provider),
+        encoding="utf-8",
+    )
+    children = sorted({str(schedule["child"]) for schedule in _effective_class_schedules(provider)})
+    for child in children:
+        child_root = homework_root / child
+        child_root.mkdir(parents=True, exist_ok=True)
+        (child_root / "class-schedule.md").write_text(
+            _render_schedule_markdown(provider, child=child),
+            encoding="utf-8",
+        )
+
+
+def _write_markdown(
+    provider: HomeworkProvider,
+    *,
+    child: str,
+    homework_root: Path,
+) -> None:
+    homework_root.mkdir(parents=True, exist_ok=True)
+    items = provider.list_items(child=child, limit=100)
+    path = homework_root / f"{child}.md"
+    path.write_text(
+        _render_homework_markdown(provider, title=f"{child} Homework", child=child, items=items),
+        encoding="utf-8",
+    )
+
+    child_root = homework_root / child
+    child_root.mkdir(parents=True, exist_ok=True)
+    (child_root / "index.md").write_text(
+        _render_homework_markdown(provider, title=f"{child} Homework", child=child, items=items),
+        encoding="utf-8",
+    )
+    by_subject: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        by_subject.setdefault(_subject_label(item), []).append(item)
+    current_subject_files = {
+        f"{_markdown_filename(subject)}.md"
+        for subject in by_subject
+    }
+    for existing_subject_file in child_root.glob("*.md"):
+        if existing_subject_file.name in {"index.md", "class-schedule.md"}:
+            continue
+        if existing_subject_file.name not in current_subject_files:
+            if _is_generated_homework_subject_file(existing_subject_file, child):
+                existing_subject_file.unlink()
+    for subject, subject_items in sorted(by_subject.items()):
+        (child_root / f"{_markdown_filename(subject)}.md").write_text(
+            _render_homework_markdown(
+                provider,
+                title=f"{child} {subject} Homework",
+                child=child,
+                items=subject_items,
+            ),
+            encoding="utf-8",
+        )
+    _write_class_schedule_markdown(provider, homework_root)
+
+
+def _is_generated_homework_subject_file(path: Path, child: str) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(
+        text.startswith("---\n")
+        and '  - "n4os/homework"' in text
+        and f"child: {child}" in text
+        and re.search(rf"^# {re.escape(child)} .+ Homework$", text, flags=re.MULTILINE)
+    )
+
+
+def ensure_default_class_schedules(provider: HomeworkProvider, homework_root: Path) -> None:
+    for schedule in DEFAULT_CLASS_SCHEDULES:
+        provider.upsert_class_schedule(**schedule)
+    _write_class_schedule_markdown(provider, homework_root)
 
 
 def _default_calendar_tools() -> CalendarToolsLike | None:
@@ -452,10 +833,34 @@ class HomeworkTools:
         *,
         homework_root: Path = DEFAULT_N4OS_HOMEWORK_ROOT,
         calendar_tools: CalendarToolsLike | None = None,
+        field_extractor: HomeworkFieldExtractorLike | None = None,
     ) -> None:
         self.provider = provider
         self.homework_root = homework_root
         self.calendar_tools = calendar_tools
+        self.field_extractor = field_extractor
+
+    def _extract_intent_from_request(
+        self,
+        request: str,
+        *,
+        now: datetime | None,
+        source: str,
+        photo_path: str | None,
+    ) -> dict[str, Any]:
+        intent = extract_intent(request, now=now, source=source, photo_path=photo_path)
+        if self.field_extractor is None:
+            return intent
+        try:
+            ai_fields = self.field_extractor.extract(
+                request,
+                now=now,
+                baseline_intent=_intent_context_for_ai(intent),
+                context=_homework_context_for_ai(self.provider, str(intent.get("child") or DEFAULT_CHILD)),
+            )
+        except Exception:
+            return intent
+        return merge_ai_homework_fields(intent, ai_fields, request)
 
     def capture_assignment(
         self,
@@ -469,13 +874,57 @@ class HomeworkTools:
         metadata_overrides: dict[str, Any] | None = None,
     ) -> ToolResponse:
         try:
-            intent = extract_intent(request, now=now, source=source, photo_path=photo_path)
+            intent = self._extract_intent_from_request(request, now=now, source=source, photo_path=photo_path)
+            if intent.get("intent") == "clarify":
+                return {
+                    "status": "needs_information",
+                    "message": str(
+                        intent.get("clarification_question")
+                        or "What child, class, and due date should I use for that homework?"
+                    ),
+                    "data": {
+                        "missing_fields": list(intent.get("missing_fields") or []),
+                        "pending_action": _pending_clarify_action(
+                            request,
+                            intent,
+                            source=source,
+                            photo_path=photo_path,
+                            photo_sha256=photo_sha256,
+                        ),
+                    },
+                }
             if intent.get("intent") == "homework_status":
                 return self.homework_status(child=str(intent.get("child") or DEFAULT_CHILD))
             if intent.get("intent") == "capture_submission":
                 return self.capture_submission(request, now=now, source=source, photo_path=photo_path)
+            inferred_due_date, inferred_schedule = _infer_due_date_from_class_schedule(
+                self.provider,
+                intent,
+                now=now,
+            )
+            ai_refined = _is_ai_refined_intent(intent)
+            if inferred_due_date and (ai_refined or not _clean_optional_text(intent.get("due_date"))):
+                intent = {**intent, "due_date": inferred_due_date}
+            explicit_time_text = bool(
+                re.search(
+                    r"\b(?:at|by)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
+                    str(intent.get("raw_input") or ""),
+                    flags=re.IGNORECASE,
+                )
+            )
+            if inferred_schedule and inferred_schedule.get("start_time") and (
+                (ai_refined and not explicit_time_text) or not _clean_optional_text(intent.get("due_time"))
+            ):
+                intent["due_time"] = inferred_schedule["start_time"]
+            if inferred_schedule and inferred_schedule.get("calendar_name") and (
+                ai_refined or not _clean_optional_text(intent.get("calendar_name"))
+            ):
+                intent["calendar_name"] = inferred_schedule["calendar_name"]
             content_fingerprint = homework_content_fingerprint(intent.get("ocr_text") or intent.get("raw_input"))
             metadata = build_homework_metadata(intent, content_fingerprint=content_fingerprint)
+            schedule_note = _schedule_note(inferred_schedule)
+            if schedule_note:
+                metadata["due_date_inference"] = schedule_note
             if metadata_overrides:
                 metadata.update(metadata_overrides)
             if not skip_duplicate_check:
@@ -531,6 +980,18 @@ class HomeworkTools:
                 photo_sha256=photo_sha256,
             )
             _write_markdown(self.provider, child=str(item["child"]), homework_root=self.homework_root)
+            if not _clean_optional_text(item.get("due_date")):
+                return {
+                    "status": "needs_information",
+                    "message": (
+                        f"Captured homework for {item['child']}: {_title_line(item)}. "
+                        "What due date should I track?"
+                    ),
+                    "data": {
+                        "item": item,
+                        "pending_action": _pending_due_date_action(item, intent),
+                    },
+                }
             calendar_result = self._create_due_calendar_event(item, intent)
         except Exception as error:
             return {
@@ -558,7 +1019,18 @@ class HomeworkTools:
         source: str = "telegram_text",
         photo_path: str | None = None,
     ) -> ToolResponse:
-        intent = extract_intent(request, now=now, source=source, photo_path=photo_path)
+        intent = self._extract_intent_from_request(request, now=now, source=source, photo_path=photo_path)
+        if intent.get("intent") == "clarify":
+            return {
+                "status": "needs_information",
+                "message": str(
+                    intent.get("clarification_question")
+                    or "Which homework assignment is this submission for?"
+                ),
+                "data": {
+                    "missing_fields": list(intent.get("missing_fields") or []),
+                },
+            }
         today = (now.date() if now and now.tzinfo is None else datetime.now().date()) if now else Date.today()
         candidates = self.provider.list_items(
             child=str(intent.get("child") or DEFAULT_CHILD),
@@ -671,6 +1143,100 @@ class HomeworkTools:
             "data": {"item": item},
         }
 
+    def resolve_pending_action(
+        self,
+        pending_action: dict[str, Any],
+        response_text: str,
+        *,
+        now: datetime | None = None,
+    ) -> ToolResponse:
+        if pending_action.get("action") == "clarify_homework_capture":
+            return self.resolve_clarified_capture(pending_action, response_text, now=now)
+        if pending_action.get("action") == "fill_homework_due_date":
+            return self.resolve_due_date(pending_action, response_text, now=now)
+        return self.resolve_duplicate_assignment(pending_action, response_text)
+
+    def resolve_clarified_capture(
+        self,
+        pending_action: dict[str, Any],
+        response_text: str,
+        *,
+        now: datetime | None = None,
+    ) -> ToolResponse:
+        response = " ".join(response_text.lower().strip(" .!").split())
+        if response in {"cancel", "no", "stop"}:
+            return {
+                "status": "ok",
+                "message": "Canceled homework capture.",
+                "data": {"cleanup_photo_path": pending_action.get("photo_path")},
+            }
+        clarified_request = f"{pending_action.get('request') or ''}\n{response_text}".strip()
+        return self.capture_assignment(
+            clarified_request,
+            now=now,
+            source=str(pending_action.get("source") or "telegram_text"),
+            photo_path=_clean_optional_text(pending_action.get("photo_path")),
+            photo_sha256=_clean_optional_text(pending_action.get("photo_sha256")),
+        )
+
+    def resolve_due_date(
+        self,
+        pending_action: dict[str, Any],
+        response_text: str,
+        *,
+        now: datetime | None = None,
+    ) -> ToolResponse:
+        response = " ".join(response_text.lower().strip(" .!").split())
+        if response in {"cancel", "no", "stop"}:
+            return {
+                "status": "ok",
+                "message": "Canceled homework due-date update.",
+                "data": {},
+            }
+        intent = extract_intent(
+            f"homework due {response_text}",
+            now=now,
+            source="telegram_text",
+        )
+        original_intent = pending_action.get("intent") if isinstance(pending_action.get("intent"), dict) else {}
+        due_date = _clean_optional_text(intent.get("due_date")) or _clean_optional_text(pending_action.get("due_date"))
+        due_time = _clean_optional_text(intent.get("due_time")) or _clean_optional_text(original_intent.get("due_time"))
+        calendar_name = _clean_optional_text(intent.get("calendar_name")) or _clean_optional_text(original_intent.get("calendar_name"))
+        if due_date is None:
+            return {
+                "status": "needs_information",
+                "message": "What due date should I track for that homework?",
+                "data": {"pending_action": pending_action},
+            }
+
+        item = self.provider.update_due_date(
+            homework_item_id=str(pending_action["item_id"]),
+            due_date=due_date,
+            note=f"Due date set from follow-up: {response_text}",
+        )
+        if item is None:
+            return {
+                "status": "error",
+                "message": "Homework storage failed: assignment disappeared.",
+                "data": {"error_type": "MissingHomeworkItem"},
+            }
+        _write_markdown(self.provider, child=str(item["child"]), homework_root=self.homework_root)
+        calendar_intent = {**original_intent, **intent, "due_time": due_time}
+        if calendar_name:
+            calendar_intent["calendar_name"] = calendar_name
+        calendar_result = self._create_due_calendar_event(item, calendar_intent)
+        message = f"Updated homework for {item['child']}: {_title_line(item)}."
+        if calendar_result is not None:
+            if calendar_result.get("status") == "ok":
+                message += " Added due-date reminder to the school calendar."
+            else:
+                message += f" Calendar reminder was not added: {calendar_result.get('message')}"
+        return {
+            "status": "ok",
+            "message": message,
+            "data": {"item": item, "calendar": calendar_result},
+        }
+
     def list_homework(self, *, child: str | None = None, limit: int = 10) -> ToolResponse:
         items = self.provider.list_items(child=child, statuses=OPEN_STATUSES, limit=limit)
         if not items:
@@ -682,6 +1248,25 @@ class HomeworkTools:
         lines = [f"Open homework for {child or DEFAULT_CHILD}:"]
         lines.extend([f"- {_title_line(item)}" for item in items])
         return {"status": "ok", "message": "\n".join(lines), "data": {"items": items}}
+
+    def list_class_schedules(self, *, child: str | None = None) -> ToolResponse:
+        schedules = _effective_class_schedules(self.provider, child=child)
+        if not schedules:
+            return {
+                "status": "ok",
+                "message": "No homework class schedules captured yet.",
+                "data": {"schedules": []},
+            }
+        lines = ["Homework class schedules:"]
+        for schedule in schedules:
+            weekday = WEEKDAY_LABELS[int(schedule["weekday"])]
+            time_text = schedule.get("start_time") or "no fixed time"
+            lines.append(f"- {schedule['child']} {schedule['class_name']}: {weekday} {time_text}")
+        return {
+            "status": "ok",
+            "message": "\n".join(lines),
+            "data": {"schedules": schedules},
+        }
 
     def homework_status(self, *, child: str | None = None) -> ToolResponse:
         return self.list_homework(child=child or DEFAULT_CHILD)
@@ -712,7 +1297,7 @@ class HomeworkTools:
                 end_time=end.isoformat(),
                 timezone=DEFAULT_TIMEZONE,
                 description=_calendar_description(item),
-                calendar_name=f"{item['child']} School Calendar",
+                calendar_name=_clean_optional_text(intent.get("calendar_name")) or f"{item['child']} School Calendar",
                 private_extended_properties=_calendar_private_properties(item),
                 event_label_background_color=CHERRY_BLOSSOM_EVENT_LABEL_COLOR,
             )
@@ -725,4 +1310,5 @@ class HomeworkTools:
 
 
 def build_default_tools() -> HomeworkTools:
-    return HomeworkTools(SQLiteHomeworkProvider())
+    provider = SQLiteHomeworkProvider()
+    return HomeworkTools(provider, field_extractor=HomeworkAIFieldExtractor.from_env_or_none())

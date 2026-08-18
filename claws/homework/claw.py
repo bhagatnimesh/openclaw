@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from .intent import DEFAULT_CHILD, extract_intent
+from .intent import DEFAULT_CHILD, extract_intent, is_homework_capture
 from .tools import HomeworkProvider, HomeworkTools, ToolResponse, build_default_tools
 
 
@@ -27,6 +27,7 @@ class HomeworkClaw:
             "capture_assignment": self.tools.capture_assignment,
             "capture_submission": self.tools.capture_submission,
             "list_homework": self.tools.list_homework,
+            "list_class_schedules": self.tools.list_class_schedules,
             "homework_status": self.tools.homework_status,
         }
 
@@ -40,16 +41,19 @@ class HomeworkClaw:
         photo_sha256: str | None = None,
     ) -> str:
         if self.pending_action is not None:
-            response = self.tools.resolve_duplicate_assignment(self.pending_action, request)
-            if response.get("status") == "needs_information":
-                pending = response.get("data", {}).get("pending_action")
-                self.pending_action = pending if isinstance(pending, dict) else self.pending_action
-            else:
-                self.pending_action = None
-            self.last_result = response
-            message = response["message"]
-            print(message)
-            return message
+            pending_action = self.pending_action
+            if pending_action.get("action") != "fill_homework_due_date" or not is_homework_capture(request):
+                response = self.tools.resolve_pending_action(pending_action, request, now=reference_time)
+                if response.get("status") == "needs_information":
+                    pending = response.get("data", {}).get("pending_action")
+                    self.pending_action = pending if isinstance(pending, dict) else self.pending_action
+                else:
+                    self.pending_action = None
+                self.last_result = response
+                message = response["message"]
+                print(message)
+                return message
+            self.pending_action = None
 
         intent = extract_intent(request, now=reference_time, source=source, photo_path=photo_path)
         if intent.get("intent") == "capture_submission":

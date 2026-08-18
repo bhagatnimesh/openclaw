@@ -45,6 +45,12 @@ from claws.n4os.claw import N4OSClaw
 from claws.homework import HomeworkClaw
 from claws.homework.intent import has_homework_terms, is_homework_capture
 from claws.n4os.input_normalizer import improve_entered_text
+from claws.n4os.note_capture import capture_note as capture_markdown_note
+from claws.n4os.school_newsletter import (
+    SchoolNewsletterImporter,
+    is_school_newsletter_followup,
+    is_school_newsletter_message,
+)
 from n4os_capture import (
     CaptureIngestResult,
     format_capture_undo_reply,
@@ -69,6 +75,7 @@ from n4os_structured_memory import (
     is_structured_memory_mutation_message,
     is_structured_memory_query,
     is_structured_remember_message,
+    looks_like_natural_structured_memory_query,
     mutate_structured_memory,
     remember_structured_memory,
     restore_structured_memory_item,
@@ -124,16 +131,18 @@ UNAUTHORIZED_MESSAGE = "Unauthorized."
 HELP_MESSAGE = (
     "N4OS Telegram help\n\n"
     "You can speak naturally. Use these when you want precision:\n"
-    "1. Remember: /capture Nysha was nervous about school. I felt unsure how to help\n"
+    "1. Remember: /remember Nysha school gate code is 4812; /capture Nysha was nervous about school\n"
     "2. Ask or chat: /ask How should I approach Nysha's reading? or /chat Let's think through school\n"
     "3. Review/status: /review week, /status Nysha, /status reading, /goals\n"
-    "4. Calendar/tasks: /event create dinner with Rahul next Tuesday at 7 PM; add task call FUSD tomorrow morning\n"
+    "4. Calendar/tasks/homework: /event create dinner with Rahul next Tuesday at 7 PM; add task call FUSD tomorrow morning; /homework help\n"
     "5. Day plan: give me today's briefing\n"
     "6. Shopping: /cart add milk to Costco; /shop Indian\n"
     "7. Reading: Nysha read 8 pages of Mercy Watson by herself; reading status\n"
     "8. Science: plan the next 4 science lab experiments\n"
-    "9. Backlog/home: Discussion: Should we attend the birthday?; Planning: Camping trip September 12; Decision: Choose Nysha's school next year; add home board item buy milk\n\n"
-    "More help: ask how do I add a memory? how do I add an event? how do I use shopping?"
+    "9. School newsletter: /import school newsletter for Nysha <Google Slides link>\n"
+    "10. Backlog/home: Discussion: Should we attend the birthday?; Planning: Camping trip September 12; Decision: Choose Nysha's school next year; add home board item buy milk\n"
+    "11. Quick learning notes: /note quick Patrick Collison: learning still matters; /note help\n\n"
+    "More help: /remember help, /task help, /shop help, or ask how do I add a memory? how do I add an event? how do I use shopping?"
 )
 ERROR_MESSAGE = "Sorry, N4OS hit an error while handling that."
 UNSUPPORTED_MESSAGE = "Please send a text or voice message."
@@ -155,6 +164,11 @@ CAPTURE_CLARIFICATION_RE = re.compile(
     r"^\s*(?:a\s+)?(?:capture|note|memory|remember(?:\s+this)?)\s*[.!?]?\s*$",
     re.IGNORECASE,
 )
+MARKDOWN_NOTE_CAPTURE_RE = re.compile(
+    r"^\s*/(?:note|mem|mem-inbox|capture)(?:@\w+)?\s+"
+    r"(?:quick|learning|inbox)\b",
+    re.IGNORECASE,
+)
 HOW_TO_HELP = {
     "capture": (
         "To capture anything worth remembering, send:\n"
@@ -165,6 +179,35 @@ HOW_TO_HELP = {
         "Nysha playing games very well\n"
         "I felt scattered after poor sleep\n\n"
         "Old /capture, /mem, and /mem-inbox commands still work as capture aliases."
+        "\n\nFor learning snippets that should go to Obsidian Markdown, send:\n"
+        "/note quick Patrick Collison: learning still matters"
+    ),
+    "remember": (
+        "Structured memory is for small facts you may need to look up later.\n\n"
+        "Use cases:\n"
+        "- Codes: /remember Nysha school gate code is 4812\n"
+        "- Health/safety: /remember Navya is allergic to cashews\n"
+        "- Family logistics: /remember Niyati has the next dinner pickup\n\n"
+        "Find and maintain:\n"
+        "- Recent: /remember recent\n"
+        "- Recent: /remember last 7 days\n"
+        "- Look up: What do you remember about Nysha school gate code?\n"
+        "- Update: update remembered note Nysha school gate code to 9999\n"
+        "- Forget: forget remembered note Nysha school gate code\n"
+        "- Undo last memory change: undo\n\n"
+        "Where it goes: data/n4os.db in the n4os_memory_items table."
+    ),
+    "note": (
+        "Notes are for ideas, learning snippets, and rough inbox items you want saved to Markdown.\n\n"
+        "Use cases:\n"
+        "- Quick learning: /note quick Patrick Collison: learning still matters\n"
+        "- Longer learning note: /note learning Book idea: agency compounds\n"
+        "- Inbox item to sort later: /note inbox Review this school idea later\n\n"
+        "Where they go:\n"
+        "- quick notes -> n4os/learnings/Quick Notes.md\n"
+        "- learning notes -> n4os/learnings/YYYY-MM-DD-<title>.md\n"
+        "- inbox notes -> n4os/learnings/Inbox.md\n\n"
+        "Use /remember help for facts you want to search later, like codes, allergies, or pickup turns."
     ),
     "event": (
         "Calendar helps add, move, cancel, and review family events.\n\n"
@@ -181,10 +224,28 @@ HOW_TO_HELP = {
         "Send one of these:\n"
         "Add: add task call FUSD tomorrow morning\n"
         "Add: Add task: Call FUSD about Nysha waitlist. Notes: Follow up with Chadbourne.\n"
+        "Noah help: add task research weekend trips. Need Noah assistant help.\n"
+        "Run Noah help: Run Noah assistant help\n"
         "Done: complete task call FUSD\n"
         "Delete: delete task call FUSD\n"
         "See: show urgent tasks due this week\n"
         "See: list all tasks for drive"
+    ),
+    "homework": (
+        "Homework captures assignments, due dates, worksheet photos, and submissions.\n\n"
+        "Use cases:\n"
+        "- Assignment: /capture homework Nysha math due Friday\n"
+        "- Photo/OCR: send a homework photo with caption /capture homework Nysha\n"
+        "- Submission: /capture submitted homework Nysha All About Me\n"
+        "- Status: homework status\n"
+        "- Cancel a pending duplicate prompt: cancel\n\n"
+        "Where it goes: n4os/homework/*.md plus homework records in the local homework SQLite store."
+    ),
+    "school_newsletter": (
+        "School newsletter imports pull useful school dates and notes from a newsletter link.\n\n"
+        "Send:\n"
+        "/import school newsletter for Nysha <Google Slides link>\n\n"
+        "N4OS previews the changes first. Reply save to apply them or cancel to drop the import."
     ),
     "memory_status": (
         "To see current N4OS status, send:\n"
@@ -738,7 +799,81 @@ def _capture_source(profile: TelegramSenderProfile | None) -> str:
     return f"Telegram/{profile.name.title()}"
 
 
+HELP_TOPIC_ALIASES = {
+    "advice": "n4os_advice",
+    "ask": "n4os_advice",
+    "backlog": "decision",
+    "calendar": "event",
+    "calender": "event",
+    "calnedar": "event",
+    "capture": "capture",
+    "cart": "shopping",
+    "chat": "n4os_advice",
+    "coach": "n4os_advice",
+    "decision": "decision",
+    "decisions": "decision",
+    "event": "event",
+    "experiments": "science_lab",
+    "goals": "goals",
+    "home": "home_board",
+    "home-board": "home_board",
+    "homeboard": "home_board",
+    "homework": "homework",
+    "import": "school_newsletter",
+    "library": "library",
+    "mem-inbox": "note",
+    "memory": "remember",
+    "memory-status": "memory_status",
+    "note": "note",
+    "notes": "note",
+    "n4os": "n4os_advice",
+    "remember": "remember",
+    "review": "review",
+    "schedule": "event",
+    "school": "school_newsletter",
+    "school-newsletter": "school_newsletter",
+    "science": "science_lab",
+    "science-lab": "science_lab",
+    "shop": "shopping",
+    "shopping": "shopping",
+    "status": "memory_status",
+    "task": "task",
+    "tasks": "task",
+    "todo": "task",
+    "todos": "task",
+}
+
+
+def _help_topic_reply(topic: str) -> str | None:
+    key = HELP_TOPIC_ALIASES.get(topic.lower().strip())
+    return HOW_TO_HELP.get(key) if key is not None else None
+
+
+def _telegram_slash_help_reply(text: str) -> str | None:
+    match = re.match(
+        r"^\s*/(?P<command>[a-z][a-z0-9_-]*)(?:@[a-z0-9_]+)?(?:\s+(?P<body>.*?))?\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+
+    command = match.group("command").lower()
+    body = (match.group("body") or "").strip()
+    if command in {"help", "start"}:
+        return _help_topic_reply(body) if body else HELP_MESSAGE
+
+    normalized_body = " ".join(body.lower().split())
+    if normalized_body not in {"help", "-h", "--help", "?"}:
+        return None
+    return _help_topic_reply(command)
+
+
 def _telegram_how_to_reply(text: str) -> str | None:
+    slash_help = _telegram_slash_help_reply(text)
+    if slash_help is not None:
+        return slash_help
+
     lowered = text.lower().strip()
     if re.match(
         r"^/(?:task|tasks|todo|todos)(?:@[a-z0-9_]+)?(?:\s+|:\s*)\S",
@@ -750,6 +885,14 @@ def _telegram_how_to_reply(text: str) -> str | None:
 
     if "memory-status" in lowered or "status" in lowered or ("memory" in lowered and "status" in lowered):
         return HOW_TO_HELP["memory_status"]
+    if "homework" in lowered:
+        return HOW_TO_HELP["homework"]
+    if "school newsletter" in lowered:
+        return HOW_TO_HELP["school_newsletter"]
+    if "remember" in lowered or "structured memory" in lowered:
+        return HOW_TO_HELP["remember"]
+    if "quick note" in lowered or re.search(r"\b(?:markdown|obsidian)\s+note\b", lowered):
+        return HOW_TO_HELP["note"]
     if "capture" in lowered or "note" in lowered or "memory" in lowered or "observation" in lowered:
         return HOW_TO_HELP["capture"]
     if "review" in lowered or "pattern" in lowered:
@@ -858,6 +1001,20 @@ def _pending_capture_request(claw: N4OSClaw, text: str) -> str | None:
     pending = getattr(claw, "pending_route_clarification", None)
     request = getattr(pending, "request", None)
     return request if isinstance(request, str) and request.strip() else None
+
+
+def _is_markdown_note_capture(text: str) -> bool:
+    return MARKDOWN_NOTE_CAPTURE_RE.match(text) is not None
+
+
+def _markdown_note_body(text: str) -> str:
+    return re.sub(
+        r"^\s*/(?:note|mem|mem-inbox|capture)(?:@\w+)?\s+",
+        "",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
 
 
 def _has_homework_pending(homework_claw: HomeworkClaw | None) -> bool:
@@ -975,6 +1132,7 @@ class N4OSTelegramBot:
         chat_sessions: N4OSChatSessionStore | None = None,
         n4os_root: Path | None = None,
         homework_claw: HomeworkClaw | None = None,
+        school_newsletter_importer: SchoolNewsletterImporter | None = None,
     ) -> None:
         self.config = config
         self.claw = claw or N4OSClaw.default()
@@ -988,6 +1146,9 @@ class N4OSTelegramBot:
         self.chat_sessions = chat_sessions or N4OSChatSessionStore()
         self.n4os_root = n4os_root or ROOT / "n4os"
         self.homework_claw = homework_claw
+        self.school_newsletter_importer = school_newsletter_importer or SchoolNewsletterImporter(
+            n4os_root=self.n4os_root,
+        )
 
     def _homework_claw(self) -> HomeworkClaw:
         if self.homework_claw is None:
@@ -1237,6 +1398,10 @@ class N4OSTelegramBot:
             text,
         )
 
+        async def reply_chat_chunks(reply: str) -> None:
+            for chunk in _telegram_reply_chunks(reply):
+                await message.reply_text(chunk)
+
         auth_reply = self._authorization_reply(user_id)
         if auth_reply is not None:
             await message.reply_text(auth_reply)
@@ -1277,7 +1442,7 @@ class N4OSTelegramBot:
                 await message.reply_text(VOICE_TRANSCRIPTION_EMPTY_MESSAGE)
                 self.logger.info("chosen route=unsupported execution_ms=0.00")
                 return
-            await message.reply_text(VOICE_TRANSCRIPTION_RESULT_MESSAGE.format(text=text))
+            await reply_chat_chunks(VOICE_TRANSCRIPTION_RESULT_MESSAGE.format(text=text))
             elapsed_ms = (time.perf_counter() - transcription_started) * 1000
             self.logger.info(
                 "transcribed Telegram audio chars=%d execution_ms=%.2f",
@@ -1302,14 +1467,17 @@ class N4OSTelegramBot:
                 _remove_path(image_input.path)
                 image_input = None
 
-        async def reply_chat_chunks(reply: str) -> None:
-            for chunk in _telegram_reply_chunks(reply):
-                await message.reply_text(chunk)
-
         if not text:
             cleanup_image_input()
             await message.reply_text(UNSUPPORTED_MESSAGE)
             self.logger.info("chosen route=unsupported execution_ms=0.00")
+            return
+
+        slash_help_reply = _telegram_slash_help_reply(text)
+        if slash_help_reply is not None:
+            cleanup_image_input()
+            await message.reply_text(slash_help_reply)
+            self.logger.info("chosen route=telegram_slash_help execution_ms=0.00")
             return
 
         if (
@@ -1329,6 +1497,39 @@ class N4OSTelegramBot:
             session.mode = "idle"
             cleanup_image_input()
             await message.reply_text(undo_reply)
+            return
+
+        if (
+            self.school_newsletter_importer.has_pending(session_key)
+            and is_school_newsletter_followup(text)
+        ) or is_school_newsletter_message(text):
+            started = time.perf_counter()
+            try:
+                if self.school_newsletter_importer.has_pending(session_key) and is_school_newsletter_followup(text):
+                    result = self.school_newsletter_importer.save_pending(
+                        key=session_key,
+                        response=text,
+                    )
+                    reply = result.message
+                else:
+                    reply = self.school_newsletter_importer.preview_from_message(
+                        text,
+                        key=session_key,
+                    )
+            except Exception:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                self.logger.exception(
+                    "error while importing school newsletter execution_ms=%.2f",
+                    elapsed_ms,
+                )
+                cleanup_image_input()
+                await message.reply_text(ERROR_MESSAGE)
+                return
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.logger.info("chosen route=school_newsletter execution_ms=%.2f", elapsed_ms)
+            session.mode = "idle"
+            cleanup_image_input()
+            await message.reply_text(reply)
             return
 
         if is_memory_status_message(text):
@@ -1427,9 +1628,11 @@ class N4OSTelegramBot:
         )
         structured_memory_query = is_structured_memory_query(text)
         explicit_structured_memory_lookup = _looks_like_explicit_structured_memory_alias_lookup(text)
+        natural_structured_memory_probe = looks_like_natural_structured_memory_query(text)
         if (
             structured_memory_query
             or explicit_structured_memory_lookup
+            or natural_structured_memory_probe
             or not active_chat_continuation
             or _looks_like_structured_memory_probe(text)
         ):
@@ -1535,6 +1738,37 @@ class N4OSTelegramBot:
             await message.reply_text(reply)
             return
 
+        if pending_capture_text is None and _is_markdown_note_capture(text):
+            started = time.perf_counter()
+            try:
+                captured = capture_markdown_note(
+                    _markdown_note_body(text),
+                    source=_source_with_sender(message_source, sender_profile),
+                    n4os_root=self.n4os_root,
+                )
+            except Exception:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                self.logger.exception(
+                    "error while capturing Markdown note execution_ms=%.2f",
+                    elapsed_ms,
+                )
+                await message.reply_text(ERROR_MESSAGE)
+                return
+
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.logger.info(
+                "chosen route=n4os_markdown_note kind=%s execution_ms=%.2f",
+                captured.kind,
+                elapsed_ms,
+            )
+            session.mode = "idle"
+            cleanup_image_input()
+            relative_path = captured.path.relative_to(self.n4os_root.parent)
+            await message.reply_text(
+                f"Captured {captured.kind} note: {captured.title} -> {relative_path}"
+            )
+            return
+
         if pending_capture_text is not None or is_capture_message(capture_text):
             started = time.perf_counter()
             try:
@@ -1566,7 +1800,7 @@ class N4OSTelegramBot:
                 )
             session.mode = "idle"
             cleanup_image_input()
-            await message.reply_text(format_capture_reply(result))
+            await reply_chat_chunks(format_capture_reply(result))
             return
 
         if is_goals_status_message(text):

@@ -12,6 +12,7 @@ from dashboard_sources import (
     DEFAULT_TIMEZONE,
     DashboardSources,
     build_default_home_board_tools,
+    build_default_homework_tools,
     build_default_shopping_tools,
     default_sources,
     fallback_recommend_task_matches,
@@ -25,6 +26,7 @@ SHOPPING_LIST_LABELS = {
     "amazon": "Amazon",
     "others": "Others",
 }
+HOMEWORK_CHILDREN = ("Nysha", "Navya")
 ROOT = Path(__file__).resolve().parent
 BEDTIME_ROUTINE_DB_FILE = ROOT / "data" / "n4os.db"
 BEDTIME_ROUTINE_DAYS = {6, 0, 1, 2, 3}
@@ -323,6 +325,78 @@ def _recommend_tasks(
             },
         )
     return normalized_recommendations
+
+
+def _task_list_entries(task_response: dict[str, Any]) -> list[dict[str, str]]:
+    task_lists = task_response.get("data", {}).get("task_lists")
+    if isinstance(task_lists, list):
+        entries = []
+        for task_list in task_lists:
+            if not isinstance(task_list, dict):
+                continue
+            task_list_id = _clean_text(task_list.get("id"), "@default")
+            entries.append(
+                {
+                    "id": task_list_id,
+                    "title": _clean_text(task_list.get("title"), task_list_id),
+                },
+            )
+        if entries:
+            return entries
+    return [{"id": "@default", "title": "My Tasks"}]
+
+
+def _is_dashboard_shopping_task_list(task_list: dict[str, str]) -> bool:
+    title = _clean_text(task_list.get("title")).lower()
+    return title.startswith("shopping") or title.startswith("grocery")
+
+
+def _list_dashboard_tasks(sources: DashboardSources) -> dict[str, Any]:
+    list_task_lists = getattr(sources.task_tools, "list_task_lists", None)
+    if not callable(list_task_lists):
+        return sources.task_tools.list_tasks(show_completed=True)
+
+    task_lists_response = list_task_lists()
+    if task_lists_response.get("status") != "ok":
+        return task_lists_response
+
+    all_tasks: list[dict[str, Any]] = []
+    task_lists = [
+        task_list
+        for task_list in _task_list_entries(task_lists_response)
+        if not _is_dashboard_shopping_task_list(task_list)
+    ]
+    warnings = []
+    for task_list in task_lists:
+        response = sources.task_tools.list_tasks(
+            task_list_id=task_list["id"],
+            show_completed=True,
+        )
+        if response.get("status") != "ok":
+            warnings.append(
+                f"{task_list['title']} task list unavailable: {response.get('message', 'Task list unavailable.')}"
+            )
+            continue
+        for task in response.get("data", {}).get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            all_tasks.append(
+                {
+                    **task,
+                    "task_list_id": task_list["id"],
+                    "task_list_title": task_list["title"],
+                },
+            )
+
+    return {
+        "status": "ok",
+        "message": "Tasks returned from Google Tasks.",
+        "data": {
+            "task_lists": task_lists,
+            "tasks": all_tasks,
+            "warnings": warnings,
+        },
+    }
 
 
 def _decision_filters(available_minutes: int | None, prep_window: bool) -> dict[str, Any]:
@@ -1142,6 +1216,7 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "home_board_count": 0,
             "open_decision_count": 0,
             "shopping_count": 0,
+            "homework_count": 0,
         },
         "best_next_action": {
             "title": "No dashboard data yet",
@@ -1167,6 +1242,8 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "groups": [],
             "open_loops": [],
             "pending": [],
+            "available": False,
+            "message": message or "Task source unavailable.",
         },
         "planning": {"items": []},
         "backlog": {
@@ -1179,6 +1256,7 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
         "bedtime": _bedtime_routine_summary(now),
         "decisions": {"open": [], "attention": []},
         "shopping": {"lists": [], "pending": [], "by_list": []},
+        "homework": _empty_homework(),
         "reading_garden": _empty_reading_garden(now.date()),
         "family": {
             "members": [],
@@ -1187,6 +1265,21 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "unassigned": [],
             "prep_gaps": [],
         },
+    }
+
+
+def _empty_homework() -> dict[str, Any]:
+    return {
+        "available": False,
+        "message": "Homework source unavailable.",
+        "children": [
+            {"child": child, "open_count": 0, "due_now_count": 0, "items": [], "classes": []}
+            for child in HOMEWORK_CHILDREN
+        ],
+        "classes": [],
+        "upcoming": [],
+        "open_count": 0,
+        "due_now_count": 0,
     }
 
 
@@ -1269,6 +1362,111 @@ def _reading_garden_summary(
     if not isinstance(summary, dict):
         return _empty_reading_garden(local_now.date()), []
     return summary, []
+
+
+def _normalize_homework_item(item: dict[str, Any], today: date) -> dict[str, Any]:
+    due_date = _parse_date(_clean_text(item.get("due_date")) or None)
+    days_until_due = (due_date - today).days if due_date is not None else None
+    due_label = "No due date" if due_date is None else _format_date_label(due_date)
+    if days_until_due is not None:
+        if days_until_due < 0:
+            due_label = f"Overdue by {abs(days_until_due)}d"
+        elif days_until_due == 0:
+            due_label = "Due today"
+        elif days_until_due == 1:
+            due_label = "Due tomorrow"
+    return {
+        "id": _clean_text(item.get("id")),
+        "child": _clean_text(item.get("child"), "Unknown"),
+        "title": _clean_text(item.get("title"), "Homework"),
+        "class_name": _clean_text(item.get("subject"), "Unsorted"),
+        "assigned_date": _clean_text(item.get("assigned_date")),
+        "due_date": _clean_text(item.get("due_date")),
+        "due_label": due_label,
+        "days_until_due": days_until_due,
+        "status": _clean_text(item.get("status"), "assigned"),
+        "notes": _clean_text(item.get("notes")),
+        "grade": _clean_text(item.get("grade")),
+        "week_range": _clean_text(item.get("week_range")),
+    }
+
+
+def _homework_summary(sources: DashboardSources, today: date) -> tuple[dict[str, Any], list[str]]:
+    tools = getattr(sources, "homework_tools", None)
+    if tools is None:
+        return _empty_homework(), []
+
+    children = []
+    all_items = []
+    warnings = []
+    successful_children = 0
+    for child in HOMEWORK_CHILDREN:
+        try:
+            response = tools.list_homework(child=child, limit=30)
+        except Exception as error:
+            warnings.append(f"{child} homework source unavailable: {error.__class__.__name__}.")
+            children.append({"child": child, "open_count": 0, "due_now_count": 0, "items": [], "classes": []})
+            continue
+        if response.get("status") != "ok":
+            warnings.append(response.get("message", f"{child} homework source unavailable."))
+            children.append({"child": child, "open_count": 0, "due_now_count": 0, "items": [], "classes": []})
+            continue
+        successful_children += 1
+
+        child_items = [
+            _normalize_homework_item(item, today)
+            for item in response.get("data", {}).get("items") or []
+        ]
+        all_items.extend(child_items)
+        by_class: dict[str, list[dict[str, Any]]] = {}
+        for item in child_items:
+            by_class.setdefault(item["class_name"], []).append(item)
+        classes = [
+            {"child": child, "class_name": class_name, "open_count": len(items), "items": items[:5]}
+            for class_name, items in sorted(by_class.items())
+        ]
+        children.append(
+            {
+                "child": child,
+                "open_count": len(child_items),
+                "due_now_count": len(
+                    [item for item in child_items if item["days_until_due"] is not None and item["days_until_due"] <= 0]
+                ),
+                "items": child_items[:8],
+                "classes": classes,
+            },
+        )
+
+    all_items.sort(
+        key=lambda item: (
+            item["days_until_due"] is None,
+            item["days_until_due"] if item["days_until_due"] is not None else 9999,
+            item["child"],
+            item["class_name"],
+            item["title"],
+        ),
+    )
+    class_counts: dict[tuple[str, str], int] = {}
+    for item in all_items:
+        key = (item["child"], item["class_name"])
+        class_counts[key] = class_counts.get(key, 0) + 1
+    available = successful_children > 0
+    summary = {
+        "available": available,
+        "partial": bool(warnings) and available,
+        "message": "Live homework data" if not warnings else "Some homework data is unavailable.",
+        "children": children,
+        "classes": [
+            {"child": child, "class_name": class_name, "open_count": count}
+            for (child, class_name), count in sorted(class_counts.items())
+        ],
+        "upcoming": all_items[:10],
+        "open_count": len(all_items),
+        "due_now_count": len(
+            [item for item in all_items if item["days_until_due"] is not None and item["days_until_due"] <= 0]
+        ),
+    }
+    return summary, warnings
 
 
 def _normalize_shopping_item(item: dict[str, Any], list_slug: str, list_name: str) -> dict[str, Any]:
@@ -1364,7 +1562,7 @@ def build_dashboard_data(
         calendar_response = _source_error_response("Calendar", error)
 
     try:
-        task_response = sources.task_tools.list_tasks(show_completed=True)
+        task_response = _list_dashboard_tasks(sources)
     except Exception as error:
         task_response = _source_error_response("Tasks", error)
 
@@ -1381,6 +1579,8 @@ def build_dashboard_data(
     source_warnings.extend(decision_warnings)
     shopping, shopping_warnings = _shopping_lists(sources)
     source_warnings.extend(shopping_warnings)
+    homework, homework_warnings = _homework_summary(sources, local_now.date())
+    source_warnings.extend(homework_warnings)
     reading_garden, reading_warnings = _reading_garden_summary(sources, local_now)
     source_warnings.extend(reading_warnings)
 
@@ -1394,11 +1594,15 @@ def build_dashboard_data(
 
     if task_response.get("status") != "ok":
         tasks_unavailable = True
-        source_warnings.append(task_response.get("message", "Task source unavailable."))
+        task_source_message = task_response.get("message", "Task source unavailable.")
+        source_warnings.append(task_source_message)
         raw_tasks: list[dict[str, Any]] = []
     else:
         tasks_unavailable = False
+        task_source_message = "Live task data"
         raw_tasks = list(task_response.get("data", {}).get("tasks") or [])
+        source_warnings.extend(str(warning) for warning in task_response.get("data", {}).get("warnings") or [])
+    task_lists = _task_list_entries(task_response)
 
     events = [
         _normalize_event(event, sources.read_event_metadata, timezone)
@@ -1409,6 +1613,7 @@ def build_dashboard_data(
         {
             **_normalize_task(task, sources.read_task_metadata, local_now.date()),
             "task_list_id": _clean_text(task.get("task_list_id"), "@default"),
+            "task_list_title": _clean_text(task.get("task_list_title"), "My Tasks"),
             "raw": task,
         }
         for task in raw_tasks
@@ -1458,8 +1663,12 @@ def build_dashboard_data(
         if task["id"] not in {existing["id"] for existing in open_loops}
     )
     open_loops = open_loops[:8]
-    pending_tasks = tasks[:24]
+    pending_tasks = tasks
     task_tags = sorted({tag for task in pending_tasks for tag in task["tags"]})
+    task_list_counts: dict[str, int] = {}
+    for task in tasks:
+        task_list_id = _clean_text(task.get("task_list_id"), "@default")
+        task_list_counts[task_list_id] = task_list_counts.get(task_list_id, 0) + 1
     task_owner_counts: dict[tuple[str, str], int] = {}
     task_owner_today_counts: dict[tuple[str, str], int] = {}
     for task in pending_tasks:
@@ -1530,6 +1739,7 @@ def build_dashboard_data(
             "home_board_count": len(home_board["today"]),
             "open_decision_count": len(open_decisions),
             "shopping_count": len(shopping["pending"]),
+            "homework_count": homework["open_count"],
         },
         "best_next_action": best_next_action,
         "warnings": warnings[:8],
@@ -1545,6 +1755,16 @@ def build_dashboard_data(
             "urgent": [_public_task(task) for task in urgent_tasks],
             "due_soon": [_public_task(task) for task in due_soon_tasks],
             "pending": [_public_task(task) for task in pending_tasks],
+            "available": not tasks_unavailable,
+            "message": task_source_message,
+            "lists": [
+                {
+                    "id": task_list["id"],
+                    "title": task_list["title"],
+                    "count": task_list_counts.get(task_list["id"], 0),
+                }
+                for task_list in task_lists
+            ],
             "tags": task_tags,
             "owners": [
                 {
@@ -1575,6 +1795,7 @@ def build_dashboard_data(
             "attention": attention_decisions,
         },
         "shopping": shopping,
+        "homework": homework,
         "reading_garden": reading_garden,
         "family": {
             "members": family["members"],
@@ -1605,6 +1826,7 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
                 decision_tools=None,
                 shopping_tools=build_default_shopping_tools(),
                 reading_garden_tools=None,
+                homework_tools=build_default_homework_tools(),
             )
             home_board, warnings = _home_board_for_portal(
                 home_board_sources,
@@ -1612,6 +1834,7 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
                 local_now,
             )
             shopping, shopping_warnings = _shopping_lists(home_board_sources)
+            homework, homework_warnings = _homework_summary(home_board_sources, local_now.date())
         except Exception:
             return data
 
@@ -1620,9 +1843,11 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
         data["bedtime"] = _bedtime_routine_summary(local_now)
         data["shopping"] = shopping
         data["summary"]["shopping_count"] = len(shopping["pending"])
+        data["homework"] = homework
+        data["summary"]["homework_count"] = homework["open_count"]
         data["warnings"].extend(
             {"level": "info", "title": "Source warning", "detail": warning}
-            for warning in [*warnings, *shopping_warnings]
+            for warning in [*warnings, *shopping_warnings, *homework_warnings]
         )
         return data
 

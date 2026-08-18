@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 import re
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from n4os_memory_inbox import (
     DEFAULT_REPO_ROOT,
@@ -38,8 +43,11 @@ ACTION_RE = re.compile(
     re.I,
 )
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+URL_RE = re.compile(r"https?://[^\s<>()]+", re.I)
 CAPTURE_REPLY_SNIPPET_LIMIT = 3
 CAPTURE_REPLY_SNIPPET_CHARS = 180
+URL_FETCH_TIMEOUT_SECONDS = 4
+URL_FETCH_MAX_BYTES = 512_000
 
 PEOPLE = {
     "nysha": ("Nysha", "[[family/Nysha|Nysha]]"),
@@ -98,6 +106,14 @@ class CaptureNote:
 
 
 @dataclass(frozen=True)
+class LinkPreview:
+    url: str
+    title: str
+    description: str
+    headings: list[str]
+
+
+@dataclass(frozen=True)
 class JournalEntry:
     captured_on: date
     text: str
@@ -136,8 +152,13 @@ def ingest_capture_notes(
     n4os_root: Path = DEFAULT_N4OS_ROOT,
     default_date: date | None = None,
     source: str = "Telegram",
+    url_fetcher: Callable[[str], str | None] | None = None,
 ) -> CaptureIngestResult:
     notes = _parse_capture_notes(text, default_date=default_date, source=source)
+    notes = [
+        _enrich_capture_note(note, url_fetcher=url_fetcher)
+        for note in notes
+    ]
     family_text = _family_ingest_text(notes)
     family_result = ingest_memory_inbox_notes(
         family_text,
@@ -231,9 +252,9 @@ def format_capture_reply(result: CaptureIngestResult) -> str:
     if summary:
         lines.extend(["", f"Summary: {summary}"])
 
-    snippets = _capture_reply_snippets(result)
-    if snippets:
-        lines.extend(["", "Captured text:", *[f"- {snippet}" for snippet in snippets]])
+    captured_texts = _capture_reply_texts(result)
+    if captured_texts:
+        lines.extend(["", "Captured text:", *[f"- {text}" for text in captured_texts]])
 
     lines.append("")
     if result.family.added or result.family.skipped_duplicates:
@@ -275,35 +296,54 @@ def _capture_reply_summary(result: CaptureIngestResult) -> str:
 
 
 def _capture_reply_snippets(result: CaptureIngestResult) -> list[str]:
-    snippets: list[str] = [note.text for note in result.notes]
-    if not snippets:
-        for observation in [*result.family.added, *result.family.skipped_duplicates]:
-            if observation.person == "Family":
-                snippets.append(observation.observation)
-            else:
-                snippets.append(f"{observation.person}: {observation.observation}")
-        for entry in [*result.journal_entries, *result.skipped_journal_duplicates]:
-            snippets.append(entry.text)
+    texts = _capture_reply_texts(result)
 
     cleaned: list[str] = []
     seen: set[str] = set()
-    for snippet in snippets:
-        text = _reply_snippet(snippet)
-        key = _normalize_text(text)
-        if not text or key in seen:
+    for text in texts:
+        snippet = _reply_snippet(text)
+        key = _normalize_text(snippet)
+        if not snippet or key in seen:
             continue
         seen.add(key)
-        cleaned.append(text)
+        cleaned.append(snippet)
         if len(cleaned) == CAPTURE_REPLY_SNIPPET_LIMIT:
             break
-    remaining = max(0, len(snippets) - len(cleaned))
+    remaining = max(0, len(texts) - len(cleaned))
     if remaining:
         cleaned.append(f"...and {remaining} more.")
     return cleaned
 
 
+def _capture_reply_texts(result: CaptureIngestResult) -> list[str]:
+    texts: list[str] = [note.text for note in result.notes]
+    if not texts:
+        for observation in [*result.family.added, *result.family.skipped_duplicates]:
+            if observation.person == "Family":
+                texts.append(observation.observation)
+            else:
+                texts.append(f"{observation.person}: {observation.observation}")
+        for entry in [*result.journal_entries, *result.skipped_journal_duplicates]:
+            texts.append(entry.text)
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        text = _compact_reply_text(text)
+        key = _normalize_text(text)
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return cleaned
+
+
+def _compact_reply_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _reply_snippet(text: str) -> str:
-    compact = re.sub(r"\s+", " ", text).strip()
+    compact = _compact_reply_text(text)
     if len(compact) <= CAPTURE_REPLY_SNIPPET_CHARS:
         return compact
     return compact[: CAPTURE_REPLY_SNIPPET_CHARS - 1].rstrip() + "..."
@@ -382,6 +422,150 @@ def _parse_capture_notes(
         if line:
             notes.append(CaptureNote(current_date, line, source))
     return notes
+
+
+def _enrich_capture_note(
+    note: CaptureNote,
+    *,
+    url_fetcher: Callable[[str], str | None] | None,
+) -> CaptureNote:
+    urls = _extract_urls(note.text)
+    if not urls:
+        return note
+
+    previews: list[LinkPreview] = []
+    fetch = url_fetcher or _fetch_url_html
+    for url in urls:
+        html = fetch(url)
+        if not html:
+            continue
+        preview = _extract_link_preview(url, html)
+        if preview:
+            previews.append(preview)
+
+    if not previews:
+        return note
+
+    context = " ".join(_format_link_preview(preview) for preview in previews)
+    return CaptureNote(
+        captured_on=note.captured_on,
+        text=f"{note.text} {context}",
+        source=note.source,
+    )
+
+
+def _extract_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    for match in URL_RE.finditer(text):
+        url = match.group(0).rstrip(".,;:!?)]}'\"")
+        if url:
+            urls.append(url)
+    return _dedupe_preserving_order(urls)
+
+
+def _fetch_url_html(url: str) -> str | None:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "N4OS capture link preview (+https://github.com/openclaw/openclaw)",
+        },
+    )
+    try:
+        with urlopen(request, timeout=URL_FETCH_TIMEOUT_SECONDS) as response:
+            content_type = response.headers.get("content-type", "")
+            if "html" not in content_type.lower():
+                return None
+            raw = response.read(URL_FETCH_MAX_BYTES + 1)
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        return None
+    if len(raw) > URL_FETCH_MAX_BYTES:
+        raw = raw[:URL_FETCH_MAX_BYTES]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _extract_link_preview(url: str, html: str) -> LinkPreview | None:
+    parser = _LinkPreviewParser()
+    try:
+        parser.feed(html)
+    except Exception:
+        return None
+
+    title = _clean_preview_text(parser.og_title or parser.title)
+    description = _clean_preview_text(parser.og_description or parser.description)
+    headings = [
+        heading
+        for heading in (_clean_preview_text(value) for value in parser.h1s)
+        if heading
+    ]
+    headings = _dedupe_preserving_order(headings)[:3]
+    if not title and not description and not headings:
+        return None
+    return LinkPreview(url=url, title=title, description=description, headings=headings)
+
+
+def _format_link_preview(preview: LinkPreview) -> str:
+    parts = [f"Link: {preview.url}"]
+    if preview.title:
+        parts.append(f"title: {preview.title}")
+    if preview.description:
+        parts.append(f"description: {preview.description}")
+    if preview.headings:
+        parts.append(f"page signals: {', '.join(preview.headings)}")
+    return "[" + "; ".join(parts) + "]"
+
+
+def _clean_preview_text(value: str) -> str:
+    text = unescape(re.sub(r"\s+", " ", value)).strip()
+    return text[:240].rstrip()
+
+
+class _LinkPreviewParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self.description = ""
+        self.og_title = ""
+        self.og_description = ""
+        self.h1s: list[str] = []
+        self._capture: str | None = None
+        self._buffer: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_by_name = {name.lower(): value or "" for name, value in attrs}
+        normalized_tag = tag.lower()
+        if normalized_tag == "meta":
+            self._handle_meta(attrs_by_name)
+            return
+        if normalized_tag in {"title", "h1"}:
+            self._capture = normalized_tag
+            self._buffer = []
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized_tag = tag.lower()
+        if self._capture != normalized_tag:
+            return
+        text = _clean_preview_text("".join(self._buffer))
+        if normalized_tag == "title" and not self.title:
+            self.title = text
+        elif normalized_tag == "h1" and text:
+            self.h1s.append(text)
+        self._capture = None
+        self._buffer = []
+
+    def handle_data(self, data: str) -> None:
+        if self._capture:
+            self._buffer.append(data)
+
+    def _handle_meta(self, attrs: dict[str, str]) -> None:
+        name = attrs.get("name", "").lower()
+        property_name = attrs.get("property", "").lower()
+        content = attrs.get("content", "")
+        if name == "description" and not self.description:
+            self.description = content
+        elif property_name == "og:title" and not self.og_title:
+            self.og_title = content
+        elif property_name == "og:description" and not self.og_description:
+            self.og_description = content
 
 
 def _strip_capture_header(text: str) -> str:

@@ -66,6 +66,39 @@ class N4OSCaptureTest(unittest.TestCase):
         self.assertEqual(len(result.family.added), 1)
         self.assertIn("asked why we do not travel business class", month_text)
 
+    def test_capture_enriches_link_context_for_future_patterns(self):
+        html = """
+        <html>
+          <head>
+            <title>60 Brain Teasers for kids {With Answers}</title>
+            <meta name="description" content="Brain teasers for kids help build problem-solving skills and memory.">
+          </head>
+          <body>
+            <h1>Easy Brain Teasers (With Answers) for Kids</h1>
+            <h2>Fun riddles for kids</h2>
+          </body>
+        </html>
+        """
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            result = ingest_capture_notes(
+                "/capture kids like silly puzzles here https://www.littleladoo.com/brain-teasers-for-kids/",
+                n4os_root=n4os_root,
+                default_date=date(2026, 7, 21),
+                url_fetcher=lambda _: html,
+            )
+
+            month_text = (n4os_root / "family" / "observations" / "2026-07.md").read_text(
+                encoding="utf-8",
+            )
+
+        self.assertEqual(len(result.family.added), 1)
+        self.assertIn("kids like silly puzzles", month_text)
+        self.assertIn("title: 60 Brain Teasers for kids {With Answers}", month_text)
+        self.assertIn("problem-solving skills and memory", month_text)
+        self.assertIn("Easy Brain Teasers (With Answers) for Kids", month_text)
+
     def test_personal_capture_writes_journal(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             n4os_root = Path(tmpdir) / "n4os"
@@ -207,6 +240,27 @@ class N4OSCaptureTest(unittest.TestCase):
         self.assertEqual(len(result.journal_entries), 1)
         self.assertIn("Journal reflection:", reply)
         self.assertNotIn("Family observation: Family", reply)
+
+    def test_capture_reply_shows_full_captured_text(self):
+        long_note = (
+            "Capture Nysha homework time was difficult because she started strong, "
+            "then got distracted by wanting another snack, and we had to reset the "
+            "table twice before she could finish the reading worksheet with steady "
+            "attention and less frustration than last week."
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            result = ingest_capture_notes(
+                long_note,
+                n4os_root=n4os_root,
+                default_date=date(2026, 7, 21),
+            )
+
+        reply = format_capture_reply(result)
+
+        captured_text = long_note.removeprefix("Capture ")
+        self.assertIn(f"- {captured_text}", reply)
+        self.assertNotIn(f"- {captured_text[:179].rstrip()}...", reply)
 
     def test_undo_capture_removes_added_family_and_journal_blocks(self):
         with tempfile.TemporaryDirectory() as tmpdir:

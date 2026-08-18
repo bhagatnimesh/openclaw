@@ -29,6 +29,7 @@ try:
         route_request,
     )
     from .input_normalizer import improve_entered_text
+    from .note_capture import capture_note
     from .prompts import CLARIFICATION_PROMPT, SYSTEM_PROMPT
     from .routing_contracts import (
         OperationResult,
@@ -58,6 +59,7 @@ except ImportError:
         route_request,
     )
     from input_normalizer import improve_entered_text
+    from note_capture import capture_note
     from prompts import CLARIFICATION_PROMPT, SYSTEM_PROMPT
     from routing_contracts import (
         OperationResult,
@@ -456,7 +458,7 @@ def _is_confident_new_route(decision: dict[str, Any], pending_owner: str) -> boo
     route = decision.get("route")
     confidence = float(decision.get("confidence") or 0)
     return (
-        route in ("calendar", "tasks", "shopping", "home_board", "decisions", "science_lab", "library", "both")
+        route in ("capture", "calendar", "tasks", "shopping", "home_board", "decisions", "science_lab", "library", "both")
         and route != pending_owner
         and confidence >= LOW_CONFIDENCE_THRESHOLD
     )
@@ -938,6 +940,13 @@ class N4OSClaw:
             return self._handle_day_briefing(dispatch_request, reference_time)
 
         responses: list[str] = []
+        if decision["route"] == "capture":
+            captured = capture_note(dispatch_request, now=reference_time, source=source)
+            self.last_domain_status = "ok"
+            return (
+                f"Captured {captured.kind} note: {captured.title} "
+                f"-> {captured.path.relative_to(captured.path.parents[2])}"
+            )
         if decision["route"] in ("calendar", "both"):
             _clear_domain_result(self.calendar_claw)
             before = _undo_depth(self.calendar_claw)

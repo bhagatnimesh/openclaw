@@ -18,6 +18,7 @@
           <a href="#today">Today</a>
           <a href="#backlog">Backlog</a>
           <a href="#shopping">Shopping</a>
+          <a href="#homework">Homework</a>
           <a href="#tasks">Tasks</a>
           <a href="#library">Library</a>
           <a href="#family">Family</a>
@@ -42,6 +43,7 @@
                 <span id="summary-prep"><strong>0</strong> prep</span>
                 <span id="summary-decisions"><strong>0</strong> decisions</span>
                 <span id="summary-shopping"><strong>0</strong> shopping</span>
+                <span id="summary-homework"><strong>0</strong> homework</span>
                 <span id="summary-home"><strong>0</strong> home</span>
                 <span id="summary-family"><strong>0</strong> family</span>
               </div>
@@ -166,6 +168,31 @@
           <div id="shopping-list-items" class="shopping-grid"></div>
         </section>
 
+        <section id="homework" class="section">
+          <div class="section-title">
+            <h2>Homework</h2>
+            <span></span>
+            <strong id="homework-count-label" class="section-count">0 open</strong>
+          </div>
+          <div class="homework-overview">
+            <article class="panel homework-upcoming-panel" data-dashboard-card="homework-upcoming">
+              <div class="panel-header">
+                <h3>Coming Up</h3>
+                <span id="homework-due-count">0 due now</span>
+              </div>
+              <div id="homework-upcoming-items" class="homework-list"></div>
+            </article>
+            <article class="panel homework-class-panel" data-dashboard-card="homework-classes">
+              <div class="panel-header">
+                <h3>Classes</h3>
+                <span id="homework-class-count">0 classes</span>
+              </div>
+              <div id="homework-class-items" class="homework-class-list"></div>
+            </article>
+          </div>
+          <div id="homework-child-groups" class="homework-child-grid"></div>
+        </section>
+
         <section id="tasks" class="section">
           <div class="section-title">
             <h2>Tasks</h2>
@@ -179,6 +206,9 @@
                 <span id="pending-task-count">0 pending</span>
               </div>
               <div class="task-filter-row" aria-label="Task filters">
+                <select id="task-list-filter" aria-label="Filter tasks by task list">
+                  <option value="all">All lists</option>
+                </select>
                 <select id="task-owner-filter" aria-label="Filter tasks by owner">
                   <option value="all">All owners</option>
                 </select>

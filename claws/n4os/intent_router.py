@@ -37,6 +37,7 @@ except ImportError:
 
 
 Route = Literal[
+    "capture",
     "calendar",
     "tasks",
     "shopping",
@@ -1065,11 +1066,29 @@ def _explicit_intent_frame(
     now: datetime | None,
 ) -> N4OSIntentFrame | None:
     explicit = parse_explicit_route(request)
-    if explicit is None or explicit.route == "capture":
+    if explicit is None:
         return None
 
     body = explicit.body
-    if explicit.route == "calendar":
+    if explicit.route == "capture":
+        if not body:
+            return N4OSIntentFrame(
+                route="unknown",
+                action="unknown",
+                confidence=0.0,
+                followup_kind="clarification",
+                missing_fields=["note"],
+                normalized_request=request,
+                clarification_question="What note should I capture?",
+                decision_source="clarification",
+            )
+        intent = {
+            "intent": "capture_note",
+            "body": body,
+            "missing_fields": [],
+        }
+        domain_request = body
+    elif explicit.route == "calendar":
         body_calendar_intent = _calendar_intent_module().extract_intent(body, now=now)
         direct_calendar_action = re.match(
             r"^\s*(?:delete|remove|cancel|move|reschedule|update|change|list|show|brief|prepare)\b",

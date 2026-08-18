@@ -443,6 +443,10 @@ h4 {
   content: "S";
 }
 
+.portal-nav a[href="#homework"]::before {
+  content: "H";
+}
+
 .portal-nav a[href="#tasks"]::before {
   content: "K";
 }
@@ -2434,6 +2438,92 @@ main > .section:first-of-type {
   opacity: 0.66;
 }
 
+.homework-overview {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
+  gap: 18px;
+  align-items: start;
+  margin-bottom: 18px;
+}
+
+.homework-list,
+.homework-class-list,
+.homework-child-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.homework-child-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.homework-item {
+  display: grid;
+  min-height: 76px;
+  align-items: center;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.homework-item.is-overdue {
+  border-left: 10px solid var(--error);
+}
+
+.homework-item.is-due-today {
+  border-left: 10px solid var(--primary-pop);
+}
+
+.homework-item.is-pending {
+  border-left: 10px solid var(--secondary);
+}
+
+.homework-item-main {
+  min-width: 0;
+}
+
+.homework-item-main strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.homework-class-chip {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  min-height: 58px;
+  padding: 10px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.homework-class-chip strong {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--secondary);
+  color: white;
+  font-weight: 900;
+}
+
+.homework-class-chip span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 900;
+  overflow-wrap: anywhere;
+}
+
+.homework-child-card .pending-task-badges {
+  margin: 0 0 12px;
+}
+
 .decision-actions {
   display: flex;
   justify-content: flex-end;
@@ -3063,6 +3153,8 @@ main > .section:first-of-type {
 
   .signal-grid,
   .shopping-grid,
+  .homework-overview,
+  .homework-child-grid,
   .decisions-layout,
   .decision-grid,
   .tasks-overview,
@@ -3156,6 +3248,8 @@ main > .section:first-of-type {
 
   .home-board-group-items,
   .shopping-grid,
+  .homework-overview,
+  .homework-child-grid,
   .decision-grid,
   .tasks-overview,
   .task-grid,

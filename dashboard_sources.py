@@ -35,6 +35,7 @@ class DashboardSources:
     decision_tools: Any | None = None
     shopping_tools: Any | None = None
     reading_garden_tools: Any | None = None
+    homework_tools: Any | None = None
 
 
 _DEFAULT_SOURCES: DashboardSources | None = None
@@ -98,6 +99,11 @@ class _UnavailableShoppingTools(_UnavailableSourceTools):
 
 class _UnavailableLibraryTools(_UnavailableSourceTools):
     def status(self, **_kwargs: Any) -> dict[str, Any]:
+        return self._response()
+
+
+class _UnavailableHomeworkTools(_UnavailableSourceTools):
+    def list_homework(self, **_kwargs: Any) -> dict[str, Any]:
         return self._response()
 
 
@@ -174,6 +180,11 @@ def build_default_sources() -> DashboardSources:
     except Exception as error:
         reading_garden_tools = _UnavailableLibraryTools("Reading Garden", error)
 
+    try:
+        homework_tools = build_default_homework_tools()
+    except Exception as error:
+        homework_tools = _UnavailableHomeworkTools("Homework", error)
+
     return DashboardSources(
         calendar_tools=calendar_tools,
         task_tools=task_tools,
@@ -184,6 +195,7 @@ def build_default_sources() -> DashboardSources:
         decision_tools=decision_tools,
         shopping_tools=shopping_tools,
         reading_garden_tools=reading_garden_tools,
+        homework_tools=homework_tools,
     )
 
 
@@ -217,6 +229,11 @@ def build_default_library_tools() -> Any:
         )
 
 
+def build_default_homework_tools() -> Any:
+    homework_module = importlib.import_module("claws.homework.tools")
+    return homework_module.build_default_tools()
+
+
 def build_default_shopping_tools() -> Any:
     shopping_dir = ROOT / "claws" / "shopping-list"
     with _isolated_claw_import(shopping_dir):
@@ -245,6 +262,7 @@ def _has_unavailable_source(sources: DashboardSources) -> bool:
             sources.decision_tools,
             sources.shopping_tools,
             sources.reading_garden_tools,
+            sources.homework_tools,
         )
     )
 

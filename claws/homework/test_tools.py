@@ -5,11 +5,17 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from claws.homework.claw import HomeworkClaw
 from claws.homework.provider import SQLiteHomeworkProvider
-from claws.homework.tools import CHERRY_BLOSSOM_EVENT_LABEL_COLOR, HomeworkTools, homework_content_fingerprint
+from claws.homework.tools import (
+    CHERRY_BLOSSOM_EVENT_LABEL_COLOR,
+    HomeworkTools,
+    ensure_default_class_schedules,
+    homework_content_fingerprint,
+)
 
 
 REFERENCE_TIME = datetime(2026, 8, 14, 9, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -26,6 +32,47 @@ class FakeCalendarTools:
             "message": "Calendar event created.",
             "data": {"event": {"id": "event-1"}},
         }
+
+
+class FakeHomeworkFieldExtractor:
+    def __init__(
+        self,
+        fields: dict[str, object] | None = None,
+        *,
+        action: str = "capture_assignment",
+        missing_fields: list[str] | None = None,
+        clarification_question: str | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.fields = fields or {}
+        self.action = action
+        self.missing_fields = missing_fields or []
+        self.clarification_question = clarification_question
+        self.fail = fail
+        self.calls: list[dict[str, object]] = []
+
+    def extract(self, request: str, **kwargs):
+        self.calls.append({"request": request, **kwargs})
+        if self.fail:
+            raise RuntimeError("ai unavailable")
+        return {
+            "action": self.action,
+            "confidence": 0.94,
+            "slots": self.fields,
+            "missing_fields": self.missing_fields,
+            "clarification_question": self.clarification_question,
+            "normalized_request": request,
+        }
+
+
+class SequencedHomeworkFieldExtractor:
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, object]] = []
+
+    def extract(self, request: str, **kwargs):
+        self.calls.append({"request": request, **kwargs})
+        return self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]
 
 
 class HomeworkToolsTest(unittest.TestCase):
@@ -57,6 +104,9 @@ class HomeworkToolsTest(unittest.TestCase):
         summary = (Path(self.tmp.name) / "homework" / "Nysha.md").read_text(encoding="utf-8")
         self.assertIn("# Nysha Homework", summary)
         self.assertIn("/static/dashboard/uploads/homework/one.jpg", summary)
+        class_summary = (Path(self.tmp.name) / "homework" / "Nysha" / "math.md").read_text(encoding="utf-8")
+        self.assertIn("# Nysha Math Homework", class_summary)
+        self.assertIn("All About Me", class_summary)
         self.assertEqual(len(self.calendar.created), 1)
         self.assertEqual(self.calendar.created[0]["calendar_name"], "Nysha School Calendar")
         self.assertEqual(
@@ -76,11 +126,553 @@ class HomeworkToolsTest(unittest.TestCase):
         self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-18T20:00:00-07:00")
         self.assertEqual(self.calendar.created[0]["end_time"], "2026-08-18T20:30:00-07:00")
 
-    def test_missing_due_date_does_not_create_calendar_event(self):
-        response = self.tools.capture_assignment("/capture homework Nysha spelling worksheet")
+    def test_missing_due_date_stores_item_and_asks_for_followup(self):
+        from claws.homework import tools as homework_tools
+
+        with patch.object(homework_tools, "DEFAULT_CLASS_SCHEDULES", ()):
+            response = self.tools.capture_assignment("/capture homework Nysha spelling worksheet")
+
+        self.assertEqual(response["status"], "needs_information")
+        self.assertIn("What due date", response["message"])
+        self.assertEqual(response["data"]["item"]["child"], "Nysha")
+        self.assertEqual(self.calendar.created, [])
+
+    def test_due_date_followup_updates_item_then_time_followup_creates_calendar_event(self):
+        from claws.homework import tools as homework_tools
+
+        claw = HomeworkClaw(self.tools)
+        with patch.object(homework_tools, "DEFAULT_CLASS_SCHEDULES", ()):
+            first = claw.capture_from_request(
+                "/capture homework art class",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertIn("What due date", first)
+        self.assertIsNotNone(claw.pending_action)
+
+        second = claw.capture_from_request("Due next Saturday", reference_time=REFERENCE_TIME)
+
+        self.assertIn("Added due-date reminder", second)
+        item = self.provider.list_items(child="Nysha")[0]
+        self.assertEqual(item["due_date"], "2026-08-15")
+        self.assertIsNone(claw.pending_action)
+        self.assertEqual(self.calendar.created[0]["calendar_name"], "Nysha School Calendar")
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-15T07:00:00-07:00")
+
+    def test_due_date_followup_accepts_bare_date_answer(self):
+        from claws.homework import tools as homework_tools
+
+        claw = HomeworkClaw(self.tools)
+        with patch.object(homework_tools, "DEFAULT_CLASS_SCHEDULES", ()):
+            first = claw.capture_from_request(
+                "/capture homework spelling worksheet",
+                reference_time=REFERENCE_TIME,
+            )
+        self.assertIn("What due date", first)
+
+        second = claw.capture_from_request("tomorrow", reference_time=REFERENCE_TIME)
+
+        self.assertIn("Added due-date reminder", second)
+        self.assertIsNone(claw.pending_action)
+        item = self.provider.list_items(child="Nysha")[0]
+        self.assertEqual(item["due_date"], "2026-08-15")
+
+    def test_due_date_followup_preserves_original_due_time(self):
+        from claws.homework import tools as homework_tools
+
+        claw = HomeworkClaw(self.tools)
+        with patch.object(homework_tools, "DEFAULT_CLASS_SCHEDULES", ()):
+            first = claw.capture_from_request(
+                "/capture homework art class at 8 am",
+                reference_time=REFERENCE_TIME,
+            )
+        self.assertIn("What due date", first)
+
+        second = claw.capture_from_request("tomorrow", reference_time=REFERENCE_TIME)
+
+        self.assertIn("Added due-date reminder", second)
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-15T08:00:00-07:00")
+
+    def test_pending_due_date_does_not_consume_new_capture_request(self):
+        from claws.homework import tools as homework_tools
+
+        claw = HomeworkClaw(self.tools)
+        with patch.object(homework_tools, "DEFAULT_CLASS_SCHEDULES", ()):
+            first = claw.capture_from_request(
+                "/capture homework art class",
+                reference_time=REFERENCE_TIME,
+            )
+            second = claw.capture_from_request(
+                "/capture homework Navya art class due 2026-08-21",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertIn("What due date", first)
+        self.assertIn("Captured homework for Navya", second)
+        self.assertEqual(len(self.provider.list_items(child="Nysha")), 1)
+        self.assertEqual(len(self.provider.list_items(child="Navya")), 1)
+
+    def test_homework_without_child_defaults_to_nysha(self):
+        response = self.tools.capture_assignment(
+            "/capture homework art class due next Saturday",
+            now=REFERENCE_TIME,
+        )
 
         self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["child"], "Nysha")
+        self.assertEqual(self.calendar.created[0]["calendar_name"], "Nysha School Calendar")
+
+    def test_ai_field_extractor_refines_homework_fields_before_calendar_event(self):
+        extractor = FakeHomeworkFieldExtractor(
+            {
+                "child": "Navya",
+                "title": "Practice writing your name",
+                "class_name": "Art",
+                "due_date": "2026-08-15",
+                "due_time": "10:00",
+                "notes": "Detected from homework photo.",
+            }
+        )
+        tools = HomeworkTools(
+            self.provider,
+            homework_root=Path(self.tmp.name) / "homework",
+            calendar_tools=self.calendar,
+            field_extractor=extractor,
+        )
+
+        response = tools.capture_assignment(
+            "/capture homework art class for Navya practice writing your name",
+            now=REFERENCE_TIME,
+            source="telegram_photo",
+        )
+
+        self.assertEqual(response["status"], "ok")
+        item = response["data"]["item"]
+        self.assertEqual(item["child"], "Navya")
+        self.assertEqual(item["title"], "Practice writing your name")
+        self.assertEqual(item["subject"], "Art")
+        self.assertEqual(item["due_date"], "2026-08-15")
+        self.assertEqual(self.calendar.created[0]["calendar_name"], "Navya School Calendar")
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-15T10:00:00-07:00")
+        self.assertEqual(extractor.calls[0]["baseline_intent"]["child"], "Navya")
+        self.assertIn("class_schedules", extractor.calls[0]["context"])
+
+    def test_ai_field_extractor_failure_falls_back_to_deterministic_parse(self):
+        tools = HomeworkTools(
+            self.provider,
+            homework_root=Path(self.tmp.name) / "homework",
+            calendar_tools=self.calendar,
+            field_extractor=FakeHomeworkFieldExtractor(fail=True),
+        )
+
+        response = tools.capture_assignment(
+            "/capture homework Nysha art class",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["child"], "Nysha")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-15")
+
+    def test_ai_clarify_response_asks_before_storing_default_assignment(self):
+        tools = HomeworkTools(
+            self.provider,
+            homework_root=Path(self.tmp.name) / "homework",
+            calendar_tools=self.calendar,
+            field_extractor=FakeHomeworkFieldExtractor(
+                action="clarify",
+                missing_fields=["child", "due_date"],
+                clarification_question="Who is this homework for and when is it due?",
+            ),
+        )
+
+        response = tools.capture_assignment("/capture homework blurry worksheet", now=REFERENCE_TIME)
+
+        self.assertEqual(response["status"], "needs_information")
+        self.assertEqual(response["message"], "Who is this homework for and when is it due?")
+        self.assertEqual(response["data"]["pending_action"]["action"], "clarify_homework_capture")
+        self.assertEqual(self.provider.list_items(child="Nysha"), [])
         self.assertEqual(self.calendar.created, [])
+
+    def test_ai_clarify_followup_completes_original_capture(self):
+        extractor = SequencedHomeworkFieldExtractor(
+            [
+                {
+                    "action": "clarify",
+                    "confidence": 0.91,
+                    "slots": {},
+                    "missing_fields": ["child", "due_date"],
+                    "clarification_question": "Who is this for and when is it due?",
+                    "normalized_request": "/capture homework blurry worksheet",
+                },
+                {
+                    "action": "capture_assignment",
+                    "confidence": 0.94,
+                    "slots": {
+                        "child": "Navya",
+                        "title": "Blurry worksheet",
+                        "class_name": "Art",
+                        "due_date": "2026-08-15",
+                    },
+                    "missing_fields": [],
+                    "normalized_request": "/capture homework blurry worksheet Navya due Saturday",
+                },
+            ],
+        )
+        tools = HomeworkTools(
+            self.provider,
+            homework_root=Path(self.tmp.name) / "homework",
+            calendar_tools=self.calendar,
+            field_extractor=extractor,
+        )
+        claw = HomeworkClaw(tools)
+
+        first = claw.capture_from_request("/capture homework blurry worksheet", reference_time=REFERENCE_TIME)
+        second = claw.capture_from_request("Navya due Saturday", reference_time=REFERENCE_TIME)
+
+        self.assertIn("Who is this for", first)
+        self.assertIn("Captured homework for Navya", second)
+        self.assertIsNone(claw.pending_action)
+        self.assertEqual(self.provider.list_items(child="Navya")[0]["title"], "Blurry worksheet")
+
+    def test_class_schedule_infers_art_due_date(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="Art",
+            weekday=5,
+            start_time="10:00",
+            due_rule="next_class",
+            calendar_name="Nysha School Calendar",
+            source="manual",
+        )
+
+        response = self.tools.capture_assignment(
+            "/capture homework art class",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-15")
+        self.assertIn("due_date_inference", response["data"]["item"]["metadata_json"])
+        self.assertEqual(self.calendar.created[0]["calendar_name"], "Nysha School Calendar")
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-15T10:00:00-07:00")
+
+    def test_generic_math_uses_school_schedule_not_rsm_math(self):
+        ensure_default_class_schedules(self.provider, Path(self.tmp.name) / "homework")
+
+        response = self.tools.capture_assignment(
+            "/capture homework Nysha math worksheet",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-14")
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-14T07:00:00-07:00")
+
+    def test_school_homework_uses_friday_schedule_when_class_not_named(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="School",
+            weekday=4,
+            due_rule="friday",
+            calendar_name="Nysha School Calendar",
+            source="manual",
+        )
+
+        response = self.tools.capture_assignment(
+            "/capture homework spelling worksheet",
+            now=datetime(2026, 8, 12, 9, 0, tzinfo=ZoneInfo("America/Los_Angeles")),
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["child"], "Nysha")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-14")
+
+    def test_unknown_class_does_not_fall_back_to_school_schedule(self):
+        response = self.tools.capture_assignment(
+            "/capture homework music class",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "needs_information")
+        self.assertIn("What due date", response["message"])
+        self.assertEqual(self.calendar.created, [])
+
+    def test_after_school_learning_does_not_match_generic_school_schedule(self):
+        response = self.tools.capture_assignment(
+            "/capture homework Navya after-school learning",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "needs_information")
+        self.assertIn("What due date", response["message"])
+        self.assertEqual(self.calendar.created, [])
+
+    def test_school_friday_due_rule_can_use_today(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="School",
+            weekday=4,
+            due_rule="friday",
+            calendar_name="Nysha School Calendar",
+            source="manual",
+        )
+
+        response = self.tools.capture_assignment(
+            "/capture homework spelling worksheet",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-14")
+
+    def test_schedule_calendar_name_is_used_for_due_reminder(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="Art",
+            weekday=5,
+            start_time="10:00",
+            due_rule="next_class",
+            calendar_name="Weekend Classes",
+            source="manual",
+        )
+
+        response = self.tools.capture_assignment(
+            "/capture homework art class",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(self.calendar.created[0]["calendar_name"], "Weekend Classes")
+
+    def test_explicit_due_date_uses_schedule_time_and_calendar(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="Art",
+            weekday=5,
+            start_time="10:00",
+            due_rule="next_class",
+            calendar_name="Weekend Classes",
+            source="manual",
+        )
+
+        response = self.tools.capture_assignment(
+            "/capture homework art class due 2026-08-15",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-15")
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-15T10:00:00-07:00")
+        self.assertEqual(self.calendar.created[0]["calendar_name"], "Weekend Classes")
+
+    def test_provider_schedule_overrides_ai_due_date_for_scheduled_class(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="Art",
+            weekday=6,
+            start_time="11:00",
+            due_rule="next_class",
+            calendar_name="Updated Art Calendar",
+            source="manual",
+        )
+        extractor = FakeHomeworkFieldExtractor(
+            {
+                "child": "Nysha",
+                "title": "Draw flowers",
+                "class_name": "Art",
+                "due_date": "2026-08-15",
+                "due_time": "10:00",
+                "calendar_name": "Nysha School Calendar",
+            }
+        )
+        tools = HomeworkTools(
+            self.provider,
+            homework_root=Path(self.tmp.name) / "homework",
+            calendar_tools=self.calendar,
+            field_extractor=extractor,
+        )
+
+        response = tools.capture_assignment(
+            "/capture homework Nysha art class",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-16")
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-16T11:00:00-07:00")
+        self.assertEqual(self.calendar.created[0]["calendar_name"], "Updated Art Calendar")
+
+    def test_ai_refinement_preserves_explicit_user_due_date_over_schedule(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="Art",
+            weekday=5,
+            start_time="10:00",
+            due_rule="next_class",
+            calendar_name="Nysha School Calendar",
+            source="manual",
+        )
+        extractor = FakeHomeworkFieldExtractor(
+            {
+                "child": "Nysha",
+                "title": "Draw flowers",
+                "class_name": "Art",
+            }
+        )
+        tools = HomeworkTools(
+            self.provider,
+            homework_root=Path(self.tmp.name) / "homework",
+            calendar_tools=self.calendar,
+            field_extractor=extractor,
+        )
+
+        response = tools.capture_assignment(
+            "/capture homework Nysha art class due 2026-08-30",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-30")
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-30T10:00:00-07:00")
+
+    def test_ai_refinement_preserves_natural_user_due_date_over_schedule(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="Art",
+            weekday=6,
+            start_time="11:00",
+            due_rule="next_class",
+            calendar_name="Updated Art Calendar",
+            source="manual",
+        )
+        extractor = FakeHomeworkFieldExtractor(
+            {
+                "child": "Nysha",
+                "title": "Draw flowers",
+                "class_name": "Art",
+                "due_date": "2026-08-15",
+            }
+        )
+        tools = HomeworkTools(
+            self.provider,
+            homework_root=Path(self.tmp.name) / "homework",
+            calendar_tools=self.calendar,
+            field_extractor=extractor,
+        )
+
+        response = tools.capture_assignment(
+            "/capture homework Nysha art class next Saturday",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-15")
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-15T11:00:00-07:00")
+
+    def test_ai_refinement_preserves_tomorrow_due_date_over_schedule(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="Art",
+            weekday=6,
+            start_time="11:00",
+            due_rule="next_class",
+            calendar_name="Updated Art Calendar",
+            source="manual",
+        )
+        extractor = FakeHomeworkFieldExtractor(
+            {
+                "child": "Nysha",
+                "title": "Draw flowers",
+                "class_name": "Art",
+                "due_date": "2026-08-15",
+            }
+        )
+        tools = HomeworkTools(
+            self.provider,
+            homework_root=Path(self.tmp.name) / "homework",
+            calendar_tools=self.calendar,
+            field_extractor=extractor,
+        )
+
+        response = tools.capture_assignment(
+            "/capture homework Nysha art class tomorrow",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["due_date"], "2026-08-15")
+
+    def test_ai_refinement_preserves_explicit_due_time_over_schedule_time(self):
+        self.provider.upsert_class_schedule(
+            child="Nysha",
+            class_name="Art",
+            weekday=5,
+            start_time="10:00",
+            due_rule="next_class",
+            calendar_name="Nysha School Calendar",
+            source="manual",
+        )
+        extractor = FakeHomeworkFieldExtractor(
+            {
+                "child": "Nysha",
+                "title": "Draw flowers",
+                "class_name": "Art",
+            }
+        )
+        tools = HomeworkTools(
+            self.provider,
+            homework_root=Path(self.tmp.name) / "homework",
+            calendar_tools=self.calendar,
+            field_extractor=extractor,
+        )
+
+        response = tools.capture_assignment(
+            "/capture homework Nysha art class due 2026-08-15 at 8 am",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(self.calendar.created[0]["start_time"], "2026-08-15T08:00:00-07:00")
+
+    def test_default_class_schedules_are_stored_and_written_to_markdown(self):
+        ensure_default_class_schedules(self.provider, Path(self.tmp.name) / "homework")
+
+        response = self.tools.list_class_schedules(child="Nysha")
+
+        self.assertEqual(response["status"], "ok")
+        self.assertIn("Nysha Art", response["message"])
+        self.assertIn("Nysha RSM Math", response["message"])
+        schedule_text = (Path(self.tmp.name) / "homework" / "class-schedules.md").read_text(encoding="utf-8")
+        self.assertIn("Nysha - Art", schedule_text)
+        self.assertIn("Tuesday", schedule_text)
+
+    def test_schedule_markdown_includes_effective_default_schedules(self):
+        response = self.tools.capture_assignment(
+            "/capture homework music class due 2026-08-21",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(response["status"], "ok")
+        schedule_text = (Path(self.tmp.name) / "homework" / "class-schedules.md").read_text(encoding="utf-8")
+        self.assertIn("Nysha - Art", schedule_text)
+        self.assertIn("Navya - Art", schedule_text)
+        nysha_schedule = (Path(self.tmp.name) / "homework" / "Nysha" / "class-schedule.md").read_text(encoding="utf-8")
+        navya_schedule = (Path(self.tmp.name) / "homework" / "Navya" / "class-schedule.md").read_text(encoding="utf-8")
+        self.assertIn("Nysha - Art", nysha_schedule)
+        self.assertIn("Navya - Art", navya_schedule)
+
+    def test_build_default_tools_does_not_seed_schedules_or_rewrite_markdown(self):
+        from claws.homework import tools as homework_tools
+
+        with (
+            patch.object(homework_tools, "SQLiteHomeworkProvider", return_value=self.provider),
+            patch.object(homework_tools, "ensure_default_class_schedules") as ensure_defaults,
+        ):
+            default_tools = homework_tools.build_default_tools()
+
+        self.assertIs(default_tools.provider, self.provider)
+        ensure_defaults.assert_not_called()
 
     def test_lists_current_homework_by_child_and_due_date(self):
         self.tools.capture_assignment("/capture homework Nysha reading due 2026-08-22")
@@ -161,6 +753,7 @@ class HomeworkToolsTest(unittest.TestCase):
             "/capture homework Nysha\n\n"
             "Image text:\n"
             "Homework title: Second Grade Homework\n"
+            "Due date: 2026-08-28\n"
             "Monday: All About Me Book 25 minutes",
             source="telegram_photo",
             photo_path="/static/dashboard/uploads/homework/one.jpg",
@@ -170,6 +763,7 @@ class HomeworkToolsTest(unittest.TestCase):
             "/capture homework Nysha\n\n"
             "Image text:\n"
             "Homework title: Second Grade Homework\n"
+            "Due date: 2026-08-28\n"
             "Monday: Practice subtraction facts",
             source="telegram_photo",
             photo_path="/static/dashboard/uploads/homework/two.jpg",
@@ -179,19 +773,21 @@ class HomeworkToolsTest(unittest.TestCase):
         self.assertEqual(len(self.provider.list_items(child="Nysha")), 2)
 
     def test_pending_duplicate_attach_adds_asset_without_calendar_event(self):
-        self.tools.capture_assignment(
-            "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
-            source="telegram_photo",
-            photo_path="/static/dashboard/uploads/homework/one.jpg",
-        )
-        response = self.tools.capture_assignment(
-            "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
-            source="telegram_photo",
-            photo_path="/static/dashboard/uploads/homework/two.jpg",
-        )
-        pending = response["data"]["pending_action"]
+        from claws.homework import tools as homework_tools
 
-        resolved = self.tools.resolve_duplicate_assignment(pending, "attach")
+        with patch.object(homework_tools, "DEFAULT_CLASS_SCHEDULES", ()):
+            self.tools.capture_assignment(
+                "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
+                source="telegram_photo",
+                photo_path="/static/dashboard/uploads/homework/one.jpg",
+            )
+            response = self.tools.capture_assignment(
+                "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
+                source="telegram_photo",
+                photo_path="/static/dashboard/uploads/homework/two.jpg",
+            )
+            pending = response["data"]["pending_action"]
+            resolved = self.tools.resolve_duplicate_assignment(pending, "attach")
 
         self.assertEqual(resolved["status"], "ok")
         items = self.provider.list_items(child="Nysha")
@@ -200,21 +796,23 @@ class HomeworkToolsTest(unittest.TestCase):
         self.assertEqual(len(self.calendar.created), 0)
 
     def test_pending_duplicate_new_records_similarity_metadata(self):
-        self.tools.capture_assignment(
-            "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
-            source="telegram_photo",
-            photo_path="/static/dashboard/uploads/homework/one.jpg",
-        )
-        response = self.tools.capture_assignment(
-            "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
-            source="telegram_photo",
-            photo_path="/static/dashboard/uploads/homework/two.jpg",
-        )
-        pending = response["data"]["pending_action"]
+        from claws.homework import tools as homework_tools
 
-        resolved = self.tools.resolve_duplicate_assignment(pending, "new")
+        with patch.object(homework_tools, "DEFAULT_CLASS_SCHEDULES", ()):
+            self.tools.capture_assignment(
+                "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
+                source="telegram_photo",
+                photo_path="/static/dashboard/uploads/homework/one.jpg",
+            )
+            response = self.tools.capture_assignment(
+                "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
+                source="telegram_photo",
+                photo_path="/static/dashboard/uploads/homework/two.jpg",
+            )
+            pending = response["data"]["pending_action"]
+            resolved = self.tools.resolve_duplicate_assignment(pending, "new")
 
-        self.assertEqual(resolved["status"], "ok")
+        self.assertEqual(resolved["status"], "needs_information")
         items = self.provider.list_items(child="Nysha")
         self.assertEqual(len(items), 2)
         created = resolved["data"]["item"]
@@ -223,12 +821,12 @@ class HomeworkToolsTest(unittest.TestCase):
     def test_claw_resolves_pending_duplicate_followup(self):
         claw = HomeworkClaw(self.tools)
         claw.capture_from_request(
-            "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
+            "/capture homework Nysha due 2026-08-21\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
             source="telegram_photo",
             photo_path="/static/dashboard/uploads/homework/one.jpg",
         )
         reply = claw.capture_from_request(
-            "/capture homework Nysha\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
+            "/capture homework Nysha due 2026-08-21\n\nImage text:\nHomework title: Second Grade Homework\nMonday: Read aloud",
             source="telegram_photo",
             photo_path="/static/dashboard/uploads/homework/two.jpg",
         )

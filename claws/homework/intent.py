@@ -94,6 +94,7 @@ def _next_weekday(name: str, today: Date) -> str:
 
 
 def _extract_due_date(text: str, today: Date) -> str | None:
+    caption_text = re.split(r"\bimage text\s*:", text, maxsplit=1, flags=re.IGNORECASE)[0]
     weekday_date = re.search(
         r"\b(?:due|due date|due by)\s*[:\-]?\s*"
         r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+"
@@ -107,7 +108,7 @@ def _extract_due_date(text: str, today: Date) -> str | None:
             return parsed
 
     relative = re.search(
-        r"\b(?:due|due date|due by)\s*[:\-]?\s*(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        r"\b(?:due|due date|due by)\s*[:\-]?\s*(today|tomorrow|(?:next\s+)?monday|(?:next\s+)?tuesday|(?:next\s+)?wednesday|(?:next\s+)?thursday|(?:next\s+)?friday|(?:next\s+)?saturday|(?:next\s+)?sunday)\b",
         text,
         flags=re.IGNORECASE,
     )
@@ -117,7 +118,16 @@ def _extract_due_date(text: str, today: Date) -> str | None:
             return today.isoformat()
         if value == "tomorrow":
             return (today + timedelta(days=1)).isoformat()
+        value = value.removeprefix("next ").strip()
         return _next_weekday(value, today)
+
+    standalone_next = re.search(
+        r"\bclass\s+next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        caption_text,
+        flags=re.IGNORECASE,
+    )
+    if standalone_next:
+        return _next_weekday(standalone_next.group(1), today)
 
     patterns = [
         r"\b(?:due date|due by|due)\s*[:\-]?\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})",
@@ -131,6 +141,21 @@ def _extract_due_date(text: str, today: Date) -> str | None:
             parsed = _parse_date_candidate(match.group(1), today)
             if parsed:
                 return parsed
+
+    offset = re.search(
+        r"\b(?:after|in)\s+(\d+|one|two|three|four)\s+weeks?\b",
+        caption_text,
+        flags=re.IGNORECASE,
+    )
+    if offset:
+        value = {
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+        }.get(offset.group(1).lower())
+        weeks = value if value is not None else int(offset.group(1))
+        return (today + timedelta(days=7 * weeks)).isoformat()
     return None
 
 
@@ -143,6 +168,12 @@ def _extract_due_time(text: str) -> str | None:
     if match is None:
         match = re.search(
             r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if match is None:
+        match = re.search(
+            r"^\s*(?:homework\s+)?(?:due\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*$",
             text,
             flags=re.IGNORECASE,
         )
@@ -190,6 +221,15 @@ def _label_value(text: str, labels: tuple[str, ...]) -> str | None:
 
 def _extract_subject(text: str) -> str | None:
     caption_text = re.split(r"\bimage text:\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    class_patterns = (
+        ("RSM Math", r"\brsm\s+math(?:\s+class)?\b"),
+        ("After-school learning", r"\bafter[-\s]school\s+learning\b"),
+        ("Math", r"\bmath\s+class\b"),
+        ("Art", r"\bart\s+class\b"),
+    )
+    for label, pattern in class_patterns:
+        if re.search(pattern, caption_text, flags=re.IGNORECASE):
+            return label
     caption_match = re.search(
         r"\b(math|reading|writing|spelling|science|social studies|art|music)\b",
         caption_text,
@@ -200,6 +240,9 @@ def _extract_subject(text: str) -> str | None:
     labeled = _label_value(text, ("subject", "class", "class/subject"))
     if labeled:
         return labeled
+    for label, pattern in class_patterns:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return label
     match = re.search(
         r"\b(math|reading|writing|spelling|science|social studies|art|music)\b",
         text,
@@ -255,12 +298,31 @@ def _extract_title(text: str, subject: str | None) -> str:
         return _clean_text(project.group(1))
 
     body = _strip_homework_prefix(text)
+    body = re.split(r"\bimage text\s*:", body, maxsplit=1, flags=re.IGNORECASE)[0]
     body = re.sub(r"\b(?:nysha|navya)\b", "", body, flags=re.IGNORECASE)
     body = re.sub(r"\b(?:due|assigned)\b.+$", "", body, flags=re.IGNORECASE)
+    body = re.sub(
+        r"\bclass\s+next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        "class",
+        body,
+        flags=re.IGNORECASE,
+    )
     body = re.sub(r"\b(?:math|reading|writing|spelling|science|social studies)\b", "", body, flags=re.IGNORECASE)
     body = _clean_text(body.strip(" .,:;-"))
     if body and len(body) <= 80:
         return body
+    ocr = _ocr_text(text)
+    if ocr:
+        for line in ocr.splitlines():
+            cleaned = _clean_text(line.strip(" .,:;-"))
+            if re.match(
+                r"^(?:assigned|class|due date|due|grade|student|subject|visible instructions|week range|week)\s*:",
+                cleaned,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            if cleaned and len(cleaned) <= 80:
+                return cleaned
     if subject:
         return f"{subject} homework"
     return "Homework"

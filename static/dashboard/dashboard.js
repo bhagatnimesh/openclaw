@@ -11,6 +11,7 @@
   var lastTasksData = {};
   var lastReadingData = {};
   var lastShoppingData = {};
+  var lastHomeworkData = {};
   var lastBacklogData = {};
   var lastBedtimeData = {};
   var backlogReviewIndex = -1;
@@ -166,6 +167,11 @@
     return normalizeTaskOwner(value);
   }
 
+  function selectedTaskList() {
+    var value = text(getQueryParam("list")).trim();
+    return value || "all";
+  }
+
   function selectedTaskDueFilter() {
     return text(getQueryParam("due")).trim().toLowerCase() === "today" ? "today" : "";
   }
@@ -191,6 +197,19 @@
     } else {
       url.searchParams.delete("owner");
     }
+    window.history.replaceState({}, "", url.toString());
+  }
+
+  function setSelectedTaskList(listId) {
+    var selected = text(listId).trim();
+    var url = new URL(window.location.href);
+    if (selected && selected !== "all") {
+      url.searchParams.set("list", selected);
+      url.hash = "#tasks";
+    } else {
+      url.searchParams.delete("list");
+    }
+    url.searchParams.delete("tag");
     window.history.replaceState({}, "", url.toString());
   }
 
@@ -1210,6 +1229,7 @@
     setSummaryChip("summary-prep", summary.prep_needed_count, "prep", "prep");
     setSummaryChip("summary-decisions", summary.open_decision_count, "decision", "decisions");
     setSummaryChip("summary-home", summary.home_board_count, "home", "home");
+    setSummaryChip("summary-homework", summary.homework_count, "homework", "homework");
     setSummaryChip(
       "summary-family",
       (family.responsibilities || []).length +
@@ -1360,15 +1380,59 @@
     return Number(task.days_until_due) === 0;
   }
 
-  function filterTasks(tasks, tag, owner, dueFilter) {
+  function taskMatchesList(task, listId) {
+    return !listId || listId === "all" || text(task.task_list_id, "@default") === listId;
+  }
+
+  function filterTasks(tasks, tag, owner, dueFilter, listId) {
     tasks = tasks || [];
     return tasks.filter(function (task) {
       return (
         taskMatchesTag(task, tag) &&
         taskMatchesOwner(task, owner) &&
-        taskMatchesDueFilter(task, dueFilter)
+        taskMatchesDueFilter(task, dueFilter) &&
+        taskMatchesList(task, listId)
       );
     });
+  }
+
+  function renderTaskListFilter(lists, selectedList) {
+    var node = byId("task-list-filter");
+    if (!node) return;
+    selectedList = selectedList || "all";
+    var options = [{ id: "all", title: "All lists", count: 0 }];
+    var seen = { all: true };
+    (lists || []).forEach(function (entry) {
+      var id = text(entry.id, "@default");
+      if (seen[id]) return;
+      seen[id] = true;
+      options.push({
+        id: id,
+        title: text(entry.title, id),
+        count: Number(entry.count || 0),
+      });
+    });
+    if (selectedList !== "all" && !seen[selectedList]) {
+      options.push({ id: selectedList, title: selectedList, count: 0 });
+    }
+    node.innerHTML = options
+      .map(function (entry) {
+        var label =
+          entry.id === "all"
+            ? entry.title
+            : entry.title + (entry.count ? " (" + entry.count + ")" : "");
+        return (
+          '<option value="' +
+          escapeHtml(entry.id) +
+          '"' +
+          (entry.id === selectedList ? " selected" : "") +
+          ">" +
+          escapeHtml(label) +
+          "</option>"
+        );
+      })
+      .join("");
+    node.hidden = options.length <= 2 && selectedList === "all";
   }
 
   function renderTaskOwnerFilter(owners, selectedOwner) {
@@ -1734,6 +1798,8 @@
       escapeHtml(task.title || "Task") +
       '" data-task-owner-label="' +
       escapeHtml(task.owner_label || "") +
+      '" data-task-list-id="' +
+      escapeHtml(task.task_list_id || "@default") +
       '" aria-label="Complete ' +
       escapeHtml(task.title) +
       '">Complete</button>'
@@ -1776,7 +1842,12 @@
         button.textContent = "Complete";
       }
     };
-    request.send(JSON.stringify({ task_id: taskId }));
+    request.send(
+      JSON.stringify({
+        task_id: taskId,
+        task_list_id: button ? button.getAttribute("data-task-list-id") : "",
+      }),
+    );
   }
 
   function decisionCompleteButton(decision) {
@@ -2014,10 +2085,121 @@
       .join("");
   }
 
-  function renderPendingTasks(tasks, allTaskCount, dueFilter) {
+  function homeworkTone(item) {
+    if (
+      item.days_until_due !== null &&
+      item.days_until_due !== undefined &&
+      item.days_until_due < 0
+    ) {
+      return "is-overdue";
+    }
+    if (item.days_until_due === 0) return "is-due-today";
+    return "is-pending";
+  }
+
+  function homeworkBadges(item) {
+    var dueNow =
+      item.days_until_due !== null &&
+      item.days_until_due !== undefined &&
+      item.days_until_due <= 0;
+    return [
+      taskBadge(item.child, "green"),
+      taskBadge(item.class_name || "Unsorted", ""),
+      taskBadge(item.due_label || "No due date", dueNow ? "alert" : "warm"),
+      item.week_range ? taskBadge(item.week_range, "") : "",
+    ].join("");
+  }
+
+  function homeworkItemRow(item) {
+    return (
+      '<div class="homework-item ' +
+      escapeHtml(homeworkTone(item)) +
+      '"><div class="homework-item-main"><strong>' +
+      escapeHtml(item.title || "Homework") +
+      '</strong><div class="pending-task-badges">' +
+      homeworkBadges(item) +
+      "</div></div></div>"
+    );
+  }
+
+  function renderHomework(data) {
+    data = data || {};
+    lastHomeworkData = data;
+    var upcoming = data.upcoming || [];
+    var children = data.children || [];
+    var classes = data.classes || [];
+    var openCount = Number(data.open_count || 0);
+    var dueNowCount = Number(data.due_now_count || 0);
+    setSummaryChip("summary-homework", openCount, "homework", "homework");
+    setText("homework-count-label", openCount + " open");
+    setText("homework-due-count", dueNowCount + " due now");
+    setText("homework-class-count", classes.length + (classes.length === 1 ? " class" : " classes"));
+    setCardHidden("homework-upcoming", !openCount && data.available !== false);
+    setCardHidden("homework-classes", !classes.length);
+
+    var upcomingNode = byId("homework-upcoming-items");
+    if (upcomingNode) {
+      if (data.available === false) {
+        upcomingNode.innerHTML = empty(data.message || "Homework source unavailable.");
+      } else {
+        upcomingNode.innerHTML = upcoming.length
+          ? upcoming.slice(0, 8).map(homeworkItemRow).join("")
+          : empty("No open homework captured.");
+      }
+    }
+
+    var classNode = byId("homework-class-items");
+    if (classNode) {
+      classNode.innerHTML = classes.length
+        ? classes
+            .map(function (entry) {
+              return (
+                '<div class="homework-class-chip"><strong>' +
+                escapeHtml(entry.open_count || 0) +
+                "</strong><span>" +
+                escapeHtml(entry.child + " | " + entry.class_name) +
+                "</span></div>"
+              );
+            })
+            .join("")
+        : "";
+    }
+
+    var childNode = byId("homework-child-groups");
+    if (!childNode) return;
+    childNode.innerHTML = children
+      .map(function (child) {
+        var items = child.items || [];
+        var classRows = (child.classes || [])
+          .map(function (entry) {
+            return (
+              '<span class="task-badge">' +
+              escapeHtml(entry.class_name + " " + entry.open_count) +
+              "</span>"
+            );
+          })
+          .join("");
+        return (
+          '<article class="panel homework-child-card"><div class="panel-header"><h3>' +
+          escapeHtml(child.child) +
+          "</h3><span>" +
+          escapeHtml((child.open_count || 0) + " open") +
+          '</span></div><div class="pending-task-badges">' +
+          classRows +
+          '</div><div class="homework-list">' +
+          (items.length ? items.slice(0, 5).map(homeworkItemRow).join("") : empty("No open homework.")) +
+          "</div></article>"
+        );
+      })
+      .join("");
+  }
+
+  function renderPendingTasks(tasks, allTaskCount, dueFilter, taskState) {
     var node = byId("pending-task-items");
     tasks = tasks || [];
+    taskState = taskState || {};
     allTaskCount = allTaskCount === undefined ? tasks.length : allTaskCount;
+    var sourceUnavailable = taskState.available === false;
     var dueCount = tasks.filter(function (task) {
       return (
         task.days_until_due !== null &&
@@ -2040,9 +2222,13 @@
     setText("task-due-count", dueCount);
     setText("task-unassigned-count", unassignedCount);
     setText("task-unscheduled-count", unscheduledCount);
-    setCardHidden("pending-tasks", !allTaskCount);
+    setCardHidden("pending-tasks", !allTaskCount && !sourceUnavailable);
     setCardHidden("task-triage", dueCount + unassignedCount + unscheduledCount === 0);
     if (!node) return;
+    if (sourceUnavailable) {
+      node.innerHTML = empty(taskState.message || "Task source unavailable.");
+      return;
+    }
     if (!tasks.length) {
       node.innerHTML = empty(
         dueFilter === "today"
@@ -2085,17 +2271,22 @@
       .join("");
   }
 
-  function renderTaskGroups(groups, selectedTag) {
+  function renderTaskGroups(groups, selectedTag, selectedOwner, selectedDue, selectedList) {
     var node = byId("task-groups");
     if (!node) return;
     var visibleGroups = (groups || [])
       .map(function (group) {
         var items = group.items || [];
-        if (selectedTag) {
-          items = items.filter(function (recommendation) {
-            return recommendation.task && taskMatchesTag(recommendation.task, selectedTag);
-          });
-        }
+        items = items.filter(function (recommendation) {
+          var task = recommendation.task;
+          return (
+            task &&
+            taskMatchesTag(task, selectedTag) &&
+            taskMatchesOwner(task, selectedOwner) &&
+            taskMatchesDueFilter(task, selectedDue) &&
+            taskMatchesList(task, selectedList)
+          );
+        });
         return {
           label: group.label,
           detail: group.detail,
@@ -2543,6 +2734,7 @@
     renderHomeBoard(data.home_board || {});
     renderBedtime(data.bedtime || {});
     renderShopping(data.shopping || {});
+    renderHomework(data.homework || {});
     renderPrep(calendar.prep_needed || []);
     renderWarnings(data.warnings || []);
 
@@ -2561,11 +2753,16 @@
     var selectedTag = selectedTaskTag();
     var selectedOwner = selectedTaskOwner();
     var selectedDue = selectedTaskDueFilter();
+    var selectedList = selectedTaskList();
     var ownerFilteredTasks = pendingTasks.filter(function (task) {
-      return taskMatchesOwner(task, selectedOwner) && taskMatchesDueFilter(task, selectedDue);
+      return (
+        taskMatchesOwner(task, selectedOwner) &&
+        taskMatchesDueFilter(task, selectedDue) &&
+        taskMatchesList(task, selectedList)
+      );
     });
     var availableTags = tasks.tags || [];
-    if (selectedOwner !== "all" || selectedDue) {
+    if (selectedOwner !== "all" || selectedDue || selectedList !== "all") {
       availableTags = Array.from(
         new Set(
           ownerFilteredTasks.reduce(function (tags, task) {
@@ -2574,11 +2771,18 @@
         ),
       ).sort();
     }
-    var filteredTasks = filterTasks(pendingTasks, selectedTag, selectedOwner, selectedDue);
+    var filteredTasks = filterTasks(
+      pendingTasks,
+      selectedTag,
+      selectedOwner,
+      selectedDue,
+      selectedList,
+    );
+    renderTaskListFilter(tasks.lists || [], selectedList);
     renderTaskOwnerFilter(tasks.owners || [], selectedOwner);
     renderTaskTagFilters(availableTags, selectedTag, filteredTasks.length);
-    renderPendingTasks(filteredTasks, pendingTasks.length, selectedDue);
-    renderTaskGroups(tasks.groups || [], selectedTag);
+    renderPendingTasks(filteredTasks, pendingTasks.length, selectedDue, tasks);
+    renderTaskGroups(tasks.groups || [], selectedTag, selectedOwner, selectedDue, selectedList);
   }
 
   function loadDashboard() {
@@ -2698,6 +2902,17 @@
   if (taskOwnerFilter) {
     taskOwnerFilter.addEventListener("change", function () {
       setSelectedTaskOwner(taskOwnerFilter.value);
+      setSelectedTaskDueFilter("");
+      renderTasks(lastTasksData);
+      updateActiveNav();
+      scrollToHashSection();
+    });
+  }
+  var taskListFilter = byId("task-list-filter");
+  if (taskListFilter) {
+    taskListFilter.addEventListener("change", function () {
+      setSelectedTaskList(taskListFilter.value);
+      setSelectedTaskOwner("all");
       setSelectedTaskDueFilter("");
       renderTasks(lastTasksData);
       updateActiveNav();
