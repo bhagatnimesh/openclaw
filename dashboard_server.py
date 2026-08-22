@@ -12,9 +12,9 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from dashboard_data import (
-    acknowledge_dashboard_bedtime_step,
     clear_dashboard_shopping_list,
     complete_dashboard_decision,
+    complete_dashboard_homework,
     complete_dashboard_shopping_item,
     complete_dashboard_task,
     create_dashboard_backlog_item,
@@ -267,6 +267,22 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             status = 200 if response.get("status") == "ok" else 400
             _json_response(self, response, status=status)
             return
+        if route == "/api/homework/complete":
+            if not _authorized_action_request(self):
+                _json_response(
+                    self,
+                    {
+                        "status": "error",
+                        "message": "Dashboard action is not authorized.",
+                    },
+                    status=403,
+                )
+                return
+            payload = _read_json_body(self)
+            response = complete_dashboard_homework(homework_item_id=payload.get("homework_item_id"))
+            status = 200 if response.get("status") == "ok" else 400
+            _json_response(self, response, status=status)
+            return
         if route == "/api/decisions/complete":
             if not _authorized_action_request(self):
                 _json_response(
@@ -302,22 +318,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 item_id=payload.get("item_id"),
                 list_slug=payload.get("list_slug"),
             )
-            status = 200 if response.get("status") == "ok" else 400
-            _json_response(self, response, status=status)
-            return
-        if route == "/api/bedtime/ack":
-            if not _authorized_action_request(self):
-                _json_response(
-                    self,
-                    {
-                        "status": "error",
-                        "message": "Dashboard action is not authorized.",
-                    },
-                    status=403,
-                )
-                return
-            payload = _read_json_body(self)
-            response = acknowledge_dashboard_bedtime_step(payload.get("step_id"))
             status = 200 if response.get("status") == "ok" else 400
             _json_response(self, response, status=status)
             return
@@ -496,6 +496,33 @@ def create_app() -> Any:
             status_code=200 if response.get("status") == "ok" else 400,
         )
 
+    @app.post("/api/homework/complete", response_class=JSONResponse)
+    async def api_homework_complete(request: Any) -> Any:
+        headers = request.headers
+        if (
+            headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"
+            or headers.get("x-n4os-dashboard-action-token") != ACTION_TOKEN
+            or not _same_origin_allowed(request)
+        ):
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "message": "Dashboard action is not authorized.",
+                },
+                status_code=403,
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        response = complete_dashboard_homework(homework_item_id=payload.get("homework_item_id"))
+        return JSONResponse(
+            response,
+            status_code=200 if response.get("status") == "ok" else 400,
+        )
+
     @app.post("/api/decisions/complete", response_class=JSONResponse)
     async def api_decisions_complete(request: Any) -> Any:
         headers = request.headers
@@ -541,33 +568,6 @@ def create_app() -> Any:
     @app.get("/api/shopping", response_class=JSONResponse)
     def api_shopping() -> Any:
         return get_dashboard_data()["shopping"]
-
-    @app.post("/api/bedtime/ack", response_class=JSONResponse)
-    async def api_bedtime_ack(request: Any) -> Any:
-        headers = request.headers
-        if (
-            headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"
-            or headers.get("x-n4os-dashboard-action-token") != ACTION_TOKEN
-            or not _same_origin_allowed(request)
-        ):
-            return JSONResponse(
-                {
-                    "status": "error",
-                    "message": "Dashboard action is not authorized.",
-                },
-                status_code=403,
-            )
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        response = acknowledge_dashboard_bedtime_step(payload.get("step_id"))
-        return JSONResponse(
-            response,
-            status_code=200 if response.get("status") == "ok" else 400,
-        )
 
     @app.post("/api/shopping/items/check", response_class=JSONResponse)
     async def api_shopping_items_check(request: Any) -> Any:

@@ -699,6 +699,26 @@
     "origin": "synthetic_task_negative_control"
   },
   {
+    "case_id": "task-complete-mark-done-prefix",
+    "utterance": "Task mark done pay PAMF",
+    "expected_route": "tasks",
+    "expected_action": "complete_task",
+    "expected_slots": {
+      "query": "pay PAMF"
+    },
+    "origin": "telegram_regression"
+  },
+  {
+    "case_id": "task-create-plan-as-task",
+    "utterance": "create a plan as a task",
+    "expected_route": "tasks",
+    "expected_action": "create_task",
+    "expected_slots": {
+      "title": "Create a plan"
+    },
+    "origin": "telegram_regression"
+  },
+  {
     "case_id": "task-negative-unknown",
     "utterance": "what is the weather tomorrow",
     "expected_route": "unknown",

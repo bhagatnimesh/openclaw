@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 import json
@@ -16,6 +17,20 @@ DEFAULT_REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_N4OS_ROOT = DEFAULT_REPO_ROOT / "n4os"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 DEFAULT_MODEL = "gpt-5.4-mini"
+N4OS_TRANSPARENT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "name": "n4os_transparent_response",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "reasoning_summary": {"type": "string"},
+            "answer": {"type": "string"},
+        },
+        "required": ["reasoning_summary", "answer"],
+        "additionalProperties": False,
+    },
+}
 ADVICE_TRIGGER_RE = re.compile(
     r"^\s*/(?:ask|n4os|coach|advice)(?:@\w+)?(?:\s+|$)|"
     r"\b(?:n4os|coach me|give me advice|what should|how should|approach)\b|"
@@ -27,6 +42,15 @@ ADVICE_TRIGGER_RE = re.compile(
 )
 
 UrlOpen = Callable[..., Any]
+
+
+@dataclass(frozen=True)
+class N4OSAdviceResult:
+    reply: str
+    reasoning_summary: str
+    context_labels: list[str]
+    knowledge_preview: str
+    model: str | None
 
 
 def is_n4os_advice_message(text: str) -> bool:
@@ -41,26 +65,94 @@ def format_n4os_advice(
     model: str | None = None,
     urlopen: UrlOpen = urllib.request.urlopen,
 ) -> str:
+    return generate_n4os_advice(
+        request,
+        n4os_root=n4os_root,
+        api_key=api_key,
+        model=model,
+        urlopen=urlopen,
+    ).reply
+
+
+def generate_n4os_advice(
+    request: str,
+    *,
+    context: dict[str, Any] | None = None,
+    n4os_root: Path = DEFAULT_N4OS_ROOT,
+    api_key: str | None = None,
+    model: str | None = None,
+    urlopen: UrlOpen = urllib.request.urlopen,
+) -> N4OSAdviceResult:
     cleaned_request = _strip_advice_prefix(request)
-    context = _build_context(cleaned_request, n4os_root)
+    prepared_context = context if context is not None else _build_context(cleaned_request, n4os_root)
+    labels = context_labels_from_context(prepared_context)
+    knowledge_preview = format_n4os_knowledge_preview(prepared_context)
     if _is_morning_checkin_request(cleaned_request.lower()):
-        return _fallback_morning_checkin(cleaned_request)
+        return _advice_result(
+            _fallback_morning_checkin(cleaned_request),
+            "Matched the morning check-in request and used the deterministic N4OS check-in template.",
+            labels,
+            knowledge_preview,
+        )
     if _is_evening_reflection_request(cleaned_request.lower()):
-        return _fallback_evening_reflection()
+        return _advice_result(
+            _fallback_evening_reflection(),
+            "Matched the evening reflection request and used the deterministic N4OS reflection template.",
+            labels,
+            knowledge_preview,
+        )
     if _is_week_ahead_request(cleaned_request.lower()):
-        return _fallback_week_ahead(context)
+        return _advice_result(
+            _fallback_week_ahead(prepared_context),
+            "Matched a week-ahead request and combined the prepared N4OS memory with current operations.",
+            labels,
+            knowledge_preview,
+        )
     if _is_school_transition_request(cleaned_request.lower()):
-        return _fallback_advice(cleaned_request, context)
-    ai_text = _try_openai_advice(
+        return _advice_result(
+            _fallback_advice(cleaned_request, prepared_context),
+            "Matched the school-transition playbook and used its deterministic practice-and-safety guidance.",
+            labels,
+            knowledge_preview,
+        )
+    ai_text, reasoning_summary, resolved_model = _try_openai_advice(
         cleaned_request,
-        context,
+        prepared_context,
         api_key=api_key,
         model=model,
         urlopen=urlopen,
     )
     if ai_text:
-        return ai_text
-    return _fallback_advice(cleaned_request, context)
+        return _advice_result(
+            ai_text,
+            reasoning_summary or "The model did not return a reasoning summary.",
+            labels,
+            knowledge_preview,
+            model=resolved_model,
+        )
+    return _advice_result(
+        _fallback_advice(cleaned_request, prepared_context),
+        "No model response was available, so N4OS used its deterministic fallback over the prepared context.",
+        labels,
+        knowledge_preview,
+    )
+
+
+def _advice_result(
+    reply: str,
+    reasoning_summary: str,
+    context_labels: list[str],
+    knowledge_preview: str,
+    *,
+    model: str | None = None,
+) -> N4OSAdviceResult:
+    return N4OSAdviceResult(
+        reply=reply,
+        reasoning_summary=reasoning_summary,
+        context_labels=context_labels,
+        knowledge_preview=knowledge_preview,
+        model=model,
+    )
 
 
 def _strip_advice_prefix(request: str) -> str:
@@ -93,6 +185,7 @@ def _build_context(request: str, n4os_root: Path) -> dict[str, Any]:
         files.append("School Transition.md")
     if "reading" in lowered or "book" in lowered:
         files.append("Reading.md")
+    files.extend(_school_context_files(n4os_root, lowered))
     if "navya" in lowered:
         files.extend(["family/FamilyValues.md", "family/Navya.md", "playbooks/Parenting.md"])
     if "health" in lowered or "sleep" in lowered or "fitness" in lowered:
@@ -125,6 +218,7 @@ def _build_context(request: str, n4os_root: Path) -> dict[str, Any]:
         "files": _read_files(n4os_root, files),
         "observations": observations,
         "journal": journal,
+        "reading_garden": _reading_garden_context(lowered),
         "trajectories": read_recent_trajectory_summaries(
             n4os_root / "trajectories",
             lowered_request=lowered,
@@ -136,7 +230,166 @@ def _build_context(request: str, n4os_root: Path) -> dict[str, Any]:
 
 def context_labels_from_context(context: dict[str, Any]) -> list[str]:
     loaded = [str(item.get("path", "")) for item in context.get("files", [])]
-    return _compact_loaded_files(loaded)
+    labels: list[str] = []
+    for path in loaded:
+        label = _context_file_label(path)
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _context_file_label(path: str) -> str | None:
+    labels = {
+        "n4os/SOUL.md": "SOUL",
+        "n4os/AGENTS.md": "N4OS Instructions",
+        "n4os/MISSION.md": "MISSION",
+        "n4os/VISION.md": "VISION",
+        "n4os/IDENTITY.md": "Identity",
+        "n4os/PRIORITIES.md": "Priorities",
+        "n4os/PRINCIPLES.md": "Principles",
+        "n4os/PERSONAL_MODEL.md": "Personal Model",
+        "n4os/OPERATING_RULES.md": "Operating Rules",
+        "n4os/family/FamilyValues.md": "Family Values",
+        "n4os/family/Nysha.md": "Nysha",
+        "n4os/family/Navya.md": "Navya",
+    }
+    if path in labels:
+        return labels[path]
+    school_label = _compact_school_file_label(path)
+    if school_label:
+        return school_label
+    if not path.startswith("n4os/") or not path.endswith(".md"):
+        return None
+    return Path(path).stem.replace("_", " ")
+
+
+def format_n4os_knowledge_preview(
+    context: dict[str, Any],
+    *,
+    history_turns: int = 0,
+) -> str:
+    labels = context_labels_from_context(context)
+    observations = context.get("observations") or []
+    journal = context.get("journal") or []
+    trajectories = context.get("trajectories") or []
+    reading_garden = context.get("reading_garden") or {}
+
+    lines = ["Knowledge selected", f"Sources: {', '.join(labels) if labels else 'None'}"]
+    lines.append(
+        "Recent context: "
+        f"{_counted(len(observations), 'observation')}, "
+        f"{_counted(len(journal), 'journal note')}, "
+        f"{_counted(len(trajectories), 'prior answer')}"
+    )
+    if isinstance(reading_garden, dict) and reading_garden.get("available"):
+        lines.append("Live context: Reading Garden")
+    if context.get("operations"):
+        lines.append("Live context: current operations")
+    if history_turns:
+        lines.append(f"Chat history: {_counted(history_turns, 'turn')}")
+    return "\n".join(lines)
+
+
+def _counted(count: int, label: str) -> str:
+    suffix = "" if count == 1 else "s"
+    return f"{count} {label}{suffix}"
+
+
+def format_n4os_reasoning_preview(summary: str, *, model: str | None) -> str:
+    cleaned = _collapse_excess_blank_lines(_strip_basic_markdown(summary)).strip()
+    summary_lines = [line.strip().lstrip("-*• ").strip() for line in cleaned.splitlines()]
+    summary_lines = [line for line in summary_lines if line][:4]
+    if not summary_lines:
+        summary_lines = ["No reasoning summary was available."]
+    heading = "Model reasoning summary (high level)" if model else "N4OS decision path"
+    lines = [heading, *(f"- {line}" for line in summary_lines)]
+    lines.extend(["", 'Tune this: reply with "capture: ..."'])
+    return "\n".join(lines)
+
+
+def _school_context_files(n4os_root: Path, lowered_request: str) -> list[str]:
+    school_terms = (
+        "school",
+        "class",
+        "teacher",
+        "homework",
+        "learning",
+        "curriculum",
+        "spring break",
+        "break",
+        "holiday",
+        "calendar",
+        "ask",
+        "talk",
+        "conversation",
+        "prompt",
+        "practice",
+        "resource",
+        "lexia",
+    )
+    if "nysha" not in lowered_request or not any(term in lowered_request for term in school_terms):
+        return []
+
+    school_root = n4os_root / "school" / "Nysha"
+    if not school_root.exists():
+        return []
+    years = sorted(path for path in school_root.iterdir() if path.is_dir())
+    if not years:
+        return []
+
+    current_year = years[-1]
+    selected = [
+        "School Knowledge.md",
+        "Room 13.md",
+    ]
+    if any(term in lowered_request for term in ("homework", "packet", "folder", "friday")):
+        selected.append("Homework System.md")
+    if any(term in lowered_request for term in ("reading", "book", "learning", "learn", "curriculum")):
+        selected.extend(["Curriculum Map.md", "Parent Support Playbook.md", "Resources.md"])
+    if any(term in lowered_request for term in ("ask", "talk", "conversation", "prompt")):
+        selected.append("Conversation Starters.md")
+    if any(term in lowered_request for term in ("practice", "resource", "lexia")):
+        selected.append("Resources.md")
+
+    rel_base = Path("school") / "Nysha" / current_year.name
+    return [(rel_base / name).as_posix() for name in selected]
+
+
+def _reading_garden_context(lowered_request: str) -> dict[str, Any]:
+    if "nysha" not in lowered_request or not any(term in lowered_request for term in ("reading", "book", "books")):
+        return {}
+    try:
+        from claws.n4os.intent_router import LIBRARY_ROOT, load_scoped_module, module_scope
+    except Exception as error:
+        return {"available": False, "error": str(error)}
+
+    try:
+        with module_scope(LIBRARY_ROOT):
+            library_module = load_scoped_module("_n4os_library_claw_for_advice", LIBRARY_ROOT, "claw.py")
+            response = library_module.LibraryClaw.default().tools.status(child="Nysha")
+    except Exception as error:
+        return {"available": False, "error": str(error)}
+
+    if response.get("status") != "ok":
+        return {"available": False, "error": response.get("message", "Reading Garden unavailable.")}
+
+    data = response.get("data") if isinstance(response.get("data"), dict) else {}
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    by_child = summary.get("by_child") if isinstance(summary.get("by_child"), dict) else {}
+    nysha = by_child.get("Nysha") if isinstance(by_child.get("Nysha"), dict) else {}
+    if not nysha:
+        return {}
+
+    collection = nysha.get("book_collection") if isinstance(nysha.get("book_collection"), list) else []
+    recent_events = nysha.get("recent_events") if isinstance(nysha.get("recent_events"), list) else []
+    return {
+        "available": True,
+        "current_book": nysha.get("current_book") or "",
+        "book_collection": collection[:10],
+        "recent_events": recent_events[:5],
+        "current_bag": nysha.get("current_bag") or {},
+        "weekly_goal": nysha.get("weekly_goal") or {},
+    }
 
 
 def _read_files(n4os_root: Path, paths: list[str]) -> list[dict[str, str]]:
@@ -231,15 +484,18 @@ def _try_openai_advice(
     api_key: str | None,
     model: str | None,
     urlopen: UrlOpen,
-) -> str | None:
+) -> tuple[str | None, str | None, str | None]:
     resolved_key = (api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", "")).strip()
     if not resolved_key:
-        return None
+        return None, None, None
 
+    resolved_model = (model or os.environ.get("N4OS_ADVICE_MODEL") or DEFAULT_MODEL).strip()
     body = {
-        "model": (model or os.environ.get("N4OS_ADVICE_MODEL") or DEFAULT_MODEL).strip(),
+        "model": resolved_model,
         "store": False,
-        "max_output_tokens": 420,
+        "max_output_tokens": 600,
+        "reasoning": {"summary": "concise"},
+        "text": {"format": N4OS_TRANSPARENT_RESPONSE_FORMAT},
         "input": [
             {
                 "role": "system",
@@ -251,7 +507,10 @@ def _try_openai_advice(
                     "Use at most 3 action bullets and 2 watch bullets. "
                     "Do not overstate raw observations as fixed identity; say 'currently tends to' for child patterns. "
                     "When family memory is used, include a capture loop for family/observations/YYYY-MM.md. "
-                    "End with short Decision, Next action, and Review lines."
+                    "End with short Decision, Next action, and Review lines. "
+                    "Return a concise reasoning_summary as 2-4 short newline-separated statements that name "
+                    "the relevant signals, assumptions, and why they support the answer. This is a high-level "
+                    "decision rationale, not hidden chain-of-thought."
                 ),
             },
             {
@@ -281,11 +540,12 @@ def _try_openai_advice(
         with urlopen(request_obj, timeout=20) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
-        return None
-    text = _extract_response_text(payload)
+        return None, None, None
+    text, disclosed_summary = _extract_transparent_response(payload)
     if not text:
-        return None
-    return _normalize_advice_output(text, context)
+        return None, None, None
+    reasoning_summary = _extract_reasoning_summary(payload) or disclosed_summary
+    return _normalize_advice_output(text, context), reasoning_summary, resolved_model
 
 
 def _extract_response_text(payload: dict[str, Any]) -> str | None:
@@ -301,6 +561,37 @@ def _extract_response_text(payload: dict[str, Any]) -> str | None:
                 chunks.append(content["text"].strip())
     text = "\n".join(chunk for chunk in chunks if chunk).strip()
     return text or None
+
+
+def _extract_reasoning_summary(payload: dict[str, Any]) -> str | None:
+    chunks: list[str] = []
+    for item in payload.get("output", []):
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        for summary in item.get("summary", []):
+            if isinstance(summary, dict) and isinstance(summary.get("text"), str):
+                chunks.append(summary["text"].strip())
+    text = "\n".join(chunk for chunk in chunks if chunk).strip()
+    return text or None
+
+
+def _extract_transparent_response(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    raw = _extract_response_text(payload)
+    if not raw:
+        return None, None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(parsed, dict):
+        return None, None
+    answer = parsed.get("answer")
+    reasoning_summary = parsed.get("reasoning_summary")
+    if not isinstance(answer, str) or not answer.strip():
+        return None, None
+    if not isinstance(reasoning_summary, str) or not reasoning_summary.strip():
+        return None, None
+    return answer.strip(), reasoning_summary.strip()
 
 
 def _normalize_advice_output(text: str, context: dict[str, Any]) -> str:
@@ -360,6 +651,10 @@ def _fallback_advice(request: str, context: dict[str, Any]) -> str:
     lines = []
     is_nysha_reading = "nysha" in lowered_request and "reading" in lowered_request
     is_nysha_school_transition = _is_school_transition_request(lowered_request)
+    if is_nysha_reading and _is_current_books_lookup(lowered_request):
+        reading_answer = _fallback_reading_garden_answer(context)
+        if reading_answer:
+            return reading_answer
     if not is_nysha_school_transition:
         lines.extend(["N4OS advice", ""])
     if is_nysha_school_transition:
@@ -455,10 +750,66 @@ def _compact_loaded_files(paths: list[str]) -> list[str]:
     }
     compact: list[str] = []
     for path in paths:
-        name = priority.get(path)
+        name = priority.get(path) or _compact_school_file_label(path)
         if name is not None:
             compact.append(name)
     return compact
+
+
+def _compact_school_file_label(path: str) -> str | None:
+    if not path.startswith("n4os/school/Nysha/"):
+        return None
+    filename = Path(path).name
+    labels = {
+        "School Knowledge.md": "Nysha School Knowledge",
+        "Room 13.md": "Room 13",
+        "Curriculum Map.md": "Curriculum Map",
+        "Homework System.md": "Homework System",
+        "Parent Support Playbook.md": "Parent Support Playbook",
+        "Resources.md": "School Resources",
+        "Conversation Starters.md": "School Conversation Starters",
+    }
+    return labels.get(filename)
+
+
+def _is_current_books_lookup(lowered: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:what|which)\s+books?\b|\bbooks?\s+(?:is|are|was|were)\b|\bcurrent(?:ly)?\s+reading\b",
+            lowered,
+        )
+    )
+
+
+def _fallback_reading_garden_answer(context: dict[str, Any]) -> str | None:
+    reading_garden = context.get("reading_garden")
+    if not isinstance(reading_garden, dict) or not reading_garden.get("available"):
+        return None
+
+    collection = reading_garden.get("book_collection")
+    books = collection if isinstance(collection, list) else []
+    if not books:
+        return None
+
+    lines = ["Nysha's recent Reading Garden titles:"]
+    for item in books[:6]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        status = str(item.get("status") or "Reading").strip()
+        last_read = str(item.get("last_read") or "").strip()
+        suffix = f" ({status}" + (f", last read {last_read}" if last_read else "") + ")"
+        lines.append(f"- {title}{suffix}")
+    if len(lines) == 1:
+        return None
+
+    current = str(reading_garden.get("current_book") or "").strip()
+    if current and current.lower() != "unknown book":
+        lines.extend(["", f"Current latest title: {current}."])
+    lines.extend(["", "Used: Reading Garden, Nysha"])
+    return "\n".join(lines)
 
 
 def _is_week_ahead_request(lowered: str) -> bool:

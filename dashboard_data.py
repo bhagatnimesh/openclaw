@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from contextlib import closing
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 import re
-import sqlite3
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -28,24 +26,6 @@ SHOPPING_LIST_LABELS = {
 }
 HOMEWORK_CHILDREN = ("Nysha", "Navya")
 ROOT = Path(__file__).resolve().parent
-BEDTIME_ROUTINE_DB_FILE = ROOT / "data" / "n4os.db"
-BEDTIME_ROUTINE_DAYS = {6, 0, 1, 2, 3}
-BEDTIME_ROUTINE_STEPS = [
-    {
-        "id": "dinner-close",
-        "label": "Dinner close",
-        "time": "19:05",
-        "voice": "Dinner close. Five minutes to upstairs launch.",
-        "detail": "Last bites, cleanup, and transition.",
-    },
-    {
-        "id": "upstairs-launch",
-        "label": "Upstairs launch",
-        "time": "19:15",
-        "voice": "Upstairs launch. Nysha can pick reading or game score. Navya gets chitchat.",
-        "detail": "Nysha: reading or game score. Navya: chitchat.",
-    },
-]
 
 
 def _local_now(now: datetime | None = None) -> datetime:
@@ -358,7 +338,18 @@ def _list_dashboard_tasks(sources: DashboardSources) -> dict[str, Any]:
 
     task_lists_response = list_task_lists()
     if task_lists_response.get("status") != "ok":
-        return task_lists_response
+        return {
+            "status": "ok",
+            "message": "Tasks unavailable.",
+            "data": {
+                "task_lists": [],
+                "tasks": [],
+                "unavailable": True,
+                "warnings": [
+                    task_lists_response.get("message", "Task source unavailable."),
+                ],
+            },
+        }
 
     all_tasks: list[dict[str, Any]] = []
     task_lists = [
@@ -609,123 +600,6 @@ def _home_board_for_portal(
     today_items, today_warnings = _home_board_items(sources, today, now)
     tomorrow_items, tomorrow_warnings = _home_board_items(sources, tomorrow, now)
     return {"today": today_items, "tomorrow": tomorrow_items}, [*today_warnings, *tomorrow_warnings]
-
-
-def _bedtime_routine_enabled(today: date) -> bool:
-    return today.weekday() in BEDTIME_ROUTINE_DAYS
-
-
-def _ensure_bedtime_routine_schema(db_path: Path = BEDTIME_ROUTINE_DB_FILE) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(db_path)) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bedtime_routine_acks (
-                date TEXT NOT NULL,
-                step_id TEXT NOT NULL,
-                acked_at TEXT NOT NULL,
-                PRIMARY KEY (date, step_id)
-            )
-            """,
-        )
-        connection.commit()
-
-
-def _read_bedtime_routine_acks(
-    today: date,
-    *,
-    db_path: Path = BEDTIME_ROUTINE_DB_FILE,
-) -> dict[str, str]:
-    _ensure_bedtime_routine_schema(db_path)
-    with closing(sqlite3.connect(db_path)) as connection:
-        rows = connection.execute(
-            """
-            SELECT step_id, acked_at
-            FROM bedtime_routine_acks
-            WHERE date = :date
-            """,
-            {"date": today.isoformat()},
-        ).fetchall()
-    return {str(step_id): str(acked_at) for step_id, acked_at in rows}
-
-
-def _bedtime_routine_summary(
-    now: datetime,
-    *,
-    db_path: Path = BEDTIME_ROUTINE_DB_FILE,
-) -> dict[str, Any]:
-    today = now.date()
-    enabled = _bedtime_routine_enabled(today)
-    acks = _read_bedtime_routine_acks(today, db_path=db_path) if enabled else {}
-    steps = []
-    for step in BEDTIME_ROUTINE_STEPS:
-        acked_at = acks.get(step["id"], "")
-        steps.append(
-            {
-                **step,
-                "date": today.isoformat(),
-                "acknowledged": bool(acked_at),
-                "acked_at": acked_at,
-            },
-        )
-    return {
-        "enabled": enabled,
-        "date": today.isoformat(),
-        "days": ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"],
-        "voice_enabled": False,
-        "title": "Bedtime Launch",
-        "target": "7:15 PM upstairs",
-        "status": "School-night routine" if enabled else "Off tonight",
-        "steps": steps,
-    }
-
-
-def acknowledge_dashboard_bedtime_step(
-    step_id: str | None,
-    *,
-    now: datetime | None = None,
-    db_path: Path = BEDTIME_ROUTINE_DB_FILE,
-) -> dict[str, Any]:
-    cleaned_step_id = _clean_text(step_id)
-    valid_step_ids = {step["id"] for step in BEDTIME_ROUTINE_STEPS}
-    if cleaned_step_id not in valid_step_ids:
-        return {
-            "status": "error",
-            "message": "Missing or invalid bedtime routine step.",
-            "data": {"missing_fields": ["step_id"]},
-        }
-
-    local_now = _local_now(now)
-    if not _bedtime_routine_enabled(local_now.date()):
-        return {
-            "status": "error",
-            "message": "Bedtime routine is only active Sunday through Thursday.",
-            "data": {"step_id": cleaned_step_id},
-        }
-
-    _ensure_bedtime_routine_schema(db_path)
-    with closing(sqlite3.connect(db_path)) as connection:
-        connection.execute(
-            """
-            INSERT INTO bedtime_routine_acks(date, step_id, acked_at)
-            VALUES (:date, :step_id, :acked_at)
-            ON CONFLICT(date, step_id) DO UPDATE SET acked_at = excluded.acked_at
-            """,
-            {
-                "date": local_now.date().isoformat(),
-                "step_id": cleaned_step_id,
-                "acked_at": local_now.isoformat(),
-            },
-        )
-        connection.commit()
-
-    return {
-        "status": "ok",
-        "message": "Bedtime routine step acknowledged.",
-        "data": {
-            "bedtime": _bedtime_routine_summary(local_now, db_path=db_path),
-        },
-    }
 
 
 def _decision_due_label(decision: dict[str, Any], today: date) -> str:
@@ -1253,7 +1127,6 @@ def _empty_dashboard(now: datetime, message: str = "") -> dict[str, Any]:
             "lanes": {"discussion": [], "planning": [], "decision": []},
         },
         "home_board": {"today": [], "tomorrow": []},
-        "bedtime": _bedtime_routine_summary(now),
         "decisions": {"open": [], "attention": []},
         "shopping": {"lists": [], "pending": [], "by_list": []},
         "homework": _empty_homework(),
@@ -1598,11 +1471,15 @@ def build_dashboard_data(
         source_warnings.append(task_source_message)
         raw_tasks: list[dict[str, Any]] = []
     else:
-        tasks_unavailable = False
+        tasks_unavailable = bool(task_response.get("data", {}).get("unavailable"))
         task_source_message = "Live task data"
         raw_tasks = list(task_response.get("data", {}).get("tasks") or [])
         source_warnings.extend(str(warning) for warning in task_response.get("data", {}).get("warnings") or [])
-    task_lists = _task_list_entries(task_response)
+    task_lists = (
+        []
+        if task_response.get("data", {}).get("unavailable")
+        else _task_list_entries(task_response)
+    )
 
     events = [
         _normalize_event(event, sources.read_event_metadata, timezone)
@@ -1789,7 +1666,6 @@ def build_dashboard_data(
         "planning": {"items": planning_items},
         "backlog": backlog,
         "home_board": home_board,
-        "bedtime": _bedtime_routine_summary(local_now),
         "decisions": {
             "open": open_decisions[:12],
             "attention": attention_decisions,
@@ -1840,7 +1716,6 @@ def get_dashboard_data(now: datetime | None = None) -> dict[str, Any]:
 
         data["home_board"] = home_board
         data["summary"]["home_board_count"] = len(home_board["today"])
-        data["bedtime"] = _bedtime_routine_summary(local_now)
         data["shopping"] = shopping
         data["summary"]["shopping_count"] = len(shopping["pending"])
         data["homework"] = homework
@@ -2066,6 +1941,48 @@ def complete_dashboard_task(
         "data": {
             **response.get("data", {}),
             "task": _public_task(normalized_task),
+        },
+    }
+
+
+def complete_dashboard_homework(
+    homework_item_id: str | None,
+    sources: DashboardSources | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    cleaned_homework_item_id = _clean_text(homework_item_id)
+    if not cleaned_homework_item_id:
+        return {
+            "status": "error",
+            "message": "Missing required homework information: homework_item_id.",
+            "data": {"missing_fields": ["homework_item_id"]},
+        }
+
+    active_sources = sources or default_sources()
+    tools = getattr(active_sources, "homework_tools", None)
+    if tools is None:
+        return {
+            "status": "error",
+            "message": "Homework source unavailable.",
+            "data": {"homework_item_id": cleaned_homework_item_id},
+        }
+
+    try:
+        response = tools.complete_homework(cleaned_homework_item_id, now=now)
+    except Exception as error:
+        return _source_error_response("Homework", error)
+
+    if response.get("status") != "ok":
+        return response
+
+    raw_item = response.get("data", {}).get("item")
+    if not isinstance(raw_item, dict):
+        return response
+    return {
+        **response,
+        "data": {
+            **response.get("data", {}),
+            "item": _normalize_homework_item(raw_item, _local_now(now).date()),
         },
     }
 

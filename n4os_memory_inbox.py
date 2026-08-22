@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+import os
 import re
+import threading
 
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_OBSERVATIONS_ROOT = DEFAULT_REPO_ROOT / "n4os" / "family" / "observations"
+_FILE_WRITE_LOCKS: dict[str, threading.Lock] = {}
 KNOWN_PEOPLE = {
     "nysha": "Nysha",
     "navya": "Navya",
@@ -135,18 +139,28 @@ def ingest_memory_inbox_notes(
         default_date=default_date,
         source=source,
     )
+    snapshots = _snapshot_files(
+        [_month_path(observations_root, observation.observed_on) for observation in observations]
+    )
     existing_keys = _load_existing_keys(observations_root)
     added: list[MemoryObservation] = []
     skipped: list[MemoryObservation] = []
 
-    for observation in observations:
-        key = _observation_key(observation)
-        if key in existing_keys:
-            skipped.append(observation)
-            continue
-        _append_observation(observations_root, observation)
-        existing_keys.add(key)
-        added.append(observation)
+    try:
+        for observation in observations:
+            key = _observation_key(observation)
+            if key in existing_keys:
+                skipped.append(observation)
+                continue
+            _append_observation(observations_root, observation)
+            existing_keys.add(key)
+            added.append(observation)
+    except Exception:
+        with suppress(Exception):
+            undo_memory_observations(added, observations_root=observations_root)
+        with suppress(Exception):
+            _restore_file_snapshots(snapshots)
+        raise
 
     return MemoryIngestResult(added=added, skipped_duplicates=skipped)
 
@@ -230,13 +244,12 @@ def _append_observation(observations_root: Path, observation: MemoryObservation)
     observations_root.mkdir(parents=True, exist_ok=True)
     path = _month_path(observations_root, observation.observed_on)
     links = _observation_note_links(observation)
-    if not path.exists():
-        path.write_text(_month_header(observation, links), encoding="utf-8")
-    else:
-        _merge_frontmatter_links(path, links)
-
-    with path.open("a", encoding="utf-8") as file:
-        file.write(_observation_block(observation) + "\n")
+    with _file_write_lock(path):
+        if path.exists():
+            text = _merge_frontmatter_links_text(path.read_text(encoding="utf-8"), links)
+        else:
+            text = _month_header(observation, links)
+        _write_text_atomic(path, text + _observation_block(observation) + "\n")
 
 
 def _observation_block(observation: MemoryObservation) -> str:
@@ -315,17 +328,26 @@ def _dedupe_preserving_order(values: list[str]) -> list[str]:
 def _merge_frontmatter_links(path: Path, links: list[str]) -> None:
     if not links:
         return
-    text = path.read_text(encoding="utf-8")
+    with _file_write_lock(path):
+        text = path.read_text(encoding="utf-8")
+        updated = _merge_frontmatter_links_text(text, links)
+        if updated != text:
+            _write_text_atomic(path, updated)
+
+
+def _merge_frontmatter_links_text(text: str, links: list[str]) -> str:
+    if not links:
+        return text
     if not text.startswith("---\n"):
-        return
+        return text
     end = text.find("\n---\n", 4)
     if end == -1:
-        return
+        return text
     frontmatter = text[4:end].splitlines()
     existing_links = set(_frontmatter_list_values(frontmatter, "links"))
     new_links = [link for link in links if link not in existing_links]
     if not new_links:
-        return
+        return text
 
     insert_at = _frontmatter_list_end(frontmatter, "links")
     if insert_at is None:
@@ -335,8 +357,44 @@ def _merge_frontmatter_links(path: Path, links: list[str]) -> None:
         frontmatter.insert(insert_at, f"  - \"{link}\"")
 
     body = text[end + len("\n---\n") :]
-    updated = "---\n" + "\n".join(frontmatter) + "\n---\n" + body
-    path.write_text(updated, encoding="utf-8")
+    return "---\n" + "\n".join(frontmatter) + "\n---\n" + body
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{id(text)}.tmp")
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        with suppress(FileNotFoundError):
+            tmp_path.unlink()
+
+
+def _snapshot_files(paths: list[Path]) -> dict[Path, str | None]:
+    snapshots: dict[Path, str | None] = {}
+    for path in paths:
+        if path in snapshots:
+            continue
+        snapshots[path] = path.read_text(encoding="utf-8") if path.exists() else None
+    return snapshots
+
+
+def _restore_file_snapshots(snapshots: dict[Path, str | None]) -> None:
+    for path, text in snapshots.items():
+        if text is None:
+            with suppress(FileNotFoundError):
+                path.unlink()
+            continue
+        _write_text_atomic(path, text)
+
+
+@contextmanager
+def _file_write_lock(path: Path):
+    key = str(path)
+    lock = _FILE_WRITE_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        yield
 
 
 def _frontmatter_list_values(lines: list[str], key: str) -> list[str]:

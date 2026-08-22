@@ -6,12 +6,18 @@ import re
 import sys
 from typing import Any
 
+try:
+    from ai_field_extraction import TaskAIFieldExtractor
+except ImportError:
+    TaskAIFieldExtractor = None
+
 from constants import DEFAULT_TASK_LIST_ID
 from intent import (
     OWNER_ALIAS_PATTERN,
     OWNER_ALIASES,
     extract_intent,
     extract_tags,
+    normalize_metadata,
     normalize_tags,
     read_metadata_from_notes,
 )
@@ -28,7 +34,9 @@ from tools import FamilyTaskTools, TasksProvider, build_default_tools
 
 NOAH_ASSISTANT_DEFAULT_LIMIT = 3
 NOAH_ASSISTANT_MAX_LIMIT = 20
-IMAGE_TEXT_MARKER = "Image text:"
+IMAGE_TEXT_MARKER_RE = re.compile(
+    r"(?im)^\s*(?:Image text:|\[Image text extraction[^\]]*\]:)\s*$",
+)
 BULK_IMAGE_TASK_CUE_RE = re.compile(
     r"\b(?:every|each|all)\b.*\b(?:entry|entries|items?|tasks?|todos?|to-dos?)\b.*\bimage\b|"
     r"\bimage\b.*\b(?:every|each|all)\b.*\b(?:entry|entries|items?|tasks?|todos?|to-dos?)\b",
@@ -42,6 +50,26 @@ IMAGE_LIST_TITLE_RE = re.compile(
     r"^\s*(?:list\s+title|title|heading)\s*:\s*(?P<title>.+?)\s*$",
     re.IGNORECASE,
 )
+AFFIRMATIVE_RE = re.compile(r"^(?:yes|y|confirm)(?:\s*,?\s*(?:please|add\s+(?:it|them|all)))?[.!?]*$", re.I)
+NEGATIVE_RE = re.compile(r"^(?:no|n|cancel)(?:\s+please)?[.!?]*$", re.I)
+TASK_LIST_REQUEST_PATTERNS = (
+    re.compile(
+        r"^\s*(?:show|list|view)\s+(?:the\s+)?(?P<name>[A-Za-z0-9&' -]+?)\s+"
+        r"(?:tasks?|todos?|to-dos?)(?:\s+list)?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:in|into|on|to)\s+(?:the\s+)?(?P<name>[A-Za-z0-9&' -]+?)"
+        r"(?P<suffix>\s+(?:task\s+)?list)\s*[.!?]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:use|choose|select)\s+(?:the\s+)?(?:task\s+)?list\s+"
+        r"(?:named\s+|called\s+)?"
+        r"(?P<name>[A-Za-z0-9&' -]+?)\s*[.!?]*$",
+        re.IGNORECASE,
+    ),
+)
 
 
 @dataclass
@@ -51,6 +79,38 @@ class PendingAction:
     choices: list[dict[str, Any]] | None = None
     update: TaskUpdateRequest | None = None
     task_list_id: str = DEFAULT_TASK_LIST_ID
+    create_intents: list[dict[str, Any]] | None = None
+    reference_time: datetime | None = None
+
+
+def _local_task_list_request(request: str) -> tuple[str | None, str]:
+    for pattern in TASK_LIST_REQUEST_PATTERNS:
+        match = pattern.search(request)
+        if match is None:
+            continue
+        name = re.sub(
+            r"\s+(?:task\s+)?list\s*$",
+            "",
+            match.group("name").strip(" .,:;-"),
+            flags=re.IGNORECASE,
+        ).strip()
+        if (
+            not name
+            or name.lower() in {"all", "my", "open", "pending"}
+            or name.lower() in OWNER_ALIASES
+        ):
+            continue
+        cleaned = " ".join(f"{request[: match.start()]} {request[match.end() :]}".split())
+        if pattern is TASK_LIST_REQUEST_PATTERNS[0]:
+            cleaned = f"show tasks {cleaned}".strip()
+        return name, cleaned
+    return None, request
+
+
+def _normalized_task_list_name(value: str) -> str:
+    normalized = " ".join(value.lower().split())
+    normalized = re.sub(r"^the\s+", "", normalized)
+    return re.sub(r"\s+(?:task\s+)?list$", "", normalized).strip()
 
 
 def _format_due(task: dict[str, Any]) -> str:
@@ -297,21 +357,10 @@ def _clean_image_task_line(line: str) -> str | None:
 
 
 def _split_bulk_image_task_request(request: str) -> tuple[str, str] | None:
-    if IMAGE_TEXT_MARKER.lower() not in request.lower() or BULK_IMAGE_TASK_CUE_RE.search(request) is None:
+    marker = IMAGE_TEXT_MARKER_RE.search(request)
+    if marker is None or BULK_IMAGE_TASK_CUE_RE.search(request) is None:
         return None
-    _, image_text = re.split(
-        re.escape(IMAGE_TEXT_MARKER),
-        request,
-        maxsplit=1,
-        flags=re.IGNORECASE,
-    )
-    caption = re.split(
-        re.escape(IMAGE_TEXT_MARKER),
-        request,
-        maxsplit=1,
-        flags=re.IGNORECASE,
-    )[0]
-    return caption, image_text
+    return request[: marker.start()], request[marker.end() :]
 
 
 def _image_list_title(image_text: str) -> str | None:
@@ -353,9 +402,74 @@ MULTI_CREATE_TASK_RE = re.compile(
     r"(?P<noun>task|todo|to-do|open loop)\b",
     re.IGNORECASE,
 )
+MULTI_CREATE_TASK_COMMAND_START_RE = re.compile(
+    r"(?:\A|(?<=[.!?])\s+|^[ \t]*)"
+    r"(?P<command>(?:please\s+)?(?:add|create|capture|remember)\s+(?:an?\s+)?"
+    r"(?:tasks?|todos?|to-dos?|open loops?)\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+TASK_DETAIL_SECTION_RE = re.compile(
+    r"(?m)^\s*(?:notes?|details?|description|context)\s*:",
+    re.IGNORECASE,
+)
+HEADER_ONLY_MULTI_CREATE_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:add|create|capture|remember)\s+"
+    r"(?:tasks|todos|to-dos|open loops)\s*:?\s*$",
+    re.IGNORECASE,
+)
+TRAILING_SENTENCE_TAG_RE = re.compile(
+    r"(?P<body>.+?)[.!?]\s+tag\s*:?\s*(?P<tag>#?[A-Za-z][A-Za-z0-9_-]*)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_repeated_create_task_commands(request: str) -> list[str] | None:
+    matches = list(MULTI_CREATE_TASK_COMMAND_START_RE.finditer(request))
+    if len(matches) < 2:
+        return None
+
+    starts = [match.start("command") for match in matches]
+    leading_text = request[: starts[0]].strip()
+    if leading_text:
+        return None
+    if any(
+        TASK_DETAIL_SECTION_RE.search(request[starts[index] : starts[index + 1]])
+        for index in range(len(starts) - 1)
+    ):
+        return None
+
+    parts = [
+        request[start : starts[index + 1]].strip()
+        for index, start in enumerate(starts[:-1])
+    ]
+    parts.append(request[starts[-1] :].strip())
+    return [
+        part
+        for part in parts
+        if part and HEADER_ONLY_MULTI_CREATE_RE.fullmatch(part) is None
+    ]
+
+
+def _normalize_split_sentence_tag_annotations(requests: list[str]) -> list[str]:
+    normalized_requests = []
+    for request in requests:
+        match = TRAILING_SENTENCE_TAG_RE.fullmatch(request)
+        if match is None:
+            normalized_requests.append(request)
+            continue
+        tags = normalize_tags([match.group("tag")])
+        if not tags:
+            normalized_requests.append(request)
+            continue
+        normalized_requests.append(f"{match.group('body').strip()} and tag {tags[0]}")
+    return normalized_requests
 
 
 def _split_multiple_create_task_requests(request: str) -> list[str]:
+    repeated_commands = _split_repeated_create_task_commands(request)
+    if repeated_commands is not None:
+        return _normalize_split_sentence_tag_annotations(repeated_commands)
+
     matches = list(MULTI_CREATE_TASK_RE.finditer(request))
     if not matches:
         return [request]
@@ -444,10 +558,19 @@ ASSISTANT_UPDATE_RE = re.compile(
     re.IGNORECASE,
 )
 PRONOUN_TARGETS = {"it", "this", "that", "this task", "that task", "the task"}
+TASK_LIST_CONTEXT_KEY = "_n4os_task_list_id"
+
+
+def _task_with_list_context(task: dict[str, Any], task_list_id: str) -> dict[str, Any]:
+    contextual_task = dict(task)
+    contextual_task[TASK_LIST_CONTEXT_KEY] = task_list_id
+    return contextual_task
 
 
 @dataclass(frozen=True)
 class TaskUpdateRequest:
+    title: str | None = None
+    due: str | None = None
     owner: str | None = None
     note: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -526,6 +649,32 @@ def _task_update_from_request(request: str) -> TaskUpdateRequest | None:
     )
 
 
+def _task_update_from_semantic_intent(intent: dict[str, Any]) -> TaskUpdateRequest | None:
+    values = intent.get("update")
+    if not isinstance(values, dict):
+        return None
+    title = str(values.get("title") or "").strip() or None
+    due = str(values.get("due") or "").strip() or None
+    owner = normalize_metadata({"owner": values.get("owner")}).get("owner")
+    if owner == "unknown":
+        owner = None
+    note = str(values.get("notes") or "").strip() or None
+    tags = normalize_tags(values.get("tags") if isinstance(values.get("tags"), list) else [])
+    assistant_help = str(values.get("assistant_help_request") or "").strip() or None
+    target = str(intent.get("query") or "").strip() or None
+    if not any((title, due, owner, note, tags, assistant_help)):
+        return None
+    return TaskUpdateRequest(
+        title=title,
+        due=due,
+        owner=owner,
+        note=note,
+        tags=tags,
+        assistant_help_request=assistant_help,
+        target=target,
+    )
+
+
 def _append_human_note(notes: str, note: str) -> str:
     if not notes.strip():
         return note
@@ -577,6 +726,36 @@ def _merge_task_tags(
     )
 
 
+def _merge_semantic_metadata(
+    baseline: dict[str, Any] | None,
+    extracted: dict[str, Any],
+) -> dict[str, Any]:
+    merged = normalize_metadata(baseline)
+    semantic = normalize_metadata(extracted)
+    for key in ("tags", "context", "requires", "can_do_while"):
+        if semantic.get(key):
+            merged[key] = list(dict.fromkeys([*merged.get(key, []), *semantic[key]]))
+    for key in (
+        "energy",
+        "urgency",
+        "complexity",
+        "effort_type",
+        "location",
+        "owner",
+        "assistant_name",
+        "assistant_help_request",
+        "assistant_context",
+    ):
+        value = semantic.get(key)
+        if value not in (None, "", "unknown"):
+            merged[key] = value
+    if semantic.get("duration_minutes") is not None:
+        merged["duration_minutes"] = semantic["duration_minutes"]
+    if semantic.get("assistant_help_needed"):
+        merged["assistant_help_needed"] = True
+    return merged
+
+
 @dataclass
 class FamilyTasksClaw:
     """Small OpenClaw entry point for the Family Tasks claw."""
@@ -589,6 +768,7 @@ class FamilyTasksClaw:
     last_created_task: dict[str, Any] | None = None
     last_result: dict[str, Any] | None = None
     undo_stack: list[dict[str, Any]] = field(default_factory=list)
+    field_extractor: Any | None = None
 
     @classmethod
     def from_provider(cls, provider: TasksProvider) -> "FamilyTasksClaw":
@@ -596,7 +776,8 @@ class FamilyTasksClaw:
 
     @classmethod
     def default(cls) -> "FamilyTasksClaw":
-        return cls(tools=build_default_tools())
+        extractor = TaskAIFieldExtractor.from_env_or_none() if TaskAIFieldExtractor is not None else None
+        return cls(tools=build_default_tools(), field_extractor=extractor)
 
     def tool_map(self) -> dict[str, Any]:
         return {
@@ -616,30 +797,282 @@ class FamilyTasksClaw:
         request: str,
         reference_time: datetime | None = None,
         research_client: NoahResearchClient | None = None,
+        *,
+        require_confirmation: bool = False,
+        semantic_intent: dict[str, Any] | None = None,
     ) -> str:
+        bulk_titles = _bulk_image_task_titles(request)
+        if bulk_titles:
+            if require_confirmation:
+                intents = self._bulk_image_task_intents(
+                    request,
+                    bulk_titles,
+                    reference_time,
+                    semantic_intent=semantic_intent,
+                )
+                return self._preview_task_creates(intents, reference_time=reference_time)
+            return self._add_bulk_tasks_from_image_request(
+                request,
+                bulk_titles,
+                reference_time=reference_time,
+                semantic_intent=semantic_intent,
+            )
+
         split_requests = _split_multiple_create_task_requests(request)
         if len(split_requests) > 1:
+            if require_confirmation:
+                intents = [self._extract_intent(item, reference_time) for item in split_requests]
+                if semantic_intent is not None and semantic_intent.get("intent") == "create_task":
+                    for intent in intents:
+                        for key in ("notes", "due", "task_list_name", "task_list_id_hint"):
+                            if semantic_intent.get(key) is not None:
+                                intent[key] = semantic_intent[key]
+                        if isinstance(semantic_intent.get("metadata"), dict):
+                            intent["metadata"] = _merge_semantic_metadata(
+                                intent.get("metadata"),
+                                semantic_intent["metadata"],
+                            )
+                return self._preview_task_creates(intents, reference_time=reference_time)
             return self._add_multiple_tasks_from_requests(
                 split_requests,
                 reference_time=reference_time,
                 research_client=research_client,
             )
 
-        bulk_titles = _bulk_image_task_titles(request)
-        if bulk_titles:
-            return self._add_bulk_tasks_from_image_request(
-                request,
-                bulk_titles,
-                reference_time=reference_time,
-            )
-
-        intent = extract_intent(request, now=reference_time)
+        intent = (
+            self._merge_create_intent(request, reference_time, semantic_intent)
+            if semantic_intent is not None
+            else self._extract_intent(request, reference_time)
+        )
+        if require_confirmation:
+            return self._preview_task_creates([intent], reference_time=reference_time)
         message, _ = self._add_task_from_intent(
             intent,
             reference_time=reference_time,
             research_client=research_client,
         )
         return message
+
+    def _extract_intent(
+        self,
+        request: str,
+        reference_time: datetime | None,
+    ) -> dict[str, Any]:
+        extracted = self.interpret_request(request, reference_time=reference_time)
+        return self._merge_create_intent(request, reference_time, extracted)
+
+    def _merge_create_intent(
+        self,
+        request: str,
+        reference_time: datetime | None,
+        extracted: dict[str, Any],
+    ) -> dict[str, Any]:
+        baseline = extract_intent(request, now=reference_time)
+        if extracted.get("intent") != "create_task":
+            return baseline
+        merged = dict(baseline)
+        merged["intent"] = "create_task"
+        for key in ("title", "notes", "due", "task_list_name", "task_list_id_hint"):
+            if extracted.get(key) is not None:
+                merged[key] = extracted[key]
+        if isinstance(extracted.get("metadata"), dict):
+            merged["metadata"] = _merge_semantic_metadata(
+                baseline.get("metadata"),
+                extracted["metadata"],
+            )
+        merged["missing_fields"] = list(extracted.get("missing_fields") or [])
+        merged["assumptions"] = list(extracted.get("assumptions") or [])
+        merged["clarification_question"] = extracted.get("clarification_question")
+        merged["ai_field_extraction"] = extracted.get("ai_field_extraction")
+        return merged
+
+    def interpret_request(
+        self,
+        request: str,
+        reference_time: datetime | None = None,
+        *,
+        semantic_image_path: str | None = None,
+    ) -> dict[str, Any]:
+        baseline = self.deterministic_intent(request, reference_time=reference_time)
+        local_task_list_name = baseline.get("task_list_name")
+        if self.field_extractor is None:
+            return baseline
+        try:
+            extraction_context = {"last_created_task": self.last_created_task or {}}
+            if semantic_image_path:
+                extraction_context["semantic_image_path"] = semantic_image_path
+            extracted = self.field_extractor.extract(
+                request,
+                now=reference_time,
+                baseline_intent=baseline,
+                context=extraction_context,
+            )
+            if local_task_list_name:
+                extracted["task_list_name"] = local_task_list_name
+                extracted["task_list_id_hint"] = None
+            return extracted
+        except Exception:
+            return baseline
+
+    def deterministic_intent(
+        self,
+        request: str,
+        reference_time: datetime | None = None,
+    ) -> dict[str, Any]:
+        local_task_list_name, local_request = _local_task_list_request(request)
+        baseline = extract_intent(local_request, now=reference_time)
+        if local_task_list_name:
+            baseline["task_list_name"] = local_task_list_name
+        return baseline
+
+    def _bulk_image_task_intents(
+        self,
+        request: str,
+        titles: list[str],
+        reference_time: datetime | None,
+        *,
+        semantic_intent: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        caption = _bulk_image_task_caption(request)
+        shared = self._extract_intent(f"Add task item {caption}", reference_time)
+        if semantic_intent is not None and semantic_intent.get("intent") == "create_task":
+            for key in ("notes", "due", "task_list_name", "task_list_id_hint"):
+                if semantic_intent.get(key) is not None:
+                    shared[key] = semantic_intent[key]
+            if isinstance(semantic_intent.get("metadata"), dict):
+                shared["metadata"] = _merge_semantic_metadata(
+                    shared.get("metadata"),
+                    semantic_intent["metadata"],
+                )
+        return [
+            {
+                **shared,
+                "title": title,
+                "missing_fields": [],
+                "assumptions": sorted({*shared.get("assumptions", []), "image_text"}),
+            }
+            for title in titles
+        ]
+
+    def _preview_task_creates(
+        self,
+        intents: list[dict[str, Any]],
+        *,
+        reference_time: datetime | None = None,
+    ) -> str:
+        missing = sorted(
+            {
+                str(field)
+                for intent in intents
+                for field in intent.get("missing_fields", [])
+                if field
+            }
+        )
+        if missing:
+            self.pending_action = PendingAction(
+                action="clarify_create",
+                create_intents=intents,
+                reference_time=reference_time,
+            )
+            self.last_result = {"status": "needs_information"}
+            question = next(
+                (
+                    str(intent.get("clarification_question"))
+                    for intent in intents
+                    if intent.get("clarification_question")
+                ),
+                None,
+            )
+            message = question or "Please provide: " + ", ".join(missing) + "."
+            print(message)
+            return message
+        self.pending_action = PendingAction(
+            action="confirm_create",
+            create_intents=intents,
+            reference_time=reference_time,
+        )
+        self.last_result = {"status": "needs_information"}
+        lines = [f"I found {len(intents)} task{'s' if len(intents) != 1 else ''} to add:"]
+        for index, intent in enumerate(intents, start=1):
+            detail = str(intent.get("title") or "Untitled task")
+            if intent.get("due"):
+                detail += f" — due {str(intent['due'])[:10]}"
+            if intent.get("task_list_name"):
+                detail += f" — {intent['task_list_name']}"
+            lines.append(f"{index}. {detail}")
+        lines.append("Add all of these? yes/no")
+        message = "\n".join(lines)
+        print(message)
+        return message
+
+    def requires_create_confirmation(self, request: str) -> bool:
+        return bool(
+            _bulk_image_task_titles(request)
+            or len(_split_multiple_create_task_requests(request)) > 1
+        )
+
+    def _correct_create_intent(
+        self,
+        intent: dict[str, Any],
+        response: str,
+        reference_time: datetime | None,
+    ) -> dict[str, Any]:
+        title = str(intent.get("title") or "task")
+        revised = self._extract_intent(
+            f"Add task {title}. Correction: {response}",
+            reference_time,
+        )
+        merged = dict(intent)
+        lowered = response.lower()
+        if revised.get("due"):
+            merged["due"] = revised["due"]
+        for key in ("task_list_name", "task_list_id_hint"):
+            if revised.get(key):
+                merged[key] = revised[key]
+        ai_revised_title = bool(revised.get("ai_field_extraction"))
+        if (
+            re.search(r"\b(?:title|rename|call it)\b", lowered) or ai_revised_title
+        ) and revised.get("title"):
+            merged["title"] = revised["title"]
+        elif "instead" in lowered and not re.search(
+            r"\b(?:due|list|owner|assign|tag|note|today|tomorrow|next|this|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\d[/.-]\d",
+            lowered,
+        ):
+            title_text = re.sub(r"\binstead\b", "", response, flags=re.IGNORECASE)
+            title_text = re.sub(
+                r"^\s*(?:change|make)\s+(?:it\s+)?(?:to\s+)?",
+                "",
+                title_text,
+                flags=re.IGNORECASE,
+            ).strip(" .,:;-")
+            title_intent = extract_intent(f"Add task {title_text}", now=reference_time)
+            if title_intent.get("title"):
+                merged["title"] = title_intent["title"]
+        if re.search(r"\b(?:note|notes|details)\b", lowered) and revised.get("notes"):
+            merged["notes"] = revised["notes"]
+        metadata = dict(intent.get("metadata") or {})
+        revised_metadata = revised.get("metadata") or {}
+        owner = revised_metadata.get("owner")
+        if owner and owner != "unknown":
+            metadata["owner"] = owner
+        if re.search(r"\b(?:tag|tags|label|labels)\b", lowered):
+            tags = revised_metadata.get("tags")
+            if tags:
+                metadata["tags"] = tags
+        if revised_metadata.get("assistant_help_needed"):
+            for key in (
+                "assistant_help_needed",
+                "assistant_name",
+                "assistant_help_request",
+                "assistant_context",
+            ):
+                if revised_metadata.get(key) not in (None, ""):
+                    metadata[key] = revised_metadata[key]
+        merged["metadata"] = metadata
+        merged["missing_fields"] = list(revised.get("missing_fields") or [])
+        merged["clarification_question"] = revised.get("clarification_question")
+        return merged
 
     def _add_task_from_intent(
         self,
@@ -662,11 +1095,18 @@ class FamilyTasksClaw:
 
         metadata = intent.get("metadata") or {}
         notes = _set_note_tags(intent.get("notes"), metadata.get("tags") or [])
+        task_list_id, task_list_error = self._resolve_task_list(intent)
+        if task_list_error is not None:
+            self.last_result = {"status": "needs_information"}
+            if print_message:
+                print(task_list_error)
+            return task_list_error, None
         response = self.tools.create_task(
             title=intent["title"],
             notes=notes,
             due=intent.get("due"),
             metadata=metadata,
+            task_list_id=task_list_id,
         )
         if response["status"] != "ok":
             message = response["message"]
@@ -675,13 +1115,13 @@ class FamilyTasksClaw:
             return message, None
 
         task = response.get("data", {}).get("task", {})
-        self.last_created_task = dict(task) if task else None
+        self.last_created_task = _task_with_list_context(task, task_list_id) if task else None
         if task.get("id"):
             self.undo_stack.append(
                 {
                     "action": "delete_task",
                     "task": dict(task),
-                    "task_list_id": DEFAULT_TASK_LIST_ID,
+                    "task_list_id": task_list_id,
                 },
             )
         message = _format_created_task_message(task)
@@ -690,6 +1130,7 @@ class FamilyTasksClaw:
                 task,
                 research_client=research_client,
                 reference_time=reference_time,
+                task_list_id=task_list_id,
             )
             if assistant_result:
                 message = f"{message}\n{assistant_result}"
@@ -703,6 +1144,25 @@ class FamilyTasksClaw:
             print(message)
         return message, dict(task) if task else None
 
+    def _resolve_task_list(self, intent: dict[str, Any]) -> tuple[str, str | None]:
+        hint = str(intent.get("task_list_id_hint") or "").strip()
+        name = str(intent.get("task_list_name") or "").strip()
+        if not hint and not name:
+            return DEFAULT_TASK_LIST_ID, None
+        response = self.tools.list_task_lists()
+        if response["status"] != "ok":
+            return DEFAULT_TASK_LIST_ID, response["message"]
+        requested = _normalized_task_list_name(name or hint)
+        matches = [
+            item
+            for item in response.get("data", {}).get("task_lists", [])
+            if str(item.get("id") or "") == hint
+            or _normalized_task_list_name(str(item.get("title") or "")) == requested
+        ]
+        if len(matches) != 1:
+            return DEFAULT_TASK_LIST_ID, f"I couldn't uniquely find the task list {name or hint}."
+        return str(matches[0]["id"]), None
+
     def _add_multiple_tasks_from_requests(
         self,
         requests: list[str],
@@ -715,7 +1175,7 @@ class FamilyTasksClaw:
         undo_start = len(self.undo_stack)
 
         for request in requests:
-            intent = extract_intent(request, now=reference_time)
+            intent = self._extract_intent(request, reference_time)
             message, task = self._add_task_from_intent(
                 intent,
                 reference_time=reference_time,
@@ -729,17 +1189,28 @@ class FamilyTasksClaw:
             messages.append(message)
 
         if created_tasks:
+            created_undo = self.undo_stack[undo_start:]
             del self.undo_stack[undo_start:]
-            undo_tasks = [task for task in created_tasks if task.get("id")]
-            if undo_tasks:
+            undo_entries = [
+                {
+                    "task": dict(entry["task"]),
+                    "task_list_id": entry.get("task_list_id", DEFAULT_TASK_LIST_ID),
+                }
+                for entry in created_undo
+                if entry.get("action") == "delete_task" and isinstance(entry.get("task"), dict)
+            ]
+            if undo_entries:
                 self.undo_stack.append(
                     {
                         "action": "delete_tasks",
-                        "tasks": undo_tasks,
-                        "task_list_id": DEFAULT_TASK_LIST_ID,
+                        "task_entries": undo_entries,
                     },
                 )
-            self.last_created_task = dict(created_tasks[-1])
+            if undo_entries:
+                self.last_created_task = _task_with_list_context(
+                    created_tasks[-1],
+                    undo_entries[-1]["task_list_id"],
+                )
 
         if not created_tasks:
             message = "Could not create tasks:\n" + "\n".join(f"- {failure}" for failure in failed)
@@ -763,17 +1234,25 @@ class FamilyTasksClaw:
         request: str,
         titles: list[str],
         reference_time: datetime | None = None,
+        *,
+        semantic_intent: dict[str, Any] | None = None,
     ) -> str:
-        caption = _bulk_image_task_caption(request)
-        shared_intent = extract_intent(
-            f"Add task {titles[0]} {caption}",
-            now=reference_time,
+        shared_intent = self._bulk_image_task_intents(
+            request,
+            titles,
+            reference_time,
+            semantic_intent=semantic_intent,
         )
+        shared_intent = shared_intent[0]
         metadata = shared_intent.get("metadata") or {}
         if not metadata.get("tags"):
             metadata = dict(metadata)
             metadata["tags"] = _bulk_image_fallback_tags(request)
-        notes = _set_note_tags(None, metadata.get("tags") or [])
+        notes = _set_note_tags(shared_intent.get("notes"), metadata.get("tags") or [])
+        task_list_id, task_list_error = self._resolve_task_list(shared_intent)
+        if task_list_error is not None:
+            print(task_list_error)
+            return task_list_error
         created_tasks: list[dict[str, Any]] = []
         failures: list[str] = []
 
@@ -783,6 +1262,7 @@ class FamilyTasksClaw:
                 notes=notes,
                 due=shared_intent.get("due"),
                 metadata=metadata,
+                task_list_id=task_list_id,
             )
             if response["status"] != "ok":
                 failures.append(f"{title}: {response['message']}")
@@ -792,14 +1272,14 @@ class FamilyTasksClaw:
                 created_tasks.append(dict(task))
 
         if created_tasks:
-            self.last_created_task = dict(created_tasks[-1])
+            self.last_created_task = _task_with_list_context(created_tasks[-1], task_list_id)
             undo_tasks = [task for task in created_tasks if task.get("id")]
             if undo_tasks:
                 self.undo_stack.append(
                     {
                         "action": "delete_tasks",
                         "tasks": undo_tasks,
-                        "task_list_id": DEFAULT_TASK_LIST_ID,
+                        "task_list_id": task_list_id,
                     },
                 )
 
@@ -827,9 +1307,19 @@ class FamilyTasksClaw:
         task_list_id: str = DEFAULT_TASK_LIST_ID,
         *,
         task_id: str | None = None,
+        semantic_intent: dict[str, Any] | None = None,
     ) -> str:
         self.last_result = {"status": "needs_information"}
-        update = _task_update_from_request(request)
+        semantic_update = (
+            _task_update_from_semantic_intent(semantic_intent)
+            if semantic_intent is not None
+            else None
+        )
+        if semantic_update is not None and semantic_update.target is None and not task_id:
+            message = "Please provide which task to update."
+            print(message)
+            return message
+        update = semantic_update or _task_update_from_request(request)
         if update is None:
             message = "Please say what to update on the task."
             print(message)
@@ -866,6 +1356,7 @@ class FamilyTasksClaw:
                 message = "I do not know which task to update."
                 print(message)
                 return message
+            task_list_id = str(task.get(TASK_LIST_CONTEXT_KEY) or task_list_id)
             return self._update_task(task, update, task_list_id)
 
         response = self.tools.list_tasks(task_list_id=task_list_id)
@@ -909,6 +1400,10 @@ class FamilyTasksClaw:
 
         notes, metadata = _task_notes_and_metadata(task)
         changes = []
+        if update.title is not None:
+            changes.append("title")
+        if update.due is not None:
+            changes.append(f"due={update.due[:10]}")
         if update.owner is not None:
             metadata["owner"] = update.owner
             changes.append(f"owner={update.owner}")
@@ -934,6 +1429,8 @@ class FamilyTasksClaw:
 
         response = self.tools.update_task(
             task_id=task_id,
+            title=update.title,
+            due=update.due,
             notes=notes,
             metadata=metadata,
             task_list_id=task_list_id,
@@ -948,7 +1445,7 @@ class FamilyTasksClaw:
         if updated:
             merged_task = dict(task)
             merged_task.update(updated)
-            self.last_created_task = merged_task
+            self.last_created_task = _task_with_list_context(merged_task, task_list_id)
         self.undo_stack.append(
             {
                 "action": "restore_task",
@@ -1027,10 +1524,20 @@ class FamilyTasksClaw:
         self,
         request: str,
         reference_time: datetime | None = None,
+        *,
+        semantic_intent: dict[str, Any] | None = None,
+        task_list_id: str = DEFAULT_TASK_LIST_ID,
     ) -> str:
-        intent = extract_intent(request, now=reference_time)
+        intent = semantic_intent or self.interpret_request(request, reference_time=reference_time)
+        if task_list_id == DEFAULT_TASK_LIST_ID and (
+            intent.get("task_list_name") or intent.get("task_list_id_hint")
+        ):
+            task_list_id, task_list_error = self._resolve_task_list(intent)
+            if task_list_error is not None:
+                print(task_list_error)
+                return task_list_error
         filters = intent.get("filters", {})
-        response = self.tools.recommend_tasks(filters=filters)
+        response = self.tools.recommend_tasks(filters=filters, task_list_id=task_list_id)
         self.last_result = response
         if response["status"] != "ok":
             message = response["message"]
@@ -1173,12 +1680,14 @@ class FamilyTasksClaw:
         task_list_id: str = DEFAULT_TASK_LIST_ID,
         *,
         task_id: str | None = None,
+        query: str | None = None,
     ) -> str:
         return self._destructive_task_from_request(
             request=request,
             action="complete",
             task_list_id=task_list_id,
             task_id=task_id,
+            query=query,
         )
 
     def delete_task_from_request(
@@ -1187,12 +1696,14 @@ class FamilyTasksClaw:
         task_list_id: str = DEFAULT_TASK_LIST_ID,
         *,
         task_id: str | None = None,
+        query: str | None = None,
     ) -> str:
         return self._destructive_task_from_request(
             request=request,
             action="delete",
             task_list_id=task_list_id,
             task_id=task_id,
+            query=query,
         )
 
     def _destructive_task_from_request(
@@ -1201,10 +1712,17 @@ class FamilyTasksClaw:
         action: str,
         task_list_id: str,
         task_id: str | None = None,
+        query: str | None = None,
     ) -> str:
         self.last_result = {"status": "needs_information"}
         intent = extract_intent(request)
-        query = intent.get("query")
+        query = query or intent.get("query")
+        normalized_query = " ".join(str(query or "").lower().split())
+        if not task_id and normalized_query in PRONOUN_TARGETS and self.last_created_task:
+            task_id = str(self.last_created_task.get("id") or "") or None
+            task_list_id = str(
+                self.last_created_task.get(TASK_LIST_CONTEXT_KEY) or task_list_id,
+            )
         if not query and not task_id:
             message = f"Please provide which task to {action}."
             print(message)
@@ -1261,11 +1779,142 @@ class FamilyTasksClaw:
             return False
 
         command = response.strip().lower()
+        affirmative = AFFIRMATIVE_RE.fullmatch(response.strip()) is not None
+        negative = NEGATIVE_RE.fullmatch(response.strip()) is not None
         pending = self.pending_action
-        if command in ("no", "n", "cancel"):
+        if negative:
             self.pending_action = None
             self.last_result = {"status": "not_counted"}
             print("Okay, I did not change any tasks.")
+            return True
+
+        if pending.action == "clarify_create":
+            if affirmative:
+                self.last_result = {"status": "needs_information"}
+                question = next(
+                    (
+                        str(intent.get("clarification_question"))
+                        for intent in pending.create_intents or []
+                        if intent.get("clarification_question")
+                    ),
+                    None,
+                )
+                print(question or "Please provide the missing task details before confirming.")
+                return True
+            corrected = []
+            for intent in pending.create_intents or []:
+                missing = set(intent.get("missing_fields") or [])
+                if "title" in missing or "task" in missing:
+                    revised = self._extract_intent(
+                        f"Add task {response}",
+                        pending.reference_time,
+                    )
+                    completed = dict(intent)
+                    for key in (
+                        "title",
+                        "notes",
+                        "due",
+                        "task_list_name",
+                        "task_list_id_hint",
+                    ):
+                        if revised.get(key) is not None:
+                            completed[key] = revised[key]
+                    if isinstance(revised.get("metadata"), dict):
+                        completed["metadata"] = _merge_semantic_metadata(
+                            intent.get("metadata"),
+                            revised["metadata"],
+                        )
+                    missing_fields = set(intent.get("missing_fields") or [])
+                    missing_fields.update(revised.get("missing_fields") or [])
+                    supplied = {
+                        "title": bool(completed.get("title")),
+                        "task": bool(completed.get("title")),
+                        "task_list": bool(
+                            completed.get("task_list_name")
+                            or completed.get("task_list_id_hint")
+                        ),
+                    }
+                    completed["missing_fields"] = sorted(
+                        field
+                        for field in missing_fields
+                        if not supplied.get(field, False)
+                    )
+                    completed["clarification_question"] = None
+                    revised = completed
+                elif "task_list" in missing:
+                    revised = self._correct_create_intent(
+                        intent,
+                        f"use task list {response}",
+                        pending.reference_time,
+                    )
+                else:
+                    revised = self._correct_create_intent(
+                        intent,
+                        response,
+                        pending.reference_time,
+                    )
+                corrected.append(revised)
+            self.pending_action = None
+            self._preview_task_creates(
+                corrected,
+                reference_time=pending.reference_time,
+            )
+            return True
+
+        if pending.action == "confirm_create":
+            if not affirmative:
+                if re.search(
+                    r"\b(?:instead|change|make|due|on|tomorrow|today|next|this|"
+                    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+                    r"list|owner|assign|tag|note|title|noah|assistant|help)\b",
+                    command,
+                ):
+                    corrected = [
+                        self._correct_create_intent(intent, response, pending.reference_time)
+                        for intent in pending.create_intents or []
+                    ]
+                    self.pending_action = None
+                    self._preview_task_creates(
+                        corrected,
+                        reference_time=pending.reference_time,
+                    )
+                    return True
+                print("Please answer yes to add the tasks, or no to cancel.")
+                return True
+            self.pending_action = None
+            intents = list(pending.create_intents or [])
+            created: list[dict[str, Any]] = []
+            failures: list[str] = []
+            undo_start = len(self.undo_stack)
+            for intent in intents:
+                message, task = self._add_task_from_intent(intent, print_message=False)
+                if task is None:
+                    failures.append(message)
+                else:
+                    created.append(task)
+            created_undo = self.undo_stack[undo_start:]
+            del self.undo_stack[undo_start:]
+            undo_entries = [
+                {
+                    "task": dict(entry["task"]),
+                    "task_list_id": entry.get("task_list_id", DEFAULT_TASK_LIST_ID),
+                }
+                for entry in created_undo
+                if entry.get("action") == "delete_task" and isinstance(entry.get("task"), dict)
+            ]
+            if undo_entries:
+                self.undo_stack.append(
+                    {
+                        "action": "delete_tasks",
+                        "task_entries": undo_entries,
+                    },
+                )
+            self.last_result = {"status": "ok" if created else "error"}
+            lines = [f"Created {len(created)} task{'s' if len(created) != 1 else ''}."]
+            if failures:
+                lines.append(f"{len(failures)} could not be created.")
+                lines.extend(f"- {failure}" for failure in failures)
+            print("\n".join(lines))
             return True
 
         if pending.choices is not None and command.isdigit():
@@ -1282,7 +1931,7 @@ class FamilyTasksClaw:
             print(f"Selected {_format_task_choice(pending.task)}. Confirm yes/no.")
             return True
 
-        if command not in ("yes", "y", "confirm"):
+        if not affirmative:
             print("Please answer yes or no.")
             return True
 
@@ -1359,12 +2008,25 @@ class FamilyTasksClaw:
             return message
 
         if undo.get("action") == "delete_tasks":
-            tasks = [item for item in undo.get("tasks", []) if item.get("id")]
+            task_entries = undo.get("task_entries")
+            if not isinstance(task_entries, list):
+                task_entries = [
+                    {"task": item, "task_list_id": task_list_id}
+                    for item in undo.get("tasks", [])
+                ]
+            task_entries = [
+                entry
+                for entry in task_entries
+                if isinstance(entry, dict)
+                and isinstance(entry.get("task"), dict)
+                and entry["task"].get("id")
+            ]
             failed = []
-            for undo_task in tasks:
+            for entry in task_entries:
+                undo_task = entry["task"]
                 response = self.tools.delete_task(
                     task_id=undo_task.get("id"),
-                    task_list_id=task_list_id,
+                    task_list_id=entry.get("task_list_id", DEFAULT_TASK_LIST_ID),
                     confirmed=True,
                 )
                 if response["status"] != "ok":
@@ -1374,7 +2036,7 @@ class FamilyTasksClaw:
                     f"- {failure}" for failure in failed
                 )
             else:
-                message = f"Undid image task creation: deleted {len(tasks)} tasks."
+                message = f"Undid image task creation: deleted {len(task_entries)} tasks."
             print(message)
             return message
 
@@ -1419,17 +2081,39 @@ def handle_task_request(claw: FamilyTasksClaw, request: str) -> None:
     if claw.handle_pending_response(request):
         return
 
-    intent = extract_intent(request)
+    intent = claw.interpret_request(request)
+    task_list_id, task_list_error = claw._resolve_task_list(intent)
+    if task_list_error is not None:
+        print(task_list_error)
+        return
     if intent["intent"] == "create_task":
-        claw.add_task_from_request(request)
+        claw.add_task_from_request(request, semantic_intent=intent)
     elif intent["intent"] == "complete_task":
-        claw.complete_task_from_request(request)
+        claw.complete_task_from_request(
+            request,
+            task_list_id=task_list_id,
+            query=intent.get("query"),
+        )
     elif intent["intent"] == "delete_task":
-        claw.delete_task_from_request(request)
+        claw.delete_task_from_request(
+            request,
+            task_list_id=task_list_id,
+            query=intent.get("query"),
+        )
+    elif intent["intent"] == "update_task":
+        claw.update_task_from_request(
+            request,
+            task_list_id=task_list_id,
+            semantic_intent=intent,
+        )
     elif intent["intent"] == "run_assistant_help":
-        claw.run_noah_assistant_help_from_request(request)
+        claw.run_noah_assistant_help_from_request(request, task_list_id=task_list_id)
     else:
-        claw.recommend_tasks_from_request(request)
+        claw.recommend_tasks_from_request(
+            request,
+            semantic_intent=intent,
+            task_list_id=task_list_id,
+        )
 
 
 def run_interactive(claw: FamilyTasksClaw | None = None) -> None:

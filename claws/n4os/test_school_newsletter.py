@@ -62,6 +62,51 @@ Friday, September 11 (Patriot Day): wear red, white, blue
 Tuesday, September 15 (Dot Day): wear dots
 """.strip()
 
+NEWSLETTER_TEXT_AUGUST_21 = """
+Room 13 Newsletter
+Mrs. Thompson
+August 21, 2026
+
+Behavior Assembly with Mr. Wood
+The principal reviewed behavior expectations and playground rules.
+
+Circle Meeting
+Students shared positive qualities of a friend and practiced public speaking skills.
+
+8 Great Traits and Kindness
+We read Lilly's Purple Plastic Purse. Lilly learns how to be responsible.
+We read Penny and Her Marble. We discussed the importance of honesty and integrity.
+We read Sheila Rae, the Brave. Sheila Rae reminds us to plan ahead and make good decisions.
+We read A Weekend with Wendell. Wendell is not a respectful guest.
+We watched a Zen Den video and learned how a traffic light can help us make better decisions.
+We practiced Belly Breathing to help us calm down when we feel strong emotions.
+
+Language Arts and Grammar
+We practiced phonics drills and read phonics poems with short vowel sounds.
+
+Poetry
+Every week we practice a poem or song. On Fridays the students present the poem.
+The students stand at the front of the class and speak in a clear presentation voice.
+The students wrote a concrete poem about summer.
+
+Math
+We reviewed place value, standard form, expanded form, and word form.
+We practiced writing money, observed patterns in the 100 grid, and worked with Math Mountains.
+
+LEXIA
+The students completed the LEXIA diagnostic and can work on LEXIA lessons at home or at school.
+LEXIA recommends about 40 minutes of practice per week.
+
+Fire Drill
+The students participated in their first fire drill.
+
+Art
+The students worked on self portraits and learned the elements of art.
+Mouse Paint by Ellen Stoll Walsh | Kids Book Read Aloud
+Primary Colors Song (Sesame Studios)
+The students colored a color wheel and practiced drawing different types of lines.
+""".strip()
+
 
 class FakeCalendarTools:
     def __init__(self) -> None:
@@ -183,12 +228,139 @@ class SchoolNewsletterTest(unittest.TestCase):
         self.assertEqual(parsed.homework[0].due_date, "2026-08-28")
         self.assertIn("Back to School Night", [item.title for item in parsed.calendar])
         self.assertIn("Send comfortable headphones for Chromebook", [item.title for item in parsed.tasks])
-        self.assertIn("The Dot", parsed.books)
-        self.assertIn("Growth mindset and perseverance", parsed.learning_context)
+        self.assertIn("The Dot", [item.label for item in parsed.knowledge.resources])
+        self.assertIn("Growth mindset and perseverance", parsed.knowledge.topics)
+
+    def test_parser_extracts_new_books_and_learning_topics_without_title_whitelist(self):
+        parsed = parse_newsletter_text(
+            NEWSLETTER_TEXT_AUGUST_21,
+            child="Nysha",
+            source_url=NEWSLETTER_URL,
+        )
+
+        self.assertEqual(
+            tuple(item.label for item in parsed.knowledge.resources if item.kind == "book"),
+            (
+                "Lilly's Purple Plastic Purse",
+                "Penny and Her Marble",
+                "Sheila Rae, the Brave",
+                "A Weekend with Wendell",
+                "Mouse Paint by Ellen Stoll Walsh",
+            ),
+        )
+        self.assertNotIn(
+            "phonics poems with short vowel sounds",
+            [item.label for item in parsed.knowledge.resources],
+        )
+        self.assertIn(
+            "Social-emotional check-ins, friendship, and calming strategies",
+            parsed.knowledge.topics,
+        )
+        self.assertIn("Language arts: grammar, phonics, and short vowel sounds", parsed.knowledge.topics)
+        self.assertIn("Math: number forms, money, number-grid patterns, and Math Mountains", parsed.knowledge.topics)
+        self.assertIn("School safety and fire-drill procedures", parsed.knowledge.topics)
+        self.assertIn("Art: self-portraits, color theory, and line", parsed.knowledge.topics)
+        self.assertIn(
+            "LEXIA recommends about 40 minutes of practice per week at home or school",
+            parsed.knowledge.recommendations,
+        )
+        self.assertIn(
+            "The class practices a poem or song weekly and presents it on Fridays",
+            parsed.knowledge.routines,
+        )
+        self.assertIn("Zen Den", [item.label for item in parsed.knowledge.resources])
+        self.assertIn("Primary Colors Song (Sesame Studios)", [item.label for item in parsed.knowledge.resources])
+        self.assertEqual(len(parsed.knowledge.conversation_prompts), 5)
 
     def test_time_range_only_shifts_explicit_evening_context_to_pm(self):
         self.assertEqual(_time_range("Back to School Night 4:30 - 5:00"), ("16:30", "17:00"))
         self.assertEqual(_time_range("Morning assembly 7:30 - 8:00"), ("07:30", "08:00"))
+
+    def test_save_routes_newsletter_context_without_creating_optional_tasks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            tasks = FakeTaskTools()
+            importer = SchoolNewsletterImporter(
+                store=SQLiteSchoolNewsletterStore(root / "n4os.db"),
+                homework_tools=HomeworkTools(SQLiteHomeworkProvider(root / "n4os.db")),
+                calendar_tools=FakeCalendarTools(),
+                task_tools=tasks,
+                n4os_root=root / "n4os",
+                homework_root=root / "n4os" / "homework",
+                fetch_text=lambda _url: NEWSLETTER_TEXT_AUGUST_21,
+            )
+
+            preview = importer.preview_from_message(
+                f"/import school newsletter for Nysha {NEWSLETTER_URL}",
+                key="telegram:test",
+            )
+            result = importer.save_pending(key="telegram:test", response="save")
+
+            self.assertIn("Optional routines (saved as context, not created as tasks)", preview)
+            self.assertEqual(tasks.created, [])
+            school_root = root / "n4os" / "school" / "Nysha" / "2026-2027"
+            school_knowledge = (school_root / "School Knowledge.md").read_text(encoding="utf-8")
+            curriculum = (school_root / "Curriculum Map.md").read_text(encoding="utf-8")
+            resources = (school_root / "Resources.md").read_text(encoding="utf-8")
+            prompts = (school_root / "Conversation Starters.md").read_text(encoding="utf-8")
+            observations = (root / "n4os" / "family" / "observations" / "2026-08.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertLess(school_knowledge.index("## Newsletter Updates"), 500)
+            self.assertIn("LEXIA recommends about 40 minutes", school_knowledge)
+            self.assertIn("Math: money notation", curriculum)
+            self.assertIn("Video: Zen Den", resources)
+            self.assertIn("What did someone share during circle meeting?", prompts)
+            self.assertIn("School newsletter imported:", observations)
+            self.assertNotIn("- Observation:", observations)
+            self.assertIn("School knowledge:", result.message)
+
+    def test_saved_import_backfills_knowledge_without_recreating_actions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = SQLiteSchoolNewsletterStore(root / "n4os.db")
+            parsed = parse_newsletter_text(
+                NEWSLETTER_TEXT_AUGUST_21,
+                child="Nysha",
+                source_url=NEWSLETTER_URL,
+            )
+            store.upsert(parsed, saved={"tasks": ["created prior reminder"]}, status="saved")
+            tasks = FakeTaskTools()
+            calendar = FakeCalendarTools()
+            importer = SchoolNewsletterImporter(
+                store=store,
+                homework_tools=HomeworkTools(SQLiteHomeworkProvider(root / "n4os.db")),
+                calendar_tools=calendar,
+                task_tools=tasks,
+                n4os_root=root / "n4os",
+                homework_root=root / "n4os" / "homework",
+                fetch_text=lambda _url: NEWSLETTER_TEXT_AUGUST_21,
+            )
+
+            importer.preview_from_message(
+                f"/import school newsletter for Nysha {NEWSLETTER_URL}",
+                key="telegram:test",
+            )
+            first = importer.save_pending(key="telegram:test", response="save")
+            importer.preview_from_message(
+                f"/import school newsletter for Nysha {NEWSLETTER_URL}",
+                key="telegram:test",
+            )
+            second = importer.save_pending(key="telegram:test", response="save")
+
+            self.assertIn("School knowledge:", first.message)
+            self.assertIn("No new items were added.", second.message)
+            self.assertEqual(tasks.created, [])
+            self.assertEqual(calendar.created, [])
+            school_knowledge = root / "n4os" / "school" / "Nysha" / "2026-2027" / "School Knowledge.md"
+            self.assertEqual(school_knowledge.read_text(encoding="utf-8").count("n4os-school-newsletter:"), 2)
+            stored = store.find(
+                child=parsed.child,
+                source_type=parsed.source_type,
+                source_id=parsed.source_id,
+                content_fingerprint=parsed.content_fingerprint,
+            )
+            self.assertIn("created prior reminder", str(stored["saved_json"] if stored else ""))
 
     def test_save_creates_real_homework_and_import_ledger(self):
         with tempfile.TemporaryDirectory() as temp:

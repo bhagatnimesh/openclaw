@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from calendar import monthrange
 from dataclasses import dataclass, field
 from copy import deepcopy
 from datetime import date, datetime, timedelta
@@ -12,6 +13,12 @@ from intent import (
     METADATA_MARKER,
     OWNER_ALIAS_PATTERN,
     OWNER_NAME_ALIASES,
+    _image_text_from_request,
+    _is_future_image_schedule_row,
+    _parse_image_schedule_rows,
+    _request_without_image_text,
+    _select_image_schedule_rows,
+    _advance_recurring_date_after_reference,
     _strip_calendar_target_phrase,
     extract_intent,
     merge_ai_calendar_fields,
@@ -89,6 +96,13 @@ PRONOUN_TARGETS = {
 }
 AI_FIELD_EXTRACTION_CUE_RE = re.compile(
     r"\b(?:invite|guest|guests?|calendar|attendee|attendees?)\b",
+    re.IGNORECASE,
+)
+IMAGE_BULK_DATE_CUE_RE = re.compile(
+    r"\b(?:all\s+(?:the\s+)?dates?|every\s*(?:day|date)(?:\s+(?:day|date))?\s+mentioned|"
+    r"specified\s+(?:days?|dates?)|(?:the\s+)?(?:days?|dates?)\s+"
+    r"(?:shown\s+|listed\s+)?in\s+(?:this|the)?\s*"
+    r"(?:image|photo|picture|screenshot))\b",
     re.IGNORECASE,
 )
 
@@ -717,6 +731,41 @@ def _parse_rrule_parts(recurrence: list[str] | None) -> dict[str, str]:
     return parts
 
 
+def _recurrence_matches_date(recurrence: list[str] | None, value: str) -> bool:
+    parts = _parse_rrule_parts(recurrence)
+    frequency = parts.get("FREQ")
+    if not frequency or frequency == "DAILY":
+        return True
+
+    event_date = date.fromisoformat(value)
+    weekday = tuple(RRULE_WEEKDAY_LABELS)[event_date.weekday()]
+    if frequency == "WEEKLY":
+        return weekday in parts.get("BYDAY", "").split(",")
+    if frequency == "MONTHLY" and parts.get("BYMONTHDAY"):
+        return str(event_date.day) in parts["BYMONTHDAY"].split(",")
+    if frequency == "MONTHLY" and parts.get("BYDAY"):
+        for value in parts["BYDAY"].split(","):
+            match = re.fullmatch(r"(?P<ordinal>[+-]?\d+)?(?P<weekday>[A-Z]{2})", value)
+            if match is None or match.group("weekday") != weekday:
+                continue
+            ordinal = match.group("ordinal") or parts.get("BYSETPOS")
+            if ordinal is None:
+                return True
+            occurrence = (event_date.day - 1) // 7 + 1
+            days_remaining = monthrange(event_date.year, event_date.month)[1] - event_date.day
+            reverse_occurrence = -(days_remaining // 7 + 1)
+            if int(ordinal) in {occurrence, reverse_occurrence}:
+                return True
+        return False
+    if frequency == "YEARLY":
+        months = parts.get("BYMONTH", "").split(",")
+        month_days = parts.get("BYMONTHDAY", "").split(",")
+        return (not months or str(event_date.month) in months) and (
+            not month_days or str(event_date.day) in month_days
+        )
+    return False
+
+
 def _format_created_event_message(
     event_title: str,
     start: datetime,
@@ -782,6 +831,24 @@ def _format_missing_create_message(intent: dict[str, Any], missing: list[str]) -
     return "Please provide: " + ", ".join(missing) + "."
 
 
+def _format_inferred_schedule_confirmation(intent: dict[str, Any]) -> str:
+    title = str(intent.get("title") or "this event")
+    timezone = intent.get("timezone") or DEFAULT_TIMEZONE
+    event_date = datetime.fromisoformat(f"{intent['date']}T00:00:00").replace(
+        tzinfo=ZoneInfo(timezone),
+    )
+    date_label = event_date.strftime("%A, %B %-d")
+    recurrence_label = intent.get("recurrence_label")
+    recurrence_part = f" {recurrence_label}" if recurrence_label else ""
+    if intent.get("all_day"):
+        return f"I found {title}{recurrence_part} starting {date_label} all day. Add it?"
+
+    start_time = datetime.fromisoformat(f"{intent['date']}T{intent['start_time']}:00")
+    start_time = start_time.replace(tzinfo=ZoneInfo(timezone))
+    time_label = start_time.strftime("%-I:%M %p")
+    return f"I found {title}{recurrence_part} starting {date_label} at {time_label}. Add it?"
+
+
 def _merge_create_intent(
     pending: dict[str, Any],
     followup: dict[str, Any],
@@ -824,6 +891,103 @@ def _merge_create_intent(
         missing_fields.append("guest_contacts")
     merged["missing_fields"] = missing_fields
     return merged
+
+
+def _merge_create_correction(
+    pending: dict[str, Any],
+    followup: dict[str, Any],
+    *,
+    replace_duration: bool = False,
+) -> dict[str, Any]:
+    merged = _merge_create_intent(pending, followup)
+    for field in ("title", "date", "start_time", "location", "description"):
+        if followup.get(field):
+            merged[field] = followup[field]
+    if followup.get("target_calendar"):
+        merged["target_calendar"] = followup["target_calendar"]
+    if followup.get("date"):
+        merged["date_was_explicit"] = True
+        recurrence = merged.get("recurrence")
+        if recurrence and not _recurrence_matches_date(recurrence, followup["date"]):
+            merged["recurrence"] = None
+            merged["recurrence_label"] = None
+    if followup.get("all_day"):
+        merged["all_day"] = True
+        merged["start_time"] = None
+    elif followup.get("start_time"):
+        merged["all_day"] = False
+    if replace_duration and followup.get("duration_minutes"):
+        merged["duration_minutes"] = followup["duration_minutes"]
+    merged["missing_fields"] = []
+    if merged.get("title") is None:
+        merged["missing_fields"].append("title")
+    if merged.get("date") is None:
+        merged["missing_fields"].append("date")
+    if not merged.get("all_day") and merged.get("start_time") is None:
+        merged["missing_fields"].append("time")
+    if merged.get("missing_guest_contacts"):
+        merged["missing_fields"].append("guest_contacts")
+    return merged
+
+
+def _has_explicit_duration_correction(value: str) -> bool:
+    return re.search(
+        r"\bfor\s+\d+\s*(?:minutes?|mins?|hours?|hrs?)\b|"
+        r"\b\d{1,2}(?:(?::|\.)\d{2})?\s*(?:am|pm)?\s*(?:to|until|-)\s*"
+        r"\d{1,2}(?::|\.)?\d{0,2}\s*(?:am|pm)\b",
+        value,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _strip_leading_confirmation(value: str) -> str:
+    match = re.match(
+        r"^\s*(?:yes|y)(?P<please>\s+please)?"
+        r"(?:(?P<separator>\s*[^\w\s]\s*)|\s+)(?P<rest>.+)$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return value
+    rest = match.group("rest")
+    correction_cue = re.match(
+        r"(?:invite\b|add\s+guests?\b|guests?\s*:|title\s*:|"
+        r"(?:on|at)\b|all\s+day\b|\d|"
+        r"today\b|tomorrow\b|tonight\b|next\b|this\b|"
+        r"mon(?:day)?\b|tue(?:sday)?\b|wed(?:nesday)?\b|"
+        r"thu(?:rsday)?\b|fri(?:day)?\b|sat(?:urday)?\b|sun(?:day)?\b|"
+        r"noon\b|midnight\b|morning\b|afternoon\b|evening\b|"
+        r"jan(?:uary)?\b|feb(?:ruary)?\b|mar(?:ch)?\b|apr(?:il)?\b|may\b|"
+        r"jun(?:e)?\b|jul(?:y)?\b|aug(?:ust)?\b|sep(?:t|tember)?\b|"
+        r"oct(?:ober)?\b|nov(?:ember)?\b|dec(?:ember)?\b)",
+        rest,
+        flags=re.IGNORECASE,
+    )
+    if match.group("please") or match.group("separator") or correction_cue:
+        return rest
+    return value
+
+
+def _advance_implicit_recurring_intent(
+    intent: dict[str, Any],
+    reference_time: datetime | None,
+) -> None:
+    if not intent.get("recurrence") or intent.get("date_was_explicit"):
+        return
+    recurrence_values = intent.get("recurrence") or []
+    recurrence = {
+        "rrule": str(recurrence_values[0]),
+        "label": intent.get("recurrence_label"),
+    }
+    reference = reference_time or datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+    intent["date"] = _advance_recurring_date_after_reference(
+        intent.get("date"),
+        intent.get("start_time"),
+        recurrence,
+        reference,
+    )
 
 
 BULK_DATE_LINE_RE = re.compile(
@@ -896,15 +1060,66 @@ def _extract_bulk_create_intent(
     request: str,
     reference_time: datetime | None,
 ) -> dict[str, Any] | None:
-    lines = [line.strip() for line in request.splitlines() if line.strip()]
-    if len(lines) < 3:
-        return None
-
     reference = reference_time
     if reference is None:
         reference = datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
     elif reference.tzinfo is None:
         reference = reference.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+    if IMAGE_BULK_DATE_CUE_RE.search(_request_without_image_text(request)):
+        base_intent = extract_intent(_request_without_image_text(request), now=reference)
+        image_rows = _parse_image_schedule_rows(_image_text_from_request(request), reference)
+        image_rows = _select_image_schedule_rows(image_rows, base_intent.get("title"))
+        image_rows = [row for row in image_rows if _is_future_image_schedule_row(row, reference)]
+        rows_by_date: dict[str, dict[str, Any]] = {}
+        for row in image_rows:
+            # This command is date-scoped: repeated OCR rows for one date must
+            # not create duplicate copies of the same titled event.
+            rows_by_date.setdefault(str(row["date"]), row)
+        image_dates = sorted(rows_by_date)
+        if len(image_dates) >= 2:
+            intents = []
+            for image_date in image_dates:
+                intent = deepcopy(base_intent)
+                intent["date"] = image_date
+                if not intent.get("all_day") and not intent.get("start_time"):
+                    intent["start_time"] = rows_by_date[image_date]["start_time"]
+                if rows_by_date[image_date].get("duration_minutes"):
+                    intent["duration_minutes"] = rows_by_date[image_date]["duration_minutes"]
+                intent["recurrence"] = None
+                intent["recurrence_label"] = None
+                intent["confirmation_required"] = False
+                resolved_fields = {"date"}
+                if intent.get("all_day") or intent.get("start_time"):
+                    resolved_fields.add("time")
+                intent["missing_fields"] = [
+                    field
+                    for field in intent.get("missing_fields", [])
+                    if field not in resolved_fields
+                ]
+                intents.append(intent)
+
+            missing_fields = []
+            if any(intent.get("title") is None for intent in intents):
+                missing_fields.append("title")
+            if any(
+                intent.get("start_time") is None and not intent.get("all_day")
+                for intent in intents
+            ):
+                missing_fields.append("time")
+            if any(intent.get("missing_guest_contacts") for intent in intents):
+                missing_fields.append("guest_contacts")
+            return {
+                "intent": "create_events",
+                "intents": intents,
+                "dates": image_dates,
+                "confirmation_required": True,
+                "missing_fields": missing_fields,
+            }
+
+    lines = [line.strip() for line in request.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return None
 
     parsed_dates: list[date] = []
     previous: date | None = None
@@ -936,11 +1151,14 @@ def _extract_bulk_create_intent(
         missing_fields.append("title")
     if any(intent.get("start_time") is None for intent in intents):
         missing_fields.append("time")
+    if any(intent.get("missing_guest_contacts") for intent in intents):
+        missing_fields.append("guest_contacts")
 
     return {
         "intent": "create_events",
         "intents": intents,
         "dates": [parsed.isoformat() for parsed in parsed_dates],
+        "confirmation_required": True,
         "missing_fields": missing_fields,
     }
 
@@ -953,20 +1171,144 @@ def _merge_bulk_create_intent(
     intents = []
     for intent in merged.get("intents", []):
         updated = _merge_create_intent(intent, followup)
+        if "duration" in intent.get("missing_fields", []):
+            updated["missing_fields"] = sorted(
+                {*updated.get("missing_fields", []), "duration"}
+            )
         intents.append(updated)
     merged["intents"] = intents
     missing = {
         field
         for intent in intents
         for field in intent.get("missing_fields", [])
-        if field in {"title", "time"}
+        if field in {"title", "time", "duration", "guest_contacts"}
     }
-    merged["missing_fields"] = [field for field in ("title", "time") if field in missing]
+    merged["missing_fields"] = [
+        field
+        for field in ("title", "time", "duration", "guest_contacts")
+        if field in missing
+    ]
     return merged
+
+
+def _refresh_bulk_missing_fields(bulk_intent: dict[str, Any]) -> None:
+    for item in bulk_intent.get("intents", []):
+        supplied = {
+            "title": bool(item.get("title")),
+            "date": bool(item.get("date")),
+            "time": bool(item.get("start_time")) or item.get("all_day") is True,
+            "duration": bool(item.get("duration_minutes")) or item.get("all_day") is True,
+            "guests": bool(item.get("attendees")),
+            "guest_contacts": bool(item.get("attendees"))
+            and not item.get("missing_guest_contacts"),
+        }
+        item["missing_fields"] = sorted(
+            field
+            for field in set(item.get("missing_fields", []))
+            if not supplied.get(field, bool(item.get(field)))
+        )
+    bulk_intent["missing_fields"] = sorted(
+        {
+            field
+            for item in bulk_intent.get("intents", [])
+            for field in item.get("missing_fields", [])
+        }
+    )
+
+
+def _apply_shared_create_fields_to_bulk(
+    bulk_intent: dict[str, Any],
+    shared: dict[str, Any],
+) -> dict[str, Any]:
+    shared_keys = (
+        "title",
+        "start_time",
+        "duration_minutes",
+        "timezone",
+        "description",
+        "location",
+        "attendees",
+        "missing_guest_contacts",
+        "target_calendar",
+        "metadata",
+        "all_day",
+    )
+    for item in bulk_intent.get("intents", []):
+        for key in shared_keys:
+            if shared.get(key) is not None:
+                item[key] = shared[key]
+        candidate_missing_fields = {
+            *item.get("missing_fields", []),
+            *shared.get("missing_fields", []),
+        }
+        item["missing_fields"] = sorted(candidate_missing_fields)
+    _refresh_bulk_missing_fields(bulk_intent)
+    if shared.get("confirmation_required"):
+        bulk_intent["confirmation_required"] = True
+    return bulk_intent
+
+
+def _merge_bulk_create_correction(
+    pending: dict[str, Any],
+    correction: dict[str, Any],
+    *,
+    replace_duration: bool,
+) -> dict[str, Any]:
+    merged = _merge_bulk_create_intent(pending, correction)
+    if correction.get("date"):
+        _collapse_bulk_to_date(merged, correction["date"])
+    for item in merged.get("intents", []):
+        if correction.get("title"):
+            item["title"] = correction["title"]
+        if correction.get("target_calendar"):
+            item["target_calendar"] = correction["target_calendar"]
+        if correction.get("all_day"):
+            item["all_day"] = True
+            item["start_time"] = None
+        elif correction.get("start_time"):
+            item["all_day"] = False
+            item["start_time"] = correction["start_time"]
+        if replace_duration and correction.get("duration_minutes"):
+            item["duration_minutes"] = correction["duration_minutes"]
+    _refresh_bulk_missing_fields(merged)
+    return merged
+
+
+def _collapse_bulk_to_date(intent: dict[str, Any], corrected_date: str) -> None:
+    intents = intent.get("intents", [])
+    selected = next((item for item in intents if item.get("date") == corrected_date), None)
+    start_variants = {
+        (bool(item.get("all_day")), item.get("start_time")) for item in intents
+    }
+    duration_variants = {item.get("duration_minutes") for item in intents}
+    selected = selected or (intents[0] if intents else {})
+    corrected = deepcopy(selected)
+    corrected["date"] = corrected_date
+    corrected["recurrence"] = None
+    corrected["recurrence_label"] = None
+    if not any(item.get("date") == corrected_date for item in intents):
+        missing_fields = set(corrected.get("missing_fields", []))
+        if len(start_variants) > 1:
+            corrected["all_day"] = False
+            corrected["start_time"] = None
+            missing_fields.add("time")
+        if len(duration_variants) > 1:
+            corrected["duration_minutes"] = None
+            missing_fields.add("duration")
+        corrected["missing_fields"] = sorted(missing_fields)
+    intent["intents"] = [corrected]
+    intent["dates"] = [corrected_date]
+    intent["missing_fields"] = list(corrected.get("missing_fields", []))
 
 
 def _format_missing_bulk_create_message(intent: dict[str, Any]) -> str:
     missing = intent.get("missing_fields", [])
+    if "guest_contacts" in missing:
+        first = next(
+            (item for item in intent.get("intents", []) if item.get("missing_guest_contacts")),
+            {},
+        )
+        return _format_missing_create_message(first, missing)
     if missing == ["time"]:
         first = next((item for item in intent.get("intents", []) if item.get("title")), {})
         title = first.get("title") or "these events"
@@ -976,6 +1318,46 @@ def _format_missing_bulk_create_message(intent: dict[str, Any]) -> str:
         )
 
     return "Please provide: " + ", ".join(missing) + "."
+
+
+def _format_inferred_bulk_schedule_confirmation(intent: dict[str, Any]) -> str:
+    intents = intent.get("intents", [])
+    first = intents[0] if intents else {}
+    title = first.get("title") or "Calendar event"
+    dates = intent.get("dates", [])
+    first_date = datetime.fromisoformat(f"{dates[0]}T00:00:00")
+    last_date = datetime.fromisoformat(f"{dates[-1]}T00:00:00")
+    date_label = (
+        first_date.strftime("%b %-d")
+        if first_date == last_date
+        else f"{first_date.strftime('%b %-d')} through {last_date.strftime('%b %-d')}"
+    )
+    if first.get("all_day"):
+        time_label = "all day"
+    else:
+        schedule_variants = {
+            (str(item["start_time"]), int(item.get("duration_minutes") or 60))
+            for item in intents
+        }
+        if len(schedule_variants) > 1:
+            labels = []
+            for item in intents:
+                item_start = datetime.fromisoformat(f"{item['date']}T{item['start_time']}:00")
+                item_end = item_start + timedelta(
+                    minutes=int(item.get("duration_minutes") or 60)
+                )
+                labels.append(
+                    f"{item_start.strftime('%b %-d')} "
+                    f"{item_start.strftime('%-I:%M %p')}–{item_end.strftime('%-I:%M %p')}"
+                )
+            time_label = f"times vary: {'; '.join(labels)}"
+        else:
+            start = datetime.fromisoformat(f"{dates[0]}T{first['start_time']}:00")
+            end = start + timedelta(minutes=int(first.get("duration_minutes") or 60))
+            time_label = f"{start.strftime('%-I:%M %p')}–{end.strftime('%-I:%M %p')}"
+    if len(dates) == 1:
+        return f"I found 1 date for {title}, {date_label}, {time_label}. Add this event?"
+    return f"I found {len(dates)} dates for {title}, {date_label}, {time_label}. Add all {len(dates)} events?"
 
 
 def _extract_preparation_followup(request: str) -> str | None:
@@ -1048,7 +1430,22 @@ def _extract_recent_event_context_followup(request: str) -> str | None:
 
 
 def _has_telegram_image_text(request: str) -> bool:
-    return bool(re.search(r"(?im)^\s*Image text:\s*$", request))
+    return bool(
+        re.search(
+            r"(?im)^\s*(?:Image text:|\[Image text extraction[^\]]*\]:)\s*$",
+            request,
+        )
+    )
+
+
+def _request_with_title_before_image(request: str, title: str) -> str:
+    marker = re.search(
+        r"(?im)^\s*(?:Image text:|\[Image text extraction[^\]]*\]:)\s*$",
+        request,
+    )
+    if marker is None:
+        return request
+    return f"{request[: marker.start()].strip()}\nTitle: {title}\n\n{request[marker.start() :]}"
 
 
 def _append_context_note(existing_notes: str, context_note: str) -> str:
@@ -1366,19 +1763,24 @@ class FamilyCalendarClaw:
         self,
         request: str,
         reference_time: datetime | None,
+        *,
+        semantic_image_path: str | None = None,
     ) -> dict[str, Any]:
         intent = extract_intent(request, now=reference_time)
         if not self._should_extract_ai_fields(request, intent):
             return intent
 
         try:
+            extraction_context = {
+                "last_created_event": _event_context_for_ai(self.last_created_event),
+            }
+            if semantic_image_path:
+                extraction_context["semantic_image_path"] = semantic_image_path
             ai_fields = self.field_extractor.extract(
                 request,
                 now=reference_time,
                 baseline_intent=_intent_context_for_ai(intent),
-                context={
-                    "last_created_event": _event_context_for_ai(self.last_created_event),
-                },
+                context=extraction_context,
             )
         except Exception:
             return intent
@@ -1397,6 +1799,8 @@ class FamilyCalendarClaw:
         *,
         event_id: str | None = None,
         calendar_id: str | None = None,
+        require_confirmation: bool = False,
+        semantic_intent: dict[str, Any] | None = None,
     ) -> str:
         """Parse one simple add-event request and create it through the tool.
 
@@ -1406,6 +1810,11 @@ class FamilyCalendarClaw:
 
         bulk_intent = _extract_bulk_create_intent(request, reference_time)
         if bulk_intent is not None:
+            if semantic_intent is not None:
+                bulk_intent = _apply_shared_create_fields_to_bulk(
+                    bulk_intent,
+                    semantic_intent,
+                )
             missing = bulk_intent.get("missing_fields", [])
             if missing:
                 self.pending_action = PendingAction(action="create_bulk", payload=bulk_intent)
@@ -1413,14 +1822,21 @@ class FamilyCalendarClaw:
                 print(message)
                 return message
 
+            if require_confirmation or bulk_intent.get("confirmation_required"):
+                self.pending_action = PendingAction(action="confirm_create_bulk", payload=bulk_intent)
+                message = _format_inferred_bulk_schedule_confirmation(bulk_intent)
+                print(message)
+                return message
+
             return self._create_events_from_intents(bulk_intent["intents"])
 
-        intent = self._extract_intent_from_request(request, reference_time)
+        intent = semantic_intent or self._extract_intent_from_request(request, reference_time)
         if intent.get("intent") == "add_guests" and hasattr(self, "add_guests_from_request"):
             return self.add_guests_from_intent(
                 intent,
                 event_id=event_id,
                 calendar_id=calendar_id,
+                reference_time=reference_time,
             )
         missing = intent.get("missing_fields", [])
         if missing:
@@ -1453,7 +1869,15 @@ class FamilyCalendarClaw:
                 return message
 
             self.pending_action = PendingAction(action="create", payload=intent)
+            if _image_text_from_request(request):
+                intent["_source_request"] = request
             message = _format_missing_create_message(intent, missing)
+            print(message)
+            return message
+
+        if require_confirmation or intent.get("confirmation_required"):
+            self.pending_action = PendingAction(action="confirm_create", payload=intent)
+            message = _format_inferred_schedule_confirmation(intent)
             print(message)
             return message
 
@@ -1528,7 +1952,10 @@ class FamilyCalendarClaw:
             return message
 
         event = response.get("data", {}).get("event", {})
-        self.last_created_event = event
+        contextual_event = deepcopy(event)
+        if intent.get("target_calendar"):
+            contextual_event["_n4os_calendar_name"] = intent["target_calendar"]
+        self.last_created_event = contextual_event
         if event.get("id"):
             self.undo_stack.append({"action": "delete_event", "event": deepcopy(event)})
         event_title = event.get("summary", intent["title"])
@@ -1728,6 +2155,7 @@ class FamilyCalendarClaw:
             intent,
             event_id=event_id,
             calendar_id=calendar_id,
+            reference_time=reference_time,
         )
 
     def add_guests_from_intent(
@@ -1736,6 +2164,7 @@ class FamilyCalendarClaw:
         *,
         event_id: str | None = None,
         calendar_id: str | None = None,
+        reference_time: datetime | None = None,
     ) -> str:
         attendees = intent.get("attendees") or []
         if "guest_contacts" in intent.get("missing_fields", []):
@@ -1750,6 +2179,7 @@ class FamilyCalendarClaw:
             print(message)
             return message
 
+        target_query = str(intent.get("query") or "").strip()
         if event_id:
             response = self.tools.get_calendar_event(event_id, calendar_id=calendar_id)
             self.last_result = response
@@ -1758,6 +2188,37 @@ class FamilyCalendarClaw:
                 print(message)
                 return message
             target_event = response.get("data", {}).get("event", {})
+        elif target_query:
+            reference = reference_time or datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+            response = self.tools.list_calendar_events(
+                time_min=(reference - timedelta(days=3650)).isoformat(),
+                time_max=(reference + timedelta(days=3650)).isoformat(),
+                max_results=250,
+                calendar_name=intent.get("target_calendar"),
+                writable=True,
+                query=target_query,
+            )
+            self.last_result = response
+            if response["status"] != "ok":
+                message = response["message"]
+                print(message)
+                return message
+            matches = [
+                item["event"]
+                for item in match_events(
+                    target_query,
+                    sorted(response.get("data", {}).get("events", []), key=_event_start),
+                )
+                if item["score"] >= MIN_CONFIDENT_SCORE
+            ]
+            if len(matches) != 1:
+                message = (
+                    "I couldn't find a unique matching event. "
+                    "Try including the event name or date."
+                )
+                print(message)
+                return message
+            target_event = matches[0]
         else:
             target_event = self.last_created_event
 
@@ -1812,7 +2273,17 @@ class FamilyCalendarClaw:
 
     def _contextual_event_from_intent(self, intent: dict[str, Any]) -> dict[str, Any] | None:
         query = str(intent.get("query") or "").strip().lower()
-        if query in PRONOUN_TARGETS:
+        if query not in PRONOUN_TARGETS or self.last_created_event is None:
+            return None
+
+        target_calendar = intent.get("target_calendar")
+        if not target_calendar:
+            return self.last_created_event
+
+        context_calendar = self.last_created_event.get("_n4os_calendar_name")
+        if context_calendar and _normalize_match_text(context_calendar) == _normalize_match_text(
+            target_calendar,
+        ):
             return self.last_created_event
         return None
 
@@ -1864,7 +2335,7 @@ class FamilyCalendarClaw:
     ) -> str:
         """Parse one simple read request and print Google Calendar events."""
 
-        intent = extract_intent(request, now=reference_time)
+        intent = self._extract_intent_from_request(request, reference_time)
         missing = intent.get("missing_fields", [])
         if missing:
             self.last_result = {"status": "needs_information"}
@@ -1876,6 +2347,7 @@ class FamilyCalendarClaw:
             time_min=intent["start"],
             time_max=intent["end"],
             max_results=50,
+            calendar_name=intent.get("target_calendar"),
         )
         self.last_result = response
         if response["status"] != "ok":
@@ -1939,11 +2411,12 @@ class FamilyCalendarClaw:
         request: str,
         reference_time: datetime | None = None,
     ) -> str:
-        intent = extract_intent(request, now=reference_time)
+        intent = self._extract_intent_from_request(request, reference_time)
         response = self.tools.list_calendar_events(
             time_min=intent["start"],
             time_max=intent["end"],
             max_results=100,
+            calendar_name=intent.get("target_calendar"),
         )
         self.last_result = response
         if response["status"] != "ok":
@@ -1963,7 +2436,7 @@ class FamilyCalendarClaw:
         request: str,
         reference_time: datetime | None = None,
     ) -> str:
-        intent = extract_intent(request, now=reference_time)
+        intent = self._extract_intent_from_request(request, reference_time)
         now = reference_time or datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
         if now.tzinfo is None:
             now = now.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -1971,6 +2444,7 @@ class FamilyCalendarClaw:
             time_min=intent["start"],
             time_max=intent["end"],
             max_results=100,
+            calendar_name=intent.get("target_calendar"),
         )
         self.last_result = response
         if response["status"] != "ok":
@@ -1999,7 +2473,7 @@ class FamilyCalendarClaw:
 
         self.last_result = {"status": "needs_information"}
 
-        intent = extract_intent(request, now=reference_time)
+        intent = self._extract_intent_from_request(request, reference_time)
         contextual_event = None if event_id else self._contextual_event_from_intent(intent)
         missing = [
             field
@@ -2024,6 +2498,8 @@ class FamilyCalendarClaw:
                 time_min=intent["search_start"],
                 time_max=intent["search_end"],
                 max_results=50,
+                calendar_name=intent.get("target_calendar"),
+                writable=True,
             )
         if response["status"] != "ok":
             self.last_result = response
@@ -2084,7 +2560,7 @@ class FamilyCalendarClaw:
 
         self.last_result = {"status": "needs_information"}
 
-        intent = extract_intent(request, now=reference_time)
+        intent = self._extract_intent_from_request(request, reference_time)
         contextual_event = None if event_id else self._contextual_event_from_intent(intent)
         missing = [
             field
@@ -2109,6 +2585,8 @@ class FamilyCalendarClaw:
                 time_min=intent["search_start"],
                 time_max=intent["search_end"],
                 max_results=50,
+                calendar_name=intent.get("target_calendar"),
+                writable=True,
             )
         if response["status"] != "ok":
             self.last_result = response
@@ -2364,13 +2842,16 @@ class FamilyCalendarClaw:
         response: str,
         reference_time: datetime | None = None,
     ) -> bool:
-        command = response.strip().lower()
+        command = response.strip().lower().strip(" .!?")
+        affirmative = re.fullmatch(r"(?:yes|y)(?:\s+please)?", command) is not None
+        negative = re.fullmatch(r"(?:no|n|cancel)(?:\s+please)?", command) is not None
+        correction_response = _strip_leading_confirmation(response)
         if self.pending_action is None:
             return False
 
         pending = self.pending_action
-        if command in ("no", "n", "cancel"):
-            if pending.action == "create":
+        if negative:
+            if pending.action in {"create", "confirm_create", "create_bulk", "confirm_create_bulk"}:
                 self.pending_action = None
                 print("Okay, I did not create anything.")
                 return True
@@ -2379,25 +2860,185 @@ class FamilyCalendarClaw:
             return True
 
         if pending.action == "create":
-            followup = extract_intent(response, now=reference_time)
-            merged = _merge_create_intent(pending.payload or {}, followup)
+            followup = extract_intent(correction_response, now=reference_time)
+            pending_payload = pending.payload or {}
+            explicit_title_correction = re.search(
+                r"\btitle\s*:?\s*\S+",
+                correction_response,
+                flags=re.IGNORECASE,
+            )
+            natural_title_correction = re.match(
+                r"\s*(?P<title>.+?)\s+instead\b",
+                correction_response,
+                flags=re.IGNORECASE,
+            )
+            if natural_title_correction and not followup.get("target_calendar"):
+                followup["title"] = natural_title_correction.group("title").strip(" ,.!?")
+            source_request = pending_payload.get("_source_request")
+            if (
+                not source_request
+                and pending_payload.get("title")
+                and not explicit_title_correction
+                and not natural_title_correction
+            ):
+                followup.pop("title", None)
+            if source_request and followup.get("title"):
+                clarified_request = _request_with_title_before_image(
+                    str(source_request),
+                    str(followup["title"]),
+                )
+                bulk_intent = _extract_bulk_create_intent(clarified_request, reference_time)
+                if bulk_intent is not None:
+                    bulk_intent = _apply_shared_create_fields_to_bulk(
+                        bulk_intent,
+                        pending_payload,
+                    )
+                    bulk_intent = _merge_bulk_create_intent(bulk_intent, followup)
+                    if followup.get("date"):
+                        _collapse_bulk_to_date(bulk_intent, followup["date"])
+                    for item in bulk_intent.get("intents", []):
+                        if followup.get("all_day"):
+                            item["all_day"] = True
+                            item["start_time"] = None
+                        elif followup.get("start_time"):
+                            item["all_day"] = False
+                            item["start_time"] = followup["start_time"]
+                        if (
+                            _has_explicit_duration_correction(correction_response)
+                            and followup.get("duration_minutes")
+                        ):
+                            item["duration_minutes"] = followup["duration_minutes"]
+                    _refresh_bulk_missing_fields(bulk_intent)
+                    missing = bulk_intent.get("missing_fields", [])
+                    if missing:
+                        self.pending_action = PendingAction(action="create_bulk", payload=bulk_intent)
+                        print(_format_missing_bulk_create_message(bulk_intent))
+                        return True
+                    if bulk_intent.get("confirmation_required"):
+                        self.pending_action = PendingAction(
+                            action="confirm_create_bulk",
+                            payload=bulk_intent,
+                        )
+                        print(_format_inferred_bulk_schedule_confirmation(bulk_intent))
+                        return True
+                    self.pending_action = None
+                    self._create_events_from_intents(bulk_intent.get("intents", []))
+                    return True
+
+                reparsed = extract_intent(clarified_request, now=reference_time)
+                reparsed_fields = reparsed
+                reparsed = _merge_create_intent(pending_payload, reparsed_fields)
+                if reparsed_fields.get("confirmation_required"):
+                    reparsed["confirmation_required"] = True
+                merged = _merge_create_correction(
+                    reparsed,
+                    followup,
+                    replace_duration=_has_explicit_duration_correction(correction_response),
+                )
+            else:
+                merged = _merge_create_correction(
+                    pending_payload,
+                    followup,
+                    replace_duration=_has_explicit_duration_correction(correction_response),
+                )
             missing = merged.get("missing_fields", [])
             if missing:
                 self.pending_action = PendingAction(action="create", payload=merged)
                 print(_format_missing_create_message(merged, missing))
                 return True
 
+            _advance_implicit_recurring_intent(merged, reference_time)
+
+            if merged.get("confirmation_required"):
+                self.pending_action = PendingAction(action="confirm_create", payload=merged)
+                print(_format_inferred_schedule_confirmation(merged))
+                return True
+
             self.pending_action = None
             self._create_event_from_intent(merged)
             return True
 
+        if pending.action == "confirm_create":
+            if affirmative:
+                self.pending_action = None
+                self._create_event_from_intent(pending.payload or {})
+                return True
+            correction = extract_intent(correction_response, now=reference_time)
+            duration_correction = _has_explicit_duration_correction(correction_response)
+            if (
+                correction.get("title")
+                or correction.get("date")
+                or correction.get("start_time")
+                or correction.get("all_day")
+                or correction.get("attendees")
+                or correction.get("missing_guest_contacts")
+                or correction.get("target_calendar")
+                or duration_correction
+            ):
+                merged = _merge_create_correction(
+                    pending.payload or {},
+                    correction,
+                    replace_duration=duration_correction,
+                )
+                _advance_implicit_recurring_intent(merged, reference_time)
+                if merged.get("missing_guest_contacts"):
+                    self.pending_action = PendingAction(action="create", payload=merged)
+                    print(_format_missing_create_message(merged, merged["missing_fields"]))
+                    return True
+                self.pending_action = PendingAction(action="confirm_create", payload=merged)
+                print(_format_inferred_schedule_confirmation(merged))
+                return True
+            print("Please reply yes to add it, or no to cancel.")
+            return True
+
+        if pending.action == "confirm_create_bulk":
+            if affirmative:
+                self.pending_action = None
+                self._create_events_from_intents((pending.payload or {}).get("intents", []))
+                return True
+            correction = extract_intent(correction_response, now=reference_time)
+            duration_correction = _has_explicit_duration_correction(correction_response)
+            if (
+                correction.get("title")
+                or correction.get("date")
+                or correction.get("start_time")
+                or correction.get("all_day")
+                or correction.get("attendees")
+                or correction.get("missing_guest_contacts")
+                or correction.get("target_calendar")
+                or duration_correction
+            ):
+                merged = _merge_bulk_create_correction(
+                    pending.payload or {},
+                    correction,
+                    replace_duration=duration_correction,
+                )
+                if merged.get("missing_fields"):
+                    self.pending_action = PendingAction(action="create_bulk", payload=merged)
+                    print(_format_missing_bulk_create_message(merged))
+                    return True
+                self.pending_action = PendingAction(action="confirm_create_bulk", payload=merged)
+                print(_format_inferred_bulk_schedule_confirmation(merged))
+                return True
+            print("Please reply yes to add all events, or no to cancel.")
+            return True
+
         if pending.action == "create_bulk":
-            followup = extract_intent(response, now=reference_time)
-            merged = _merge_bulk_create_intent(pending.payload or {}, followup)
+            followup = extract_intent(correction_response, now=reference_time)
+            merged = _merge_bulk_create_correction(
+                pending.payload or {},
+                followup,
+                replace_duration=_has_explicit_duration_correction(correction_response),
+            )
             missing = merged.get("missing_fields", [])
             if missing:
                 self.pending_action = PendingAction(action="create_bulk", payload=merged)
                 print(_format_missing_bulk_create_message(merged))
+                return True
+
+            if merged.get("confirmation_required"):
+                self.pending_action = PendingAction(action="confirm_create_bulk", payload=merged)
+                print(_format_inferred_bulk_schedule_confirmation(merged))
                 return True
 
             self.pending_action = None

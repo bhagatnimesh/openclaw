@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import base64
 import json
 import logging
+import mimetypes
 import os
+from pathlib import Path
 import re
 from typing import Any, Callable
 import urllib.error
@@ -184,33 +187,50 @@ class OpenAIN4OSIntentInterpreter:
         now: datetime | None = None,
         context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        user_payload = json.dumps(
+            {
+                "request": request,
+                "reference_time": _reference_time_text(now),
+                "context": {
+                    key: value
+                    for key, value in (context or {}).items()
+                    if key != "semantic_image_path"
+                },
+                "output_schema": {
+                    "route": "string",
+                    "action": "string",
+                    "confidence": "number 0..1",
+                    "followup_kind": "optional string",
+                    "target": "optional object",
+                    "slots": "optional object",
+                    "missing_fields": "optional string array",
+                    "clarification_question": "optional string",
+                },
+            },
+            sort_keys=True,
+        )
+        user_content: str | list[dict[str, str]] = user_payload
+        image_path = _clean_string((context or {}).get("semantic_image_path"))
+        if image_path:
+            path = Path(image_path)
+            if path.is_file():
+                mime_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+                image_data = base64.b64encode(path.read_bytes()).decode("ascii")
+                user_content = [
+                    {"type": "input_text", "text": user_payload},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:{mime_type};base64,{image_data}",
+                        "detail": "high",
+                    },
+                ]
         body = {
             "model": self.model,
             "store": False,
             "max_output_tokens": 450,
             "input": [
                 {"role": "system", "content": _system_prompt()},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "request": request,
-                            "reference_time": _reference_time_text(now),
-                            "context": context or {},
-                            "output_schema": {
-                                "route": "string",
-                                "action": "string",
-                                "confidence": "number 0..1",
-                                "followup_kind": "optional string",
-                                "target": "optional object",
-                                "slots": "optional object",
-                                "missing_fields": "optional string array",
-                                "clarification_question": "optional string",
-                            },
-                        },
-                        sort_keys=True,
-                    ),
-                },
+                {"role": "user", "content": user_content},
             ],
         }
         api_request = urllib.request.Request(

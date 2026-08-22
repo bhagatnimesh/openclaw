@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import unittest
 from datetime import date
 from pathlib import Path
@@ -23,11 +24,14 @@ from telegram_bot import (
     HELP_MESSAGE,
     HOMEWORK_PHOTO_UPLOAD_DIR,
     HOW_TO_HELP,
+    OpenAIImageTextExtractor,
+    OpenAIN4OSHelpAnswerer,
     READING_PHOTO_UPLOAD_DIR,
     SETUP_USER_MESSAGE,
     UNAUTHORIZED_MESSAGE,
     N4OSTelegramBot,
     TelegramConfig,
+    TelegramRecentCapture,
     TelegramUndoEntry,
     TelegramSenderProfile,
     VOICE_TRANSCRIPTION_EMPTY_MESSAGE,
@@ -38,13 +42,28 @@ from telegram_bot import (
     VOICE_TRANSCRIPTION_UNAVAILABLE_MESSAGE,
     build_application,
     load_config,
+    _build_help_catalog,
+    _apply_capture_correction,
     _conversation_key,
 )
 from claws.n4os.claw import N4OSClaw
-from n4os_capture import CaptureIngestResult, JournalEntry
+from claws.n4os.second_brain_importer import SecondBrainImportUserError
+from n4os_capture import CaptureIngestResult, CaptureNote, JournalEntry, ingest_capture_notes
 from n4os_capture import CaptureUndoResult
+from n4os_advice import N4OSAdviceResult
 from n4os_chat import N4OSChatResult
+from n4os_research import RESEARCH_HELP_MESSAGE, N4OSResearchResult, N4OSResearchSource
 from n4os_memory_inbox import MemoryIngestResult, MemoryObservation
+
+
+def advice_result(reply: str, *, model: str | None = None) -> N4OSAdviceResult:
+    return N4OSAdviceResult(
+        reply=reply,
+        reasoning_summary="Used the selected knowledge to choose the response.",
+        context_labels=["SOUL"],
+        knowledge_preview="Knowledge selected\nSources: SOUL",
+        model=model,
+    )
 
 
 def assert_single_memory_reply(
@@ -68,6 +87,8 @@ def assert_single_memory_reply(
 
 
 class FakeMessage:
+    _next_message_id = 1000
+
     def __init__(
         self,
         text: str | None = None,
@@ -76,6 +97,8 @@ class FakeMessage:
         audio: Any | None = None,
         document: Any | None = None,
         photo: list[Any] | None = None,
+        message_id: int | None = None,
+        reply_to_message: Any | None = None,
     ) -> None:
         self.text = text
         self.caption = caption
@@ -83,10 +106,44 @@ class FakeMessage:
         self.audio = audio
         self.document = document
         self.photo = photo or []
+        self.message_id = message_id if message_id is not None else self._next_id()
+        self.reply_to_message = reply_to_message
         self.replies: list[str] = []
+        self.sent_messages: list[Any] = []
 
-    async def reply_text(self, text: str) -> None:
+    @classmethod
+    def _next_id(cls) -> int:
+        value = cls._next_message_id
+        cls._next_message_id += 1
+        return value
+
+    async def reply_text(self, text: str) -> Any:
         self.replies.append(text)
+        sent = type("FakeSentMessage", (), {"message_id": self._next_id(), "text": text})()
+        self.sent_messages.append(sent)
+        return sent
+
+
+class FakeHelpAnswerer:
+    def __init__(self, reply: str | None = None, *, fail: bool = False) -> None:
+        self.reply = reply
+        self.fail = fail
+        self.questions: list[str] = []
+
+    def answer(self, question: str) -> str | None:
+        self.questions.append(question)
+        if self.fail:
+            raise RuntimeError("help unavailable")
+        return self.reply
+
+
+class FakeSchoolCoachClaw:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def handle_request(self, request: str, *, provenance) -> str:
+        self.calls.append({"request": request, "provenance": provenance})
+        return "Current plan: Keep the next interaction short and positive."
 
 
 class FakeUser:
@@ -287,6 +344,33 @@ class FakeSchoolNewsletterImporter:
         self.save_calls.append((key, response))
         self.pending = False
         return type("Result", (), {"message": "Saved school newsletter updates."})()
+
+
+class FakeSecondBrainImporter:
+    def __init__(self) -> None:
+        self.pending = False
+        self.preview_calls: list[tuple[str, str]] = []
+        self.save_calls: list[tuple[str, str]] = []
+
+    def has_pending(self, key: str) -> bool:
+        del key
+        return self.pending
+
+    def preview_from_message(self, text: str, *, key: str) -> str:
+        self.preview_calls.append((text, key))
+        self.pending = True
+        return "N4OS import preview: Back-to-School Night\n\nReply `save` to approve this plan, or `cancel`."
+
+    def save_pending(self, *, key: str, response: str):
+        self.save_calls.append((key, response))
+        self.pending = False
+        return type("Result", (), {"message": "Saved second brain import."})()
+
+
+class FailingSecondBrainImporter(FakeSecondBrainImporter):
+    def preview_from_message(self, text: str, *, key: str) -> str:
+        self.preview_calls.append((text, key))
+        raise SecondBrainImportUserError("Paste the full Google Slides URL.")
 
 
 class PendingHomeworkClaw(FakeHomeworkClaw):
@@ -506,6 +590,133 @@ class QuietLogger:
 
 
 class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
+    async def test_school_coach_command_bypasses_router_with_message_provenance(self):
+        router = FakeClaw()
+        school_coach = FakeSchoolCoachClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(
+                token="token",
+                allowed_user_id=12345,
+                sender_profiles=(TelegramSenderProfile(12345, "dad", "dad"),),
+            ),
+            router,
+            logger=QuietLogger(),
+            school_coach_claw=school_coach,
+        )
+        message = FakeMessage(
+            "/school-coach What's your current plan for Ms. Rivera?",
+            message_id=42,
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message, chat_id=99), FakeContext())
+
+        self.assertEqual(router.requests, [])
+        self.assertEqual(
+            message.replies,
+            ["Current plan: Keep the next interaction short and positive."],
+        )
+        self.assertEqual(len(school_coach.calls), 1)
+        provenance = school_coach.calls[0]["provenance"]
+        self.assertEqual(provenance.kind, "user_report")
+        self.assertEqual(provenance.ref, "telegram:99:12345:42")
+        self.assertEqual(provenance.reported_by, "dad")
+
+    async def test_school_coach_space_command_and_spoken_followup_stay_in_coach_mode(self):
+        router = FakeClaw()
+        school_coach = FakeSchoolCoachClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            router,
+            logger=QuietLogger(),
+            school_coach_claw=school_coach,
+        )
+        first = FakeMessage("/school coach", message_id=43)
+        followup = FakeMessage("Yes, focus on Mrs. Thompson", message_id=44)
+        reset = FakeMessage("new session", message_id=45)
+        task = FakeMessage("add task email the school", message_id=45)
+
+        await bot.handle_message(FakeUpdate(12345, first, chat_id=99), FakeContext())
+        await bot.handle_message(FakeUpdate(12345, followup, chat_id=99), FakeContext())
+        await bot.handle_message(FakeUpdate(12345, reset, chat_id=99), FakeContext())
+        await bot.handle_message(FakeUpdate(12345, task, chat_id=99), FakeContext())
+
+        self.assertEqual(
+            [call["request"] for call in school_coach.calls],
+            ["/school coach", "Yes, focus on Mrs. Thompson"],
+        )
+        self.assertEqual(reset.replies, ["Started a new N4OS session."])
+        self.assertEqual(task.replies, ["router replied to: add task email the school"])
+
+    async def test_spoken_school_coach_trigger_routes_voice_transcript(self):
+        router = FakeClaw()
+        school_coach = FakeSchoolCoachClaw()
+        transcript = "What's your current plan for Mrs. Thompson?"
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            router,
+            logger=QuietLogger(),
+            audio_transcriber=FakeAudioTranscriber(transcript),
+            school_coach_claw=school_coach,
+        )
+        message = FakeMessage(voice=FakeVoice(), message_id=46)
+
+        await bot.handle_message(FakeUpdate(12345, message, chat_id=99), FakeContext())
+
+        self.assertEqual(router.requests, [])
+        self.assertEqual([call["request"] for call in school_coach.calls], [transcript])
+        self.assertEqual(
+            message.replies,
+            [
+                VOICE_TRANSCRIPTION_STARTED_MESSAGE,
+                VOICE_TRANSCRIPTION_RESULT_MESSAGE.format(text=transcript),
+                "Current plan: Keep the next interaction short and positive.",
+            ],
+        )
+
+    async def test_second_brain_import_previews_then_save_confirms(self):
+        importer = FakeSecondBrainImporter()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+            second_brain_importer=importer,
+        )
+        context = FakeContext()
+        link = "https://docs.google.com/presentation/d/backtoschool123/edit?usp=sharing"
+        first = FakeMessage(
+            "/import second brain "
+            f"{link}\n"
+            "Instructions: This is Nysha's Back-to-School guide. Use it as second brain context."
+        )
+
+        await bot.handle_message(FakeUpdate(12345, first, chat_id=99), context)
+
+        self.assertEqual(len(importer.preview_calls), 1)
+        self.assertIn("N4OS import preview", first.replies[0])
+
+        second = FakeMessage("save")
+        await bot.handle_message(FakeUpdate(12345, second, chat_id=99), context)
+
+        self.assertEqual(len(importer.save_calls), 1)
+        self.assertEqual(second.replies, ["Saved second brain import."])
+
+    async def test_second_brain_import_user_error_is_shown_directly(self):
+        importer = FailingSecondBrainImporter()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+            second_brain_importer=importer,
+        )
+        message = FakeMessage(
+            "/import second brain https://docs.google.com/presentation/d/...\n"
+            "Instructions: This is Nysha's Back-to-School guide."
+        )
+
+        await bot.handle_message(FakeUpdate(12345, message, chat_id=99), FakeContext())
+
+        self.assertEqual(message.replies, ["Paste the full Google Slides URL."])
+
     async def test_school_newsletter_prompt_previews_then_save_confirms(self):
         importer = FakeSchoolNewsletterImporter()
         bot = N4OSTelegramBot(
@@ -973,6 +1184,23 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             stored_file.unlink(missing_ok=True)
         self.assertEqual(message.replies, ["Captured homework for Nysha: All About Me - assigned, due 2026-08-21."])
 
+    async def test_homework_complete_command_routes_without_photo(self):
+        homework = FakeHomeworkClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+            homework_claw=homework,
+        )
+        message = FakeMessage("/homework complete art class Nysha")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(homework.calls[0][0], "/homework complete art class Nysha")
+        self.assertEqual(homework.calls[0][1], "telegram_text")
+        self.assertIsNone(homework.calls[0][2])
+        self.assertEqual(message.replies, ["Captured homework for Nysha: All About Me - assigned, due 2026-08-21."])
+
     async def test_pending_homework_duplicate_preserves_photo_until_cancel(self):
         homework = PendingHomeworkClaw()
         bot = N4OSTelegramBot(
@@ -1072,6 +1300,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         ingest.assert_called_once_with(
             "/capture Nysha liked teaching younger kids. I felt proud.",
+            n4os_root=bot.n4os_root,
             source="Telegram",
         )
         self.assertEqual(claw.requests, [])
@@ -1117,6 +1346,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         ingest.assert_called_once_with(
             "/capture Niyati journal note",
+            n4os_root=bot.n4os_root,
             source="Telegram/Niyati",
         )
         self.assertEqual(claw.requests, [])
@@ -1153,7 +1383,8 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         ingest.assert_called_once_with(
             "Capture Nysha asked why we do not travel business class.",
-            source="Telegram",
+            n4os_root=bot.n4os_root,
+            source="telegram_voice",
         )
         self.assertEqual(claw.requests, [])
         self.assertEqual(message.replies[0], VOICE_TRANSCRIPTION_STARTED_MESSAGE)
@@ -1192,6 +1423,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         ingest.assert_called_once_with(
             "Nysha asked why we do not travel business class.",
+            n4os_root=bot.n4os_root,
             source="Telegram",
         )
         self.assertIsNone(claw.pending_route_clarification)
@@ -1243,12 +1475,1328 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             await bot.handle_message(FakeUpdate(12345, capture_message), None)
             await bot.handle_message(FakeUpdate(12345, undo_message), None)
 
-        undo.assert_called_once_with(result)
+        undo.assert_called_once_with(result, n4os_root=bot.n4os_root)
         self.assertEqual(claw.requests, [])
         self.assertEqual(
             undo_message.replies,
             ["Undid capture: removed 1 family observation and 1 journal entry."],
         )
+
+    def test_capture_correction_parses_deterministic_replacements(self):
+        text = "Capture for Damage, it was been fun."
+
+        corrected, error = _apply_capture_correction(
+            text,
+            'replace "Damage" with "Dimage"',
+        )
+        self.assertIsNone(error)
+        self.assertEqual(corrected, "Capture for Dimage, it was been fun.")
+
+        corrected, error = _apply_capture_correction(
+            text,
+            "Dimage, not Damage; it has been fun, not it was been fun",
+        )
+        self.assertIsNone(error)
+        self.assertEqual(corrected, "Capture for Dimage, it has been fun.")
+
+        corrected, error = _apply_capture_correction(text, "Damage -> Dimage")
+        self.assertIsNone(error)
+        self.assertEqual(corrected, "Capture for Dimage, it was been fun.")
+
+    def test_capture_correction_reports_unmatched_replacement(self):
+        corrected, error = _apply_capture_correction(
+            "Capture for Dimage.",
+            'replace "Damage" with "Dimage"',
+        )
+
+        self.assertIsNone(corrected)
+        self.assertEqual(error, 'I could not find "Damage" in the saved capture.')
+
+    def test_capture_correction_replaces_repeated_typos(self):
+        corrected, error = _apply_capture_correction(
+            "Capture Damage proposal. Damage follow-up.",
+            "Dimage, not Damage",
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(corrected, "Capture Dimage proposal. Dimage follow-up.")
+
+    def test_capture_correction_allows_semicolons_inside_quoted_replacements(self):
+        corrected, error = _apply_capture_correction(
+            "Capture A; B proposal. Damage follow-up.",
+            'replace "A; B" with "A and B"; Dimage, not Damage',
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(corrected, "Capture A and B proposal. Dimage follow-up.")
+
+    def test_capture_correction_allows_semicolons_inside_single_quoted_replacements(self):
+        corrected, error = _apply_capture_correction(
+            "Capture A; B proposal. Damage follow-up.",
+            "replace 'A; B' with 'A and B'; Dimage, not Damage",
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(corrected, "Capture A and B proposal. Dimage follow-up.")
+
+    def test_capture_correction_splits_bare_apostrophes_normally(self):
+        corrected, error = _apply_capture_correction(
+            "Capture Navyas proud mood.",
+            "Navya's, not Navyas; calm, not proud",
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(corrected, "Capture Navya's calm mood.")
+
+    def test_capture_correction_inserts_replacement_text_literally(self):
+        corrected, error = _apply_capture_correction(
+            "Capture path is Damage.",
+            'replace "Damage" with "C:\\tmp\\1"',
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(corrected, "Capture path is C:\\tmp\\1.")
+
+    async def test_capture_correction_preserves_original_default_date(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            result = ingest_capture_notes(
+                "Capture I felt Damage.",
+                n4os_root=n4os_root,
+                default_date=date(2026, 8, 17),
+                source="Telegram",
+            )
+            session = bot.sessions.get("telegram:12345")
+            session.undo_stack.append(TelegramUndoEntry(kind="capture", capture_result=result))
+            session.recent_captures.append(
+                TelegramRecentCapture(
+                    text="Capture I felt Damage.",
+                    source="Telegram",
+                    result=result,
+                )
+            )
+            correction = FakeMessage("fix last capture: Dimage, not Damage")
+
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+            original_date_path = n4os_root / "journal" / "2026-08-17.md"
+            today_path = n4os_root / "journal" / f"{date.today().isoformat()}.md"
+
+            self.assertIn("Dimage", original_date_path.read_text(encoding="utf-8"))
+            if today_path != original_date_path:
+                self.assertFalse(today_path.exists())
+
+    async def test_capture_correction_refuses_when_edit_creates_multiple_notes(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        original = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I felt Damage.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text="I felt Damage.",
+                    source="Telegram",
+                )
+            ],
+        )
+        session = bot.sessions.get("telegram:12345")
+        session.undo_stack.append(TelegramUndoEntry(kind="capture", capture_result=original))
+        session.recent_captures.append(
+            TelegramRecentCapture(
+                text="Capture I felt Damage.",
+                source="Telegram",
+                result=original,
+            )
+        )
+        message = FakeMessage('fix last capture: replace "Damage" with "Dimage.\nI felt proud"')
+
+        with (
+            patch("telegram_bot.undo_capture_ingest") as undo,
+            patch("telegram_bot.ingest_capture_notes") as ingest,
+        ):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        undo.assert_not_called()
+        ingest.assert_not_called()
+        self.assertEqual(
+            message.replies,
+            [
+                "I can only fix a single saved capture note right now. Keep the correction to one note, or send undo and resend the corrected capture."
+            ],
+        )
+
+    async def test_capture_correction_replays_saved_link_preview_without_enrichment(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        original = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I saved Damage link.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text=(
+                        "I saved Damage link https://example.test "
+                        "and https://second.example "
+                        "[Link: https://example.test; title: Original Title] "
+                        "[Link: https://second.example; title: Second Title]"
+                    ),
+                    source="Telegram",
+                )
+            ],
+        )
+        corrected = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I saved Dimage link.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text=(
+                        "I saved Dimage link https://example.test "
+                        "[Link: https://example.test; title: Original Title]"
+                    ),
+                    source="Telegram",
+                )
+            ],
+        )
+        session = bot.sessions.get("telegram:12345")
+        session.undo_stack.append(TelegramUndoEntry(kind="capture", capture_result=original))
+        session.recent_captures.append(
+            TelegramRecentCapture(
+                text="/capture I saved Damage link https://example.test and https://second.example",
+                source="Telegram",
+                result=original,
+            )
+        )
+        message = FakeMessage("fix last capture: Dimage, not Damage")
+
+        with (
+            patch(
+                "telegram_bot.undo_capture_ingest",
+                return_value=CaptureUndoResult(
+                    family_observations_removed=0,
+                    journal_entries_removed=1,
+                ),
+            ),
+            patch("telegram_bot.ingest_capture_notes", return_value=corrected) as ingest,
+        ):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        ingest.assert_called_once()
+        args, kwargs = ingest.call_args
+        self.assertIn("title: Original Title", args[0])
+        self.assertIn("title: Second Title", args[0])
+        self.assertIn("Dimage", args[0])
+        self.assertFalse(kwargs["enrich_links"])
+
+    async def test_capture_correction_preserves_preview_with_closing_bracket(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        original = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I saved Damage link.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text=(
+                        "I saved Damage link https://example.test "
+                        "[Link: https://example.test; title: Docs [v2]]"
+                    ),
+                    source="Telegram",
+                )
+            ],
+        )
+        corrected = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I saved Dimage link.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+        )
+        session = bot.sessions.get("telegram:12345")
+        session.undo_stack.append(TelegramUndoEntry(kind="capture", capture_result=original))
+        session.recent_captures.append(
+            TelegramRecentCapture(
+                text="/capture I saved Damage link https://example.test",
+                source="Telegram",
+                result=original,
+            )
+        )
+        message = FakeMessage("fix last capture: Dimage, not Damage")
+
+        with (
+            patch(
+                "telegram_bot.undo_capture_ingest",
+                return_value=CaptureUndoResult(
+                    family_observations_removed=0,
+                    journal_entries_removed=1,
+                ),
+            ),
+            patch("telegram_bot.ingest_capture_notes", return_value=corrected) as ingest,
+        ):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        ingest.assert_called_once()
+        args, kwargs = ingest.call_args
+        self.assertIn("title: Docs [v2]", args[0])
+        self.assertFalse(kwargs["enrich_links"])
+
+    async def test_capture_correction_strips_stale_preview_when_url_changes(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        original = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I saved https://old.example.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text=(
+                        "I saved https://old.example "
+                        "[Link: https://old.example; title: Old Title]"
+                    ),
+                    source="Telegram",
+                )
+            ],
+        )
+        corrected = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I saved https://new.example.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+        )
+        session = bot.sessions.get("telegram:12345")
+        session.undo_stack.append(TelegramUndoEntry(kind="capture", capture_result=original))
+        session.recent_captures.append(
+            TelegramRecentCapture(
+                text="/capture I saved https://old.example",
+                source="Telegram",
+                result=original,
+            )
+        )
+        message = FakeMessage(
+            'fix last capture: https://old.example -> https://new.example'
+        )
+
+        with (
+            patch(
+                "telegram_bot.undo_capture_ingest",
+                return_value=CaptureUndoResult(
+                    family_observations_removed=0,
+                    journal_entries_removed=1,
+                ),
+            ),
+            patch("telegram_bot.ingest_capture_notes", return_value=corrected) as ingest,
+        ):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        ingest.assert_called_once()
+        args, kwargs = ingest.call_args
+        self.assertIn("https://new.example", args[0])
+        self.assertNotIn("Old Title", args[0])
+        self.assertTrue(kwargs["enrich_links"])
+
+    async def test_capture_correction_preserves_unchanged_preview_when_one_url_changes(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        original = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I saved https://old.example and https://keep.example.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text=(
+                        "I saved https://old.example and https://keep.example "
+                        "[Link: https://old.example; title: Old Title] "
+                        "[Link: https://keep.example; title: Keep Title]"
+                    ),
+                    source="Telegram",
+                )
+            ],
+        )
+        corrected = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text=(
+                        "I saved https://new.example and https://keep.example "
+                        "[Link: https://keep.example; title: Keep Title]"
+                    ),
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+        )
+        session = bot.sessions.get("telegram:12345")
+        session.undo_stack.append(TelegramUndoEntry(kind="capture", capture_result=original))
+        session.recent_captures.append(
+            TelegramRecentCapture(
+                text="/capture I saved https://old.example and https://keep.example",
+                source="Telegram",
+                result=original,
+            )
+        )
+        message = FakeMessage(
+            'fix last capture: https://old.example -> https://new.example'
+        )
+
+        with (
+            patch(
+                "telegram_bot.undo_capture_ingest",
+                return_value=CaptureUndoResult(
+                    family_observations_removed=0,
+                    journal_entries_removed=1,
+                ),
+            ),
+            patch("telegram_bot.ingest_capture_notes", return_value=corrected) as ingest,
+        ):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        ingest.assert_called_once()
+        args, kwargs = ingest.call_args
+        self.assertIn("https://new.example", args[0])
+        self.assertIn("title: Keep Title", args[0])
+        self.assertNotIn("title: Old Title", args[0])
+        self.assertTrue(kwargs["enrich_links"])
+
+    async def test_capture_correction_preserves_inline_dated_preview(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        original = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I saved Damage https://example.test.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text=(
+                        "I saved Damage https://example.test "
+                        "[Link: https://example.test; title: Original Title]"
+                    ),
+                    source="Telegram",
+                )
+            ],
+        )
+        corrected = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I saved Dimage https://example.test.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+        )
+        session = bot.sessions.get("telegram:12345")
+        session.undo_stack.append(TelegramUndoEntry(kind="capture", capture_result=original))
+        session.recent_captures.append(
+            TelegramRecentCapture(
+                text="/capture 2026-08-17 I saved Damage https://example.test",
+                source="Telegram",
+                result=original,
+            )
+        )
+        message = FakeMessage("fix last capture: Dimage, not Damage")
+
+        with (
+            patch(
+                "telegram_bot.undo_capture_ingest",
+                return_value=CaptureUndoResult(
+                    family_observations_removed=0,
+                    journal_entries_removed=1,
+                ),
+            ),
+            patch("telegram_bot.ingest_capture_notes", return_value=corrected) as ingest,
+        ):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        ingest.assert_called_once()
+        args, kwargs = ingest.call_args
+        self.assertIn("title: Original Title", args[0])
+        self.assertFalse(kwargs["enrich_links"])
+
+    async def test_fix_last_capture_corrects_voice_journal_and_undoes_corrected_entry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            transcript = "Capture I was been fun working on a Damage proposal."
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                audio_transcriber=FakeAudioTranscriber(transcript),
+                n4os_root=n4os_root,
+            )
+            capture = FakeMessage(voice=FakeVoice())
+            correction = FakeMessage(
+                "fix last capture: Dimage, not Damage; it has been fun, not I was been fun"
+            )
+            undo = FakeMessage("undo")
+            followup_correction = FakeMessage("fix last capture: Design, not Damage")
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            journal_text = journal_path.read_text(encoding="utf-8")
+            self.assertIn("Dimage", journal_text)
+            self.assertIn("it has been fun", journal_text)
+            self.assertNotIn("Damage", journal_text)
+            self.assertNotIn("I was been fun", journal_text)
+            self.assertIn("Source: telegram_voice", journal_text)
+            self.assertEqual(correction.replies[0].splitlines()[0], "Updated captured note.")
+
+            await bot.handle_message(FakeUpdate(12345, undo), None)
+
+            self.assertEqual(
+                undo.replies,
+                ["Undid capture correction: restored the previous captured note."],
+            )
+            restored_text = journal_path.read_text(encoding="utf-8")
+            self.assertIn("Damage", restored_text)
+            self.assertIn("I was been fun", restored_text)
+            self.assertNotIn("Dimage", restored_text)
+
+            await bot.handle_message(FakeUpdate(12345, followup_correction), None)
+            self.assertEqual(followup_correction.replies[0].splitlines()[0], "Updated captured note.")
+            self.assertIn("Design", journal_path.read_text(encoding="utf-8"))
+
+    async def test_reply_to_captured_message_corrects_that_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            first = FakeMessage("/capture Nysha liked Damage puzzles.")
+            second = FakeMessage("/capture I felt proud after work.")
+
+            await bot.handle_message(FakeUpdate(12345, first), None)
+            first_capture_reply = first.sent_messages[-1]
+            await bot.handle_message(FakeUpdate(12345, second), None)
+            correction = FakeMessage(
+                'replace "Damage" with "Dimage"',
+                reply_to_message=first_capture_reply,
+            )
+
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+            followup = FakeMessage(
+                'replace "Dimage" with "Design"',
+                reply_to_message=correction.sent_messages[-1],
+            )
+            await bot.handle_message(FakeUpdate(12345, followup), None)
+
+            observations_path = next((n4os_root / "family" / "observations").glob("*.md"))
+            observations_text = observations_path.read_text(encoding="utf-8")
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            journal_text = journal_path.read_text(encoding="utf-8")
+            self.assertIn("Design puzzles", observations_text)
+            self.assertNotIn("Dimage puzzles", observations_text)
+            self.assertNotIn("Damage puzzles", observations_text)
+            self.assertIn("I felt proud after [[playbooks/Career|work]]", journal_text)
+            self.assertEqual(correction.replies[0].splitlines()[0], "Updated captured note.")
+            self.assertEqual(followup.replies[0].splitlines()[0], "Updated captured note.")
+
+    async def test_reply_fix_last_capture_prefers_replied_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            first = FakeMessage("/capture Nysha liked Damage puzzles.")
+            second = FakeMessage("/capture I felt proud.")
+
+            await bot.handle_message(FakeUpdate(12345, first), None)
+            await bot.handle_message(FakeUpdate(12345, second), None)
+            correction = FakeMessage(
+                "fix last capture: Dimage, not Damage",
+                reply_to_message=first.sent_messages[-1],
+            )
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+            observations_path = next((n4os_root / "family" / "observations").glob("*.md"))
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            observations_text = observations_path.read_text(encoding="utf-8")
+            journal_text = journal_path.read_text(encoding="utf-8")
+
+        self.assertIn("Dimage puzzles", observations_text)
+        self.assertIn("I felt proud", journal_text)
+        self.assertEqual(correction.replies[0].splitlines()[0], "Updated captured note.")
+
+    async def test_reply_fix_last_capture_refuses_unknown_reply_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            capture = FakeMessage("/capture I felt Damage.")
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            correction = FakeMessage(
+                "fix last capture: Dimage, not Damage",
+                reply_to_message=FakeMessage("old bot reply", message_id=999999),
+            )
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            journal_text = journal_path.read_text(encoding="utf-8")
+
+        self.assertEqual(correction.replies, ["No recent capture found to fix."])
+        self.assertIn("Damage", journal_text)
+        self.assertNotIn("Dimage", journal_text)
+
+    async def test_bare_not_reply_to_capture_does_not_force_correction(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            capture = FakeMessage("/capture I felt proud.")
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            reply = FakeMessage(
+                "later, not today",
+                reply_to_message=capture.sent_messages[-1],
+            )
+            await bot.handle_message(FakeUpdate(12345, reply), None)
+
+        self.assertEqual(claw.requests, ["later, not today"])
+        self.assertEqual(reply.replies, ["router replied to: later, not today"])
+
+    async def test_batch_capture_correction_is_refused_for_v1(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            capture = FakeMessage(
+                "\n".join(
+                    [
+                        "/capture",
+                        "Nysha liked Damage puzzles.",
+                        "I felt proud after work.",
+                    ]
+                )
+            )
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            correction = FakeMessage("fix last capture: Dimage, not Damage")
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+            observations_path = next((n4os_root / "family" / "observations").glob("*.md"))
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            observations_text = observations_path.read_text(encoding="utf-8")
+            journal_text = journal_path.read_text(encoding="utf-8")
+
+        self.assertIn("Damage puzzles", observations_text)
+        self.assertNotIn("Dimage puzzles", observations_text)
+        self.assertIn("I felt proud after [[playbooks/Career|work]]", journal_text)
+        self.assertEqual(
+            correction.replies,
+            [
+                "I can only fix a single saved capture note right now. For batch captures, send undo and resend the corrected capture."
+            ],
+        )
+
+    async def test_batch_capture_correction_is_refused_even_with_one_new_block(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/capture I felt proud.")),
+                None,
+            )
+            capture = FakeMessage(
+                "\n".join(
+                    [
+                        "/capture",
+                        "I felt proud.",
+                        "I felt Damage.",
+                    ]
+                )
+            )
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            correction = FakeMessage("fix last capture: Dimage, not Damage")
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            journal_text = journal_path.read_text(encoding="utf-8")
+
+        self.assertIn("I felt Damage.", journal_text)
+        self.assertNotIn("I felt Dimage.", journal_text)
+        self.assertEqual(
+            correction.replies,
+            [
+                "I can only fix a single saved capture note right now. For batch captures, send undo and resend the corrected capture."
+            ],
+        )
+
+    async def test_reply_to_later_captured_reply_chunk_corrects_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            capture = FakeMessage("/capture I felt Damage " + ("after work " * 500))
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            self.assertGreater(len(capture.sent_messages), 1)
+            correction = FakeMessage(
+                "fix: Dimage, not Damage",
+                reply_to_message=capture.sent_messages[-1],
+            )
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            journal_text = journal_path.read_text(encoding="utf-8")
+
+        self.assertIn("Dimage", journal_text)
+        self.assertNotIn("Damage", journal_text)
+        self.assertEqual(correction.replies[0].splitlines()[0], "Updated captured note.")
+
+    async def test_capture_correction_without_recent_capture_refuses(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("fix last capture: Dimage, not Damage")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, ["No recent capture found to fix."])
+
+    async def test_capture_undo_prunes_recent_correction_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            capture = FakeMessage("/capture I felt proud.")
+            undo = FakeMessage("undo")
+            correction = FakeMessage("fix last capture: calm, not proud")
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            await bot.handle_message(FakeUpdate(12345, undo), None)
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+        self.assertEqual(correction.replies, ["No recent capture found to fix."])
+
+    async def test_undo_after_correction_then_undo_removes_restored_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            capture = FakeMessage("/capture I felt Damage.")
+            correction = FakeMessage("fix last capture: Dimage, not Damage")
+            undo_correction = FakeMessage("undo")
+            undo_capture = FakeMessage("undo")
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+            await bot.handle_message(FakeUpdate(12345, undo_correction), None)
+            await bot.handle_message(FakeUpdate(12345, undo_capture), None)
+
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            journal_text = journal_path.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            undo_correction.replies,
+            ["Undid capture correction: restored the previous captured note."],
+        )
+        self.assertIn("Undid capture", undo_capture.replies[0])
+        self.assertNotIn("Damage", journal_text)
+        self.assertNotIn("Dimage", journal_text)
+
+    async def test_undo_correction_aborts_when_corrected_capture_partially_removed(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        corrected = CaptureIngestResult(
+            family=MemoryIngestResult(
+                added=[
+                    MemoryObservation(
+                        observed_on=date(2026, 8, 17),
+                        person="Nysha",
+                        observation="liked Dimage puzzles",
+                        source="Telegram",
+                    )
+                ],
+                skipped_duplicates=[],
+            ),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I felt proud.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+        )
+        bot.undo_stack.append(
+            TelegramUndoEntry(
+                kind="capture_correction",
+                capture_result=corrected,
+                capture_current_text="/capture Nysha liked Dimage puzzles.\nI felt proud.",
+                capture_restore_text="/capture Nysha liked Damage puzzles.\nI felt proud.",
+                capture_restore_source="Telegram",
+                capture_restore_default_date=date(2026, 8, 17),
+            )
+        )
+
+        with (
+            patch(
+                "telegram_bot.undo_capture_ingest",
+                return_value=CaptureUndoResult(
+                    family_observations_removed=1,
+                    journal_entries_removed=0,
+                ),
+            ),
+            patch("telegram_bot.ingest_capture_notes") as ingest,
+        ):
+            reply = bot.undo_last_action()
+
+        self.assertEqual(
+            reply,
+            "I could not safely remove the full corrected capture, so I left it unchanged.",
+        )
+        ingest.assert_called_once()
+        self.assertIn("Dimage puzzles", ingest.call_args.args[0])
+        self.assertEqual(len(bot.undo_stack), 1)
+
+    async def test_undo_correction_preserves_undo_stack_order(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            capture = FakeMessage("/capture I felt Damage.")
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            session = bot.sessions.get("telegram:12345")
+            session.undo_stack.append(TelegramUndoEntry(kind="router"))
+            correction = FakeMessage("fix last capture: Dimage, not Damage")
+            undo_correction = FakeMessage("undo")
+            undo_router = FakeMessage("undo")
+
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+            await bot.handle_message(FakeUpdate(12345, undo_correction), None)
+            await bot.handle_message(FakeUpdate(12345, undo_router), None)
+
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            journal_text = journal_path.read_text(encoding="utf-8")
+
+        self.assertEqual(claw.requests, ["undo"])
+        self.assertIn("Damage", journal_text)
+        self.assertEqual(undo_router.replies, ["router replied to: undo"])
+
+    async def test_undo_correction_preserves_reply_targets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            capture = FakeMessage("/capture I felt Damage.")
+
+            await bot.handle_message(FakeUpdate(12345, capture), None)
+            correction = FakeMessage("fix last capture: Dimage, not Damage")
+            undo_correction = FakeMessage("undo")
+
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+            correction_reply = correction.sent_messages[-1]
+            await bot.handle_message(FakeUpdate(12345, undo_correction), None)
+            reply_correction = FakeMessage(
+                'replace "Damage" with "Design"',
+                reply_to_message=correction_reply,
+            )
+            await bot.handle_message(FakeUpdate(12345, reply_correction), None)
+
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            journal_text = journal_path.read_text(encoding="utf-8")
+
+        self.assertEqual(reply_correction.replies[0].splitlines()[0], "Updated captured note.")
+        self.assertIn("Design", journal_text)
+
+    def test_undo_correction_restores_corrected_capture_when_previous_restore_fails(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        corrected = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I felt Dimage.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text="I felt Dimage.",
+                    source="Telegram",
+                )
+            ],
+        )
+        replacement = CaptureIngestResult(
+            family=MemoryIngestResult(added=[], skipped_duplicates=[]),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I felt Dimage.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text="I felt Dimage.",
+                    source="Telegram",
+                )
+            ],
+        )
+        session = bot.sessions.get("telegram:12345")
+        session.undo_stack.append(
+            TelegramUndoEntry(
+                kind="capture_correction",
+                capture_result=corrected,
+                capture_current_text="/capture I felt Dimage.",
+                capture_restore_text="/capture I felt Damage.",
+                capture_restore_editable_text="/capture I felt Damage.",
+                capture_restore_source="Telegram",
+                capture_restore_default_date=date(2026, 8, 17),
+            )
+        )
+
+        with (
+            patch(
+                "telegram_bot.undo_capture_ingest",
+                return_value=CaptureUndoResult(
+                    family_observations_removed=0,
+                    journal_entries_removed=1,
+                ),
+            ),
+            patch(
+                "telegram_bot.ingest_capture_notes",
+                side_effect=[RuntimeError("restore failed"), replacement],
+            ) as ingest,
+        ):
+            reply = bot.undo_last_action(
+                undo_stack=session.undo_stack,
+                recent_captures=session.recent_captures,
+            )
+
+        self.assertEqual(
+            reply,
+            "I could not restore the previous capture, so I kept the corrected capture available for undo.",
+        )
+        self.assertEqual(len(session.undo_stack), 1)
+        self.assertIs(session.undo_stack[-1].capture_result, replacement)
+        self.assertIs(session.recent_captures[-1].result, replacement)
+        self.assertEqual(ingest.call_count, 2)
+
+    async def test_duplicate_capture_correction_removes_bad_original_and_can_undo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            original = FakeMessage("/capture I felt Damage.")
+            duplicate = FakeMessage("/capture I felt Dimage.")
+
+            await bot.handle_message(FakeUpdate(12345, original), None)
+            await bot.handle_message(FakeUpdate(12345, duplicate), None)
+            correction = FakeMessage(
+                "fix: Dimage, not Damage",
+                reply_to_message=original.sent_messages[-1],
+            )
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+            journal_path = next((n4os_root / "journal").glob("*.md"))
+            journal_text = journal_path.read_text(encoding="utf-8")
+            undo = FakeMessage("undo")
+            await bot.handle_message(FakeUpdate(12345, undo), None)
+            restored_text = journal_path.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            correction.replies,
+            [
+                "Updated captured note. The corrected version was already saved elsewhere, so I removed the older duplicate."
+            ],
+        )
+        self.assertNotIn("I felt Damage.", journal_text)
+        self.assertIn("I felt Dimage.", journal_text)
+        self.assertEqual(
+            undo.replies,
+            ["Undid capture correction: restored the previous captured note."],
+        )
+        self.assertIn("I felt Damage.", restored_text)
+        self.assertIn("I felt Dimage.", restored_text)
+
+    def test_duplicate_capture_correction_undo_keeps_entry_when_restore_fails(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        session = bot.sessions.get("telegram:12345")
+        entry = TelegramUndoEntry(
+            kind="capture_correction_duplicate",
+            capture_restore_text="/capture I felt Damage.",
+            capture_restore_editable_text="/capture I felt Damage.",
+            capture_restore_source="Telegram",
+            capture_restore_default_date=date(2026, 8, 17),
+        )
+        session.undo_stack.append(entry)
+
+        with patch("telegram_bot.ingest_capture_notes", side_effect=RuntimeError("boom")):
+            reply = bot.undo_last_action(
+                undo_stack=session.undo_stack,
+                recent_captures=session.recent_captures,
+            )
+
+        self.assertEqual(
+            reply,
+            "I could not restore the previous capture, so I left the undo available.",
+        )
+        self.assertEqual(session.undo_stack, [entry])
+
+    async def test_capture_correction_aborts_when_original_is_partially_removed(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        original = CaptureIngestResult(
+            family=MemoryIngestResult(
+                added=[
+                    MemoryObservation(
+                        observed_on=date(2026, 8, 17),
+                        person="Nysha",
+                        observation="liked Damage puzzles",
+                        source="Telegram",
+                    )
+                ],
+                skipped_duplicates=[],
+            ),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="I felt proud.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text="Nysha liked Damage puzzles.",
+                    source="Telegram",
+                ),
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text="I felt proud.",
+                    source="Telegram",
+                ),
+            ],
+        )
+        session = bot.sessions.get("telegram:12345")
+        session.undo_stack.append(TelegramUndoEntry(kind="capture", capture_result=original))
+        session.recent_captures.append(
+            TelegramRecentCapture(
+                text="/capture Nysha liked Damage puzzles.\nI felt proud.",
+                source="Telegram",
+                result=original,
+            )
+        )
+        message = FakeMessage("fix last capture: Dimage, not Damage")
+
+        with patch("telegram_bot.undo_capture_ingest") as undo, patch("telegram_bot.ingest_capture_notes") as ingest:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(
+            message.replies,
+            [
+                "I can only fix a single saved capture note right now. For batch captures, send undo and resend the corrected capture."
+            ],
+        )
+        undo.assert_not_called()
+        ingest.assert_not_called()
+
+    async def test_capture_correction_partial_rollback_preserves_full_undo_result(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        original = CaptureIngestResult(
+            family=MemoryIngestResult(
+                added=[
+                    MemoryObservation(
+                        observed_on=date(2026, 8, 17),
+                        person="Nysha",
+                        observation="liked Damage puzzles",
+                        source="Telegram",
+                    )
+                ],
+                skipped_duplicates=[],
+            ),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="Nysha liked Damage puzzles. I felt proud.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text="Nysha liked Damage puzzles. I felt proud.",
+                    source="Telegram",
+                )
+            ],
+        )
+        replayed_subset = CaptureIngestResult(
+            family=MemoryIngestResult(
+                added=[],
+                skipped_duplicates=[
+                    MemoryObservation(
+                        observed_on=date(2026, 8, 17),
+                        person="Nysha",
+                        observation="liked Damage puzzles",
+                        source="Telegram",
+                    )
+                ],
+            ),
+            journal_entries=[
+                JournalEntry(
+                    captured_on=date(2026, 8, 17),
+                    text="Nysha liked Damage puzzles. I felt proud.",
+                    topics=[],
+                    source="Telegram",
+                )
+            ],
+            skipped_journal_duplicates=[],
+            notes=[
+                CaptureNote(
+                    captured_on=date(2026, 8, 17),
+                    text="Nysha liked Damage puzzles. I felt proud.",
+                    source="Telegram",
+                )
+            ],
+        )
+        session = bot.sessions.get("telegram:12345")
+        undo_entry = TelegramUndoEntry(kind="capture", capture_result=original)
+        session.undo_stack.append(undo_entry)
+        session.recent_captures.append(
+            TelegramRecentCapture(
+                text="/capture Nysha liked Damage puzzles. I felt proud.",
+                source="Telegram",
+                result=original,
+            )
+        )
+        message = FakeMessage("fix last capture: Dimage, not Damage")
+
+        with (
+            patch(
+                "telegram_bot.undo_capture_ingest",
+                return_value=CaptureUndoResult(
+                    family_observations_removed=1,
+                    journal_entries_removed=0,
+                ),
+            ),
+            patch("telegram_bot.ingest_capture_notes", return_value=replayed_subset),
+        ):
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertIs(undo_entry.capture_result, original)
+        self.assertIs(session.recent_captures[-1].result, original)
+        self.assertEqual(
+            message.replies,
+            ["I could not safely remove the full original capture, so I left it unchanged."],
+        )
+
+    async def test_duplicate_only_capture_is_not_registered_as_last_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            ingest_capture_notes(
+                "/capture I felt Dimage.",
+                n4os_root=n4os_root,
+                source="Telegram",
+            )
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            duplicate = FakeMessage("/capture I felt Dimage.")
+            correction = FakeMessage("fix last capture: Damage, not Dimage")
+
+            await bot.handle_message(FakeUpdate(12345, duplicate), None)
+            await bot.handle_message(FakeUpdate(12345, correction), None)
+
+        self.assertEqual(correction.replies, ["No recent capture found to fix."])
 
     async def test_note_quick_from_telegram_appends_markdown_quick_note(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2076,7 +3624,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         chat.assert_called_once()
         self.assertEqual(claw.requests, [])
-        self.assertEqual(followup.replies, ["chat answer"])
+        self.assertEqual(followup.replies[-1], "chat answer")
 
     async def test_active_chat_allows_explicit_structured_memory_lookup(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2468,18 +4016,19 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         )
         message = FakeMessage("/ask How should we approach Nysha's reading?")
 
-        with patch("telegram_bot.format_n4os_advice", return_value="memory-backed advice") as advice, patch(
+        with patch("telegram_bot.generate_n4os_advice", return_value=advice_result("memory-backed advice")) as advice, patch(
             "telegram_bot.record_n4os_trajectory"
         ) as record:
             await bot.handle_message(FakeUpdate(12345, message), None)
 
-        advice.assert_called_once_with(
-            "/ask How should we approach Nysha's reading?",
-            n4os_root=bot.n4os_root,
-        )
+        advice.assert_called_once()
+        self.assertEqual(advice.call_args.args, ("/ask How should we approach Nysha's reading?",))
+        self.assertIn("context", advice.call_args.kwargs)
         record.assert_called_once()
         self.assertEqual(claw.requests, [])
-        self.assertEqual(message.replies, ["memory-backed advice"])
+        self.assertEqual(message.replies[-1], "memory-backed advice")
+        self.assertTrue(message.replies[0].startswith("Knowledge selected"))
+        self.assertTrue(message.replies[1].startswith("N4OS decision path"))
 
     async def test_ask_question_with_help_word_still_uses_advice(self):
         claw = FakeClaw()
@@ -2490,18 +4039,15 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         )
         message = FakeMessage("/ask how should I help Nysha with school transition?")
 
-        with patch("telegram_bot.format_n4os_advice", return_value="school advice") as advice, patch(
+        with patch("telegram_bot.generate_n4os_advice", return_value=advice_result("school advice")) as advice, patch(
             "telegram_bot.record_n4os_trajectory"
         ) as record:
             await bot.handle_message(FakeUpdate(12345, message), None)
 
-        advice.assert_called_once_with(
-            "/ask how should I help Nysha with school transition?",
-            n4os_root=bot.n4os_root,
-        )
+        advice.assert_called_once()
         record.assert_called_once()
         self.assertEqual(claw.requests, [])
-        self.assertEqual(message.replies, ["school advice"])
+        self.assertEqual(message.replies[-1], "school advice")
 
     async def test_morning_checkin_uses_n4os_advice_before_router(self):
         claw = FakeClaw()
@@ -2512,15 +4058,15 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         )
         message = FakeMessage("Run morning check-in.")
 
-        with patch("telegram_bot.format_n4os_advice", return_value="morning prompt") as advice, patch(
+        with patch("telegram_bot.generate_n4os_advice", return_value=advice_result("morning prompt")) as advice, patch(
             "telegram_bot.record_n4os_trajectory"
         ) as record:
             await bot.handle_message(FakeUpdate(12345, message), None)
 
-        advice.assert_called_once_with("Run morning check-in.", n4os_root=bot.n4os_root)
+        advice.assert_called_once()
         record.assert_called_once()
         self.assertEqual(claw.requests, [])
-        self.assertEqual(message.replies, ["morning prompt"])
+        self.assertEqual(message.replies[-1], "morning prompt")
 
     async def test_help_me_plan_morning_uses_advice_not_command_help(self):
         claw = FakeClaw()
@@ -2531,15 +4077,15 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         )
         message = FakeMessage("Help me plan tomorrow morning.")
 
-        with patch("telegram_bot.format_n4os_advice", return_value="tomorrow plan") as advice, patch(
+        with patch("telegram_bot.generate_n4os_advice", return_value=advice_result("tomorrow plan")) as advice, patch(
             "telegram_bot.record_n4os_trajectory"
         ) as record:
             await bot.handle_message(FakeUpdate(12345, message), None)
 
-        advice.assert_called_once_with("Help me plan tomorrow morning.", n4os_root=bot.n4os_root)
+        advice.assert_called_once()
         record.assert_called_once()
         self.assertEqual(claw.requests, [])
-        self.assertEqual(message.replies, ["tomorrow plan"])
+        self.assertEqual(message.replies[-1], "tomorrow plan")
 
     async def test_ask_question_stores_trajectory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2555,7 +4101,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             )
             message = FakeMessage("/ask How should I approach Nysha school?")
 
-            with patch("telegram_bot.format_n4os_advice", return_value="school advice"):
+            with patch("telegram_bot.generate_n4os_advice", return_value=advice_result("school advice")):
                 await bot.handle_message(FakeUpdate(12345, message), None)
 
             trajectory_path = next((n4os_root / "trajectories").glob("*.md"))
@@ -2594,9 +4140,78 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         chat.assert_called_once()
         self.assertEqual(claw.requests, [])
-        self.assertEqual(message.replies, ["rich school conversation"])
+        self.assertEqual(message.replies[-1], "rich school conversation")
+        self.assertTrue(message.replies[0].startswith("Knowledge selected"))
+        self.assertTrue(message.replies[1].startswith("Model reasoning summary"))
         self.assertIn("- Mode: chat", trajectory)
         self.assertIn("rich school conversation", trajectory)
+
+    async def test_research_command_shows_web_sources_before_answer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir(parents=True)
+            (n4os_root / "SOUL.md").write_text("Be warm.\n", encoding="utf-8")
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            message = FakeMessage("/research deep current school enrollment guidance")
+            result = N4OSResearchResult(
+                reply="Call the district first [1].",
+                reasoning_summary="Used the current district source and selected N4OS context.",
+                context_labels=["SOUL", "Live web search"],
+                knowledge_preview="Research setup",
+                model="gpt-5.6-sol",
+                mode="deep",
+                reasoning_effort="high",
+                sources=[
+                    N4OSResearchSource(
+                        title="District enrollment",
+                        url="https://district.example/enrollment",
+                    )
+                ],
+            )
+
+            with patch("telegram_bot.generate_n4os_research", return_value=result), patch(
+                "telegram_bot.record_n4os_trajectory"
+            ) as record:
+                await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies[0].splitlines()[0], "Research setup")
+        self.assertIn("gpt-5.6-sol", message.replies[0])
+        self.assertEqual(message.replies[1].splitlines()[0], "Research evidence")
+        self.assertIn("https://district.example/enrollment", message.replies[1])
+        self.assertTrue(message.replies[2].startswith("Model reasoning summary"))
+        self.assertEqual(message.replies[3], "Call the district first [1].")
+        self.assertEqual(record.call_args.kwargs["mode"], "research")
+
+    async def test_research_help_does_not_start_web_research(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/research help")
+
+        with patch("telegram_bot.generate_n4os_research") as research:
+            await bot.handle_message(FakeUpdate(12345, message), None)
+
+        research.assert_not_called()
+        self.assertEqual(message.replies, [RESEARCH_HELP_MESSAGE])
+
+    async def test_help_research_uses_dedicated_research_help(self):
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/help research")
+
+        await bot.handle_help(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [RESEARCH_HELP_MESSAGE])
 
     async def test_chat_followup_continues_active_session(self):
         claw = FakeClaw()
@@ -2619,9 +4234,50 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             await bot.handle_message(FakeUpdate(12345, second), None)
 
         self.assertEqual(chat.call_count, 2)
-        self.assertEqual(first.replies, ["first answer"])
-        self.assertEqual(second.replies, ["second answer"])
+        self.assertEqual(first.replies[-1], "first answer")
+        self.assertEqual(second.replies[-1], "second answer")
         self.assertEqual(claw.requests, [])
+
+    async def test_reply_capture_to_reasoning_saves_linked_tuning_feedback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                FakeClaw(),
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+            question = FakeMessage("/chat How should we approach the first school week?")
+            result = N4OSChatResult(
+                reply="Use a calm first-week plan.",
+                context_labels=["SOUL", "Nysha School Knowledge"],
+                model="gpt-5.4-mini",
+                reasoning_summary="Prioritized current school knowledge over general guidance.",
+            )
+
+            with patch("telegram_bot.format_n4os_chat", return_value=result), patch(
+                "telegram_bot.record_n4os_trajectory"
+            ):
+                await bot.handle_message(FakeUpdate(12345, question), None)
+
+            feedback = FakeMessage(
+                "capture: Room 13 is outdated; prefer School Knowledge.",
+                reply_to_message=question.sent_messages[1],
+            )
+            with patch("telegram_bot.capture_markdown_note") as capture:
+                await bot.handle_message(FakeUpdate(12345, feedback), None)
+
+        capture.assert_called_once()
+        captured_text = capture.call_args.args[0]
+        self.assertIn("Room 13 is outdated", captured_text)
+        self.assertIn("How should we approach the first school week?", captured_text)
+        self.assertIn("SOUL, Nysha School Knowledge", captured_text)
+        self.assertIn("Prioritized current school knowledge", captured_text)
+        self.assertEqual(
+            feedback.replies,
+            ["Captured N4OS tuning feedback with the related answer trace."],
+        )
 
     async def test_active_chat_does_not_capture_mutation_commands(self):
         claw = FakeClaw()
@@ -2690,7 +4346,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             await bot.handle_message(FakeUpdate(12345, message), None)
 
         chat.assert_called_once()
-        self.assertEqual(message.replies, ["chat status reply"])
+        self.assertEqual(message.replies[-1], "chat status reply")
 
     async def test_long_chat_reply_is_chunked(self):
         claw = FakeClaw()
@@ -2724,6 +4380,9 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(claw.requests, [])
         self.assertEqual(message.replies, [HOW_TO_HELP["capture"]])
+        self.assertIn("undo", HOW_TO_HELP["capture"])
+        self.assertIn("fix last capture", HOW_TO_HELP["capture"])
+        self.assertIn('replace "old" with "new"', HOW_TO_HELP["capture"])
 
     async def test_authorized_commands_question_gets_general_help(self):
         claw = FakeClaw()
@@ -2738,6 +4397,68 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(claw.requests, [])
         self.assertEqual(message.replies, [HELP_MESSAGE])
+
+    async def test_help_open_question_uses_ai_answerer_for_session_reset(self):
+        answerer = FakeHelpAnswerer(
+            "To restart the current N4OS session, send /new or /reset.\n"
+            "For rich chat only, send /chat reset."
+        )
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            FakeClaw(),
+            logger=QuietLogger(),
+            help_answerer=answerer,
+        )
+        message = FakeMessage("/help what is command to refresh or restart a session")
+
+        await bot.handle_help(FakeUpdate(12345, message), None)
+
+        self.assertEqual(
+            message.replies,
+            [
+                "To restart the current N4OS session, send /new or /reset.\n"
+                "For rich chat only, send /chat reset."
+            ],
+        )
+        self.assertEqual(answerer.questions, ["what is command to refresh or restart a session"])
+        self.assertNotIn("**", message.replies[0])
+        self.assertNotIn("###", message.replies[0])
+        self.assertNotIn("Loaded:", message.replies[0])
+        self.assertNotIn("n4os/", message.replies[0])
+
+    async def test_natural_help_question_uses_ai_answerer_for_session_reset(self):
+        claw = FakeClaw()
+        answerer = FakeHelpAnswerer("Use /new or /reset to start a new N4OS session.")
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            help_answerer=answerer,
+        )
+        message = FakeMessage("what command restarts a session?")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, ["Use /new or /reset to start a new N4OS session."])
+        self.assertEqual(answerer.questions, ["what command restarts a session?"])
+
+    async def test_ai_help_failure_falls_back_to_general_help(self):
+        claw = FakeClaw()
+        answerer = FakeHelpAnswerer(fail=True)
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+            help_answerer=answerer,
+        )
+        message = FakeMessage("/help what command restarts a session")
+
+        await bot.handle_help(FakeUpdate(12345, message), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(message.replies, [HELP_MESSAGE])
+        self.assertEqual(answerer.questions, ["what command restarts a session"])
 
     async def test_authorized_how_to_before_leaving_portal_gets_direct_help(self):
         claw = FakeClaw()
@@ -3184,6 +4905,116 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Loaded:", HELP_MESSAGE)
         self.assertNotIn("n4os/", HELP_MESSAGE)
 
+    def test_ai_help_catalog_includes_routes_and_session_controls(self):
+        catalog = _build_help_catalog()
+
+        route_commands = catalog["route_commands"]
+        self.assertTrue(
+            any(
+                "/task" in entry["command_aliases"] and "create_task" in entry["actions"]
+                for entry in route_commands
+            )
+        )
+        self.assertIn(
+            {
+                "topic": "session",
+                "commands": ["/new", "/reset", "new session"],
+                "purpose": "Start a new N4OS conversation session and clear current router state.",
+            },
+            catalog["conversation_controls"],
+        )
+
+    def test_openai_help_answerer_payload_contains_catalog(self):
+        captured: dict[str, Any] = {}
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps({"output_text": "Use /new or /reset to start fresh."}).encode(
+                    "utf-8"
+                )
+
+        def fake_urlopen(request: Any, timeout: int) -> FakeResponse:
+            captured["timeout"] = timeout
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        answerer = OpenAIN4OSHelpAnswerer(
+            api_key="test-key",
+            model="test-help-model",
+            timeout_seconds=3,
+            urlopen=fake_urlopen,
+        )
+
+        self.assertEqual(
+            answerer.answer("what command restarts a session?"),
+            "Use /new or /reset to start fresh.",
+        )
+
+        self.assertEqual(captured["timeout"], 3)
+        payload = captured["payload"]
+        self.assertEqual(payload["model"], "test-help-model")
+        user_content = json.loads(payload["input"][1]["content"])
+        self.assertEqual(user_content["question"], "what command restarts a session?")
+        self.assertTrue(
+            any(
+                control["commands"] == ["/new", "/reset", "new session"]
+                for control in user_content["catalog"]["conversation_controls"]
+            )
+        )
+        self.assertTrue(
+            any(
+                "/task" in command["command_aliases"] and "create_task" in command["actions"]
+                for command in user_content["catalog"]["route_commands"]
+            )
+        )
+
+    def test_openai_image_text_extractor_prompt_preserves_schedule_tables(self):
+        captured: dict[str, Any] = {}
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "output_text": (
+                            "School Day Date Time Attendance\n"
+                            "Fremont Fri Sep 18th, 2026 6:00PM Mark absent"
+                        )
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request: Any, timeout: int) -> FakeResponse:
+            del timeout
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
+            image.write(b"calendar image")
+            image.flush()
+            extractor = OpenAIImageTextExtractor(
+                api_key="test-key",
+                model="test-image-model",
+                urlopen=fake_urlopen,
+            )
+
+            self.assertIn("Fremont Fri Sep 18th", extractor.extract_text(Path(image.name)))
+
+        prompt = captured["payload"]["input"][0]["content"][0]["text"]
+        self.assertFalse(captured["payload"]["store"])
+        self.assertIn("calendar, class, appointment, or schedule tables", prompt)
+        self.assertIn("one row per visible scheduled entry", prompt)
+
     async def test_help_command_with_library_topic_gets_library_help(self):
         bot = N4OSTelegramBot(
             TelegramConfig(token="token", allowed_user_id=12345),
@@ -3320,6 +5151,21 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(message.replies, [HOW_TO_HELP["task"]])
         self.assertIn("Noah assistant help", HOW_TO_HELP["task"])
+        self.assertEqual(claw.requests, [])
+
+    async def test_task_slash_help_question_gets_task_help_without_creating_task(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/task help how do I mark a task done")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [HOW_TO_HELP["task"]])
+        self.assertIn("Done: complete task call FUSD", HOW_TO_HELP["task"])
         self.assertEqual(claw.requests, [])
 
     async def test_school_newsletter_slash_help_message_gets_import_help(self):

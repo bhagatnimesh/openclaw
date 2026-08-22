@@ -21,6 +21,7 @@ class FakeCalendarList:
             {
                 "items": [
                     {"id": "primary", "summary": "Family"},
+                    {"id": "nysha-school-short-id", "summary": "Nysha School"},
                     {"id": "nysha-school-id", "summary": "Nysha School Calendar"},
                 ],
             },
@@ -39,12 +40,17 @@ class FakeEvents:
         self.service.update_calls.append(kwargs)
         return FakeExecute({"id": kwargs["eventId"], "summary": kwargs["body"]["summary"]})
 
+    def list(self, **kwargs):
+        self.service.list_calls.append(kwargs)
+        return FakeExecute({"items": []})
+
 
 class FakeCalendarService:
     def __init__(self):
         self.calendar_list_calls = []
         self.insert_calls = []
         self.update_calls = []
+        self.list_calls = []
 
     def calendarList(self):
         return FakeCalendarList(self)
@@ -54,6 +60,59 @@ class FakeCalendarService:
 
 
 class GoogleCalendarProviderUnitTest(unittest.TestCase):
+    def test_list_events_resolves_named_calendar(self):
+        from provider import GoogleCalendarProvider
+
+        calendar = GoogleCalendarProvider.__new__(GoogleCalendarProvider)
+        calendar.calendar_id = "primary"
+        calendar.service = FakeCalendarService()
+
+        calendar.list_events(
+            time_min="2026-08-21T00:00:00-07:00",
+            time_max="2026-08-28T00:00:00-07:00",
+            calendar_name="Nysha School Calendar",
+        )
+
+        self.assertEqual(calendar.service.list_calls[0]["calendarId"], "nysha-school-id")
+        self.assertEqual(
+            calendar.service.calendar_list_calls[0],
+            {"maxResults": 250, "minAccessRole": "reader"},
+        )
+
+    def test_list_events_can_require_writable_named_calendar(self):
+        from provider import GoogleCalendarProvider
+
+        calendar = GoogleCalendarProvider.__new__(GoogleCalendarProvider)
+        calendar.calendar_id = "primary"
+        calendar.service = FakeCalendarService()
+
+        calendar.list_events(
+            time_min="2026-08-21T00:00:00-07:00",
+            time_max="2026-08-28T00:00:00-07:00",
+            calendar_name="Nysha School Calendar",
+            writable=True,
+        )
+
+        self.assertEqual(
+            calendar.service.calendar_list_calls[0],
+            {"maxResults": 250, "minAccessRole": "writer"},
+        )
+
+    def test_list_events_forwards_free_text_query(self):
+        from provider import GoogleCalendarProvider
+
+        calendar = GoogleCalendarProvider.__new__(GoogleCalendarProvider)
+        calendar.calendar_id = "primary"
+        calendar.service = FakeCalendarService()
+
+        calendar.list_events(
+            time_min="2026-08-21T00:00:00-07:00",
+            time_max="2026-08-28T00:00:00-07:00",
+            query="dentist appointment",
+        )
+
+        self.assertEqual(calendar.service.list_calls[0]["q"], "dentist appointment")
+
     def test_create_event_resolves_named_calendar(self):
         from provider import GoogleCalendarProvider
 

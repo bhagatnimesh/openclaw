@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Literal
 from urllib.parse import urlparse
 import urllib.request
 from uuid import uuid4
@@ -68,6 +68,22 @@ class NewsletterTaskCandidate:
 
 
 @dataclass(frozen=True)
+class NewsletterResource:
+    label: str
+    kind: Literal["book", "video", "song", "platform"]
+
+
+@dataclass(frozen=True)
+class NewsletterKnowledge:
+    topics: tuple[str, ...]
+    skills: tuple[str, ...]
+    routines: tuple[str, ...]
+    recommendations: tuple[str, ...]
+    resources: tuple[NewsletterResource, ...]
+    conversation_prompts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class NewsletterParsed:
     child: str
     source_url: str
@@ -81,8 +97,7 @@ class NewsletterParsed:
     homework: tuple[NewsletterHomeworkCandidate, ...]
     calendar: tuple[NewsletterCalendarCandidate, ...]
     tasks: tuple[NewsletterTaskCandidate, ...]
-    learning_context: tuple[str, ...]
-    books: tuple[str, ...]
+    knowledge: NewsletterKnowledge
 
 
 @dataclass(frozen=True)
@@ -330,9 +345,22 @@ class SchoolNewsletterImporter:
 
         preview = pending.preview
         if preview.existing_import is not None and preview.existing_import.get("status") == "saved":
+            changes: dict[str, list[str]] = {"knowledge": [], "observations": []}
+            changes["knowledge"].extend(self._save_school_knowledge(preview.parsed))
+            audit = self._save_audit_record(preview.parsed)
+            if audit:
+                changes["observations"].append(audit)
+            saved = _merge_saved_results(preview.existing_import.get("saved_json"), changes)
+            self.store.upsert(preview.parsed, saved=saved, status="saved")
             self.pending.pop(key, None)
-            return NewsletterSaveResult("Saved school newsletter updates.\nNo new items were added.", {})
-        saved: dict[str, list[str]] = {"homework": [], "calendar": [], "tasks": [], "observations": []}
+            return NewsletterSaveResult(_format_save_result(changes), changes)
+        saved: dict[str, list[str]] = {
+            "homework": [],
+            "calendar": [],
+            "tasks": [],
+            "knowledge": [],
+            "observations": [],
+        }
         for candidate, match in zip(preview.parsed.homework, preview.homework_matches):
             label = self._save_homework(candidate, match, preview.parsed)
             if label:
@@ -346,9 +374,10 @@ class SchoolNewsletterImporter:
             label = self._save_task(candidate, match, preview.parsed)
             if label:
                 saved["tasks"].append(label)
-        observation = self._save_observation(preview.parsed)
-        if observation:
-            saved["observations"].append(observation)
+        saved["knowledge"].extend(self._save_school_knowledge(preview.parsed))
+        audit = self._save_audit_record(preview.parsed)
+        if audit:
+            saved["observations"].append(audit)
         self.store.upsert(preview.parsed, saved=saved, status="saved")
         self.pending.pop(key, None)
         return NewsletterSaveResult(_format_save_result(saved), saved)
@@ -541,7 +570,45 @@ class SchoolNewsletterImporter:
             return f"created {candidate.title}"
         return None
 
-    def _save_observation(self, parsed: NewsletterParsed) -> str | None:
+    def _save_school_knowledge(self, parsed: NewsletterParsed) -> list[str]:
+        year = _school_year(parsed.newsletter_date)
+        base = self.n4os_root / "school" / parsed.child / year
+        source = f"{parsed.title} ({parsed.source_url})"
+        sections = (
+            (
+                base / "School Knowledge.md",
+                "n4os/school/knowledge",
+                "School Knowledge",
+                _knowledge_section(parsed, source=source),
+            ),
+            (
+                base / "Curriculum Map.md",
+                "n4os/school/curriculum",
+                f"{parsed.child} Curriculum Map",
+                _curriculum_section(parsed, source=source),
+            ),
+            (
+                base / "Resources.md",
+                "n4os/school/resources",
+                f"{parsed.child} School Resources",
+                _resources_section(parsed, source=source),
+            ),
+            (
+                base / "Conversation Starters.md",
+                "n4os/school/conversations",
+                f"{parsed.child} Conversation Starters",
+                _conversation_section(parsed, source=source),
+            ),
+        )
+        saved: list[str] = []
+        for path, tag, title, section in sections:
+            if not section:
+                continue
+            if _write_newsletter_section(path, tag=tag, title=title, parsed=parsed, section=section):
+                saved.append(_relative_n4os_path(path, self.n4os_root))
+        return saved
+
+    def _save_audit_record(self, parsed: NewsletterParsed) -> str | None:
         observations_dir = self.n4os_root / "family" / "observations"
         observations_dir.mkdir(parents=True, exist_ok=True)
         month = parsed.newsletter_date[:7]
@@ -555,14 +622,9 @@ class SchoolNewsletterImporter:
             marker,
             f"## {parsed.newsletter_date} School Newsletter - {parsed.child}",
             "",
-            f"- Source: {parsed.title} ({parsed.source_url})",
+            f"- School newsletter imported: {parsed.title} ({parsed.source_url})",
+            f"- Structured knowledge: school/{parsed.child}/{_school_year(parsed.newsletter_date)}/",
         ]
-        if parsed.teacher:
-            lines.append(f"- Teacher/class: {parsed.teacher}")
-        for item in parsed.learning_context:
-            lines.append(f"- School context: {item}")
-        if parsed.books:
-            lines.append(f"- Books/videos mentioned: {', '.join(parsed.books)}")
         path.write_text(existing.rstrip() + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
         try:
             return path.relative_to(ROOT).as_posix()
@@ -594,8 +656,7 @@ def parse_newsletter_text(text: str, *, child: str, source_url: str) -> Newslett
     homework = _parse_homework(cleaned_text, child=child, newsletter_date=newsletter_date, source_url=source_url)
     calendar = _parse_calendar(cleaned_text, newsletter_date=newsletter_date)
     tasks = _parse_tasks(cleaned_text, newsletter_date=newsletter_date)
-    learning_context = _parse_learning_context(cleaned_text)
-    books = _parse_books(cleaned_text)
+    knowledge = _parse_newsletter_knowledge(cleaned_text)
     return NewsletterParsed(
         child=child,
         source_url=source_url,
@@ -609,8 +670,7 @@ def parse_newsletter_text(text: str, *, child: str, source_url: str) -> Newslett
         homework=tuple(homework),
         calendar=tuple(calendar),
         tasks=tuple(tasks),
-        learning_context=tuple(learning_context),
-        books=tuple(books),
+        knowledge=knowledge,
     )
 
 
@@ -626,20 +686,35 @@ def format_newsletter_preview(preview: NewsletterPreview) -> str:
     _add_preview_group(lines, "Homework", preview.homework_matches)
     _add_preview_group(lines, "Calendar", preview.calendar_matches)
     _add_preview_group(lines, "Reminders", preview.task_matches)
-    if parsed.learning_context:
+    if parsed.knowledge.topics:
         lines.append("Learning/focus:")
-        lines.extend([f"- {item}" for item in parsed.learning_context[:6]])
+        lines.extend([f"- {item}" for item in parsed.knowledge.topics[:10]])
         lines.append("")
-    if parsed.books:
-        lines.append("Books/videos:")
-        lines.extend([f"- {item}" for item in parsed.books[:8]])
+    _add_text_group(lines, "Skills", parsed.knowledge.skills, limit=8)
+    _add_text_group(lines, "Classroom routines", parsed.knowledge.routines, limit=6)
+    if parsed.knowledge.resources:
+        lines.append("Books/media/resources:")
+        lines.extend([f"- {item.kind.title()}: {item.label}" for item in parsed.knowledge.resources[:10]])
         lines.append("")
+    if parsed.knowledge.recommendations:
+        lines.append("Optional routines (saved as context, not created as tasks):")
+        lines.extend([f"- {item}" for item in parsed.knowledge.recommendations[:6]])
+        lines.append("")
+    _add_text_group(lines, "Conversation prompts", parsed.knowledge.conversation_prompts, limit=5)
     if preview.warnings:
         lines.append("Could not fully check:")
         lines.extend([f"- {warning}" for warning in preview.warnings])
         lines.append("")
     lines.append("Reply `save` to add only new/enrichment items, or `cancel`.")
     return "\n".join(lines).strip()
+
+
+def _add_text_group(lines: list[str], title: str, items: tuple[str, ...], *, limit: int) -> None:
+    if not items:
+        return
+    lines.append(f"{title}:")
+    lines.extend([f"- {item}" for item in items[:limit]])
+    lines.append("")
 
 
 def _add_preview_group(lines: list[str], title: str, matches: tuple[MatchResult, ...]) -> None:
@@ -665,7 +740,8 @@ def _format_save_result(saved: dict[str, list[str]]) -> str:
         ("Homework", saved.get("homework", [])),
         ("Calendar", saved.get("calendar", [])),
         ("Tasks", saved.get("tasks", [])),
-        ("Observations", saved.get("observations", [])),
+        ("School knowledge", saved.get("knowledge", [])),
+        ("Import audit", saved.get("observations", [])),
     ):
         if items:
             lines.append(f"{label}:")
@@ -673,6 +749,145 @@ def _format_save_result(saved: dict[str, list[str]]) -> str:
     if len(lines) == 1:
         lines.append("No new items were added.")
     return "\n".join(lines)
+
+
+def _merge_saved_results(raw_saved: object, changes: dict[str, list[str]]) -> dict[str, list[str]]:
+    try:
+        decoded = json.loads(str(raw_saved or "{}"))
+    except (TypeError, ValueError):
+        decoded = {}
+    saved = {
+        str(key): [str(item) for item in value]
+        for key, value in decoded.items()
+        if isinstance(key, str) and isinstance(value, list)
+    }
+    for key, items in changes.items():
+        saved[key] = list(dict.fromkeys([*saved.get(key, []), *items]))
+    return saved
+
+
+def _school_year(newsletter_date: str) -> str:
+    parsed = Date.fromisoformat(newsletter_date)
+    start = parsed.year if parsed.month >= 7 else parsed.year - 1
+    return f"{start}-{start + 1}"
+
+
+def _knowledge_section(parsed: NewsletterParsed, *, source: str) -> str:
+    knowledge = parsed.knowledge
+    groups = (
+        ("Current Topics", knowledge.topics),
+        ("Current Skills", knowledge.skills),
+        ("Classroom Routines", knowledge.routines),
+        ("At-Home Recommendations", knowledge.recommendations),
+    )
+    return _newsletter_section_body(parsed, source=source, groups=groups)
+
+
+def _curriculum_section(parsed: NewsletterParsed, *, source: str) -> str:
+    groups = (
+        ("Topics", parsed.knowledge.topics),
+        ("Skills", parsed.knowledge.skills),
+    )
+    return _newsletter_section_body(parsed, source=source, groups=groups)
+
+
+def _resources_section(parsed: NewsletterParsed, *, source: str) -> str:
+    resources = tuple(f"{item.kind.title()}: {item.label}" for item in parsed.knowledge.resources)
+    groups = (
+        ("Books, Media, And Platforms", resources),
+        ("Practice Recommendations", parsed.knowledge.recommendations),
+    )
+    return _newsletter_section_body(parsed, source=source, groups=groups)
+
+
+def _conversation_section(parsed: NewsletterParsed, *, source: str) -> str:
+    groups = (("Source-Backed Prompts", parsed.knowledge.conversation_prompts),)
+    return _newsletter_section_body(parsed, source=source, groups=groups)
+
+
+def _newsletter_section_body(
+    parsed: NewsletterParsed,
+    *,
+    source: str,
+    groups: tuple[tuple[str, tuple[str, ...]], ...],
+) -> str:
+    populated = [(heading, items) for heading, items in groups if items]
+    if not populated:
+        return ""
+    lines = [f"### {parsed.newsletter_date} - {parsed.title}", "", f"- {source}"]
+    if parsed.teacher:
+        lines.append(f"- Teacher/class: {parsed.teacher}")
+    for heading, items in populated:
+        lines.extend(["", f"#### {heading}", "", *(f"- {item}" for item in items)])
+    return "\n".join(lines)
+
+
+def _write_newsletter_section(
+    path: Path,
+    *,
+    tag: str,
+    title: str,
+    parsed: NewsletterParsed,
+    section: str,
+) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else _school_note_header(tag=tag, title=title)
+    marker = f"n4os-school-newsletter:{parsed.content_fingerprint}"
+    start_marker = f"<!-- {marker}:start -->"
+    end_marker = f"<!-- {marker}:end -->"
+    block = f"{start_marker}\n{section.strip()}\n{end_marker}"
+    without_existing = _remove_marked_block(existing, start_marker=start_marker, end_marker=end_marker)
+    updated = _insert_newsletter_block(without_existing, block)
+    if updated == existing:
+        return False
+    path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def _school_note_header(*, tag: str, title: str) -> str:
+    return "\n".join(
+        [
+            "---",
+            "tags:",
+            f'  - "{tag}"',
+            "links:",
+            '  - "[[README|N4OS]]"',
+            "---",
+            "",
+            f"# {title}",
+            "",
+        ]
+    )
+
+
+def _remove_marked_block(existing: str, *, start_marker: str, end_marker: str) -> str:
+    start = existing.find(start_marker)
+    if start < 0:
+        return existing
+    end = existing.find(end_marker, start + len(start_marker))
+    if end < 0:
+        return existing
+    end += len(end_marker)
+    return (existing[:start].rstrip() + "\n\n" + existing[end:].lstrip()).rstrip() + "\n"
+
+
+def _insert_newsletter_block(existing: str, block: str) -> str:
+    heading = "## Newsletter Updates"
+    if heading in existing:
+        position = existing.index(heading) + len(heading)
+        return (existing[:position].rstrip() + "\n\n" + block + "\n\n" + existing[position:].lstrip()).rstrip() + "\n"
+    title_match = re.search(r"(?m)^# .+$", existing)
+    if title_match is None:
+        return (existing.rstrip() + f"\n\n{heading}\n\n{block}\n").lstrip()
+    position = title_match.end()
+    return (existing[:position].rstrip() + f"\n\n{heading}\n\n{block}\n\n" + existing[position:].lstrip()).rstrip() + "\n"
+
+
+def _relative_n4os_path(path: Path, n4os_root: Path) -> str:
+    try:
+        return path.relative_to(n4os_root).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _fetch_google_slides_text(source_url: str) -> str:
@@ -851,14 +1066,99 @@ def _parse_tasks(text: str, *, newsletter_date: str) -> list[NewsletterTaskCandi
     return tasks
 
 
+def _parse_newsletter_knowledge(text: str) -> NewsletterKnowledge:
+    topics = tuple(_parse_learning_context(text))
+    skills = tuple(_labels_for_rules(text, _SKILL_RULES))
+    routines = tuple(_labels_for_rules(text, _ROUTINE_RULES))
+    recommendations = tuple(_labels_for_rules(text, _RECOMMENDATION_RULES))
+    resources = tuple(_parse_resources(text))
+    prompts = tuple(_conversation_prompts(topics, skills, routines, resources))
+    return NewsletterKnowledge(
+        topics=topics,
+        skills=skills,
+        routines=routines,
+        recommendations=recommendations,
+        resources=resources,
+        conversation_prompts=prompts,
+    )
+
+
+def _labels_for_rules(text: str, rules: tuple[tuple[str, str], ...]) -> list[str]:
+    return [label for label, pattern in rules if re.search(pattern, text, re.IGNORECASE | re.DOTALL)]
+
+
+_SKILL_RULES = (
+    (
+        "Phonics: visual and blending drills; short vowel sounds a, e, and i",
+        r"phonics drills.+?short vowel sounds?\s+a,\s*e,\s*and\s*i",
+    ),
+    (
+        "Poetry: concrete poems and speaking with a clear presentation voice",
+        r"presentation voice|concrete poem",
+    ),
+    (
+        "Math: place value; standard, expanded, and word form; even and odd",
+        r"place value.+?standard form.+?expanded form.+?word form",
+    ),
+    (
+        "Math: money notation, 100-grid patterns, tens partners, and Math Mountains",
+        r"writing money.+?(?:100 grid|tens partners|Math Mountains)",
+    ),
+    (
+        "Art: self-portraits, color theory, art elements, and types of lines",
+        r"self portraits|elements of art|color wheel",
+    ),
+)
+
+_ROUTINE_RULES = (
+    (
+        "Morning circle meetings support emotional check-ins, sharing, and public speaking",
+        r"circle meeting.+?(?:feeling|share|public speaking)",
+    ),
+    (
+        "The class practices a poem or song weekly and presents it on Fridays",
+        r"every week.+?(?:poem|song).+?on Fridays.+?present",
+    ),
+)
+
+_RECOMMENDATION_RULES = (
+    (
+        "LEXIA recommends about 40 minutes of practice per week at home or school",
+        r"LEXIA recommends about 40 minutes of practice per week",
+    ),
+)
+
+
 def _parse_learning_context(text: str) -> list[str]:
     context = []
     rules = (
         ("Classroom community and respectful communication", r"classroom community|communicate respectfully"),
         ("PBIS behavior expectations and playground rules", r"PBIS|Playground Rules"),
         ("Growth mindset and perseverance", r"growth mindset|persevere"),
-        ("Language arts: sentence editing, grammar, nouns, compound words", r"Language Arts.+?compound words"),
+        (
+            "Social-emotional check-ins, friendship, and calming strategies",
+            r"circle meeting|positive qualities of a friend|belly breathing|strong emotions",
+        ),
+        (
+            "Character: responsibility, honesty, integrity, and decision-making",
+            r"importance of honesty and integrity|learns how to be responsible|plan ahead and make good decisions",
+        ),
+        (
+            "Language arts: grammar, phonics, and short vowel sounds",
+            r"Language Arts.+?(?:compound words|phonics|short vowel)",
+        ),
+        (
+            "Poetry and public speaking",
+            r"present the poem|presentation voice|concrete poem",
+        ),
         ("Math: place value, base 10 patterns, even and odd", r"Place Value|base 10|even and odd"),
+        (
+            "Math: number forms, money, number-grid patterns, and Math Mountains",
+            r"standard form.+?expanded form|writing money|100 grid|Math Mountains",
+        ),
+        ("LEXIA English-language practice", r"LEXIA diagnostic|LEXIA lessons"),
+        ("School safety and fire-drill procedures", r"fire drill"),
+        ("Art: self-portraits, color theory, and line", r"self portraits|elements of art|color wheel"),
         ("Fine motor and listening practice through directed drawing", r"fine motor skills|following directions"),
     )
     for label, pattern in rules:
@@ -869,20 +1169,76 @@ def _parse_learning_context(text: str) -> list[str]:
 
 def _parse_books(text: str) -> list[str]:
     books: list[str] = []
-    patterns = (
-        r"Our Class is a Family",
-        r"Chrysanthemum by Kevin Henkes",
-        r"Tacky the Penguin by Helen Lester",
-        r"Chester.s Way by Kevin Henkes",
-        r"Owen by Kevin Henkes",
-        r"A Letter From Your Teacher by Shannon Olsen",
-        r"The Dot",
+    sentence_patterns = (
+        r"(?:^|[.!?]\s+)(?:On\s+\w+\s+|Today\s+)?we read\s+(?P<title>[^.!?\n]+)",
+        r"(?:^|[.!?]\s+)I read aloud (?:a book called\s+)?(?P<title>[^.!?\n]+)",
     )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            books.append(match.group(0).replace("Chester’s", "Chester's"))
+    read_aloud_pattern = re.compile(
+        r"(?:^|[.!?]\s+)(?P<title>[A-Z][^.!?\n|]{1,100}?)(?:\s*\|\s*Kids Book)?\s+Read Aloud\b",
+        re.IGNORECASE,
+    )
+
+    for line in text.splitlines():
+        for pattern in sentence_patterns:
+            for match in re.finditer(pattern, line, re.IGNORECASE):
+                title = _clean_book_title(match.group("title"))
+                if title:
+                    books.append(title)
+        for match in read_aloud_pattern.finditer(line):
+            title = _clean_book_title(match.group("title"))
+            if title:
+                books.append(title)
+
     return list(dict.fromkeys(books))
+
+
+def _parse_resources(text: str) -> list[NewsletterResource]:
+    resources = [NewsletterResource(label=title, kind="book") for title in _parse_books(text)]
+    for match in re.finditer(r"\bwatched (?:a|an|the) (?P<label>[A-Z][A-Za-z0-9 '&-]{1,80}?) video\b", text):
+        resources.append(NewsletterResource(label=match.group("label").strip(), kind="video"))
+    for line in text.splitlines():
+        song = re.fullmatch(r"(?P<label>[A-Z][^.!?\n]{1,100}\bSong(?:\s*\([^)]+\))?)", line.strip())
+        if song:
+            resources.append(NewsletterResource(label=song.group("label"), kind="song"))
+    for platform in ("LEXIA", "IXL", "iReady", "Typing.com"):
+        if re.search(rf"\b{re.escape(platform)}\b", text, re.IGNORECASE):
+            resources.append(NewsletterResource(label=platform, kind="platform"))
+    unique: dict[tuple[str, str], NewsletterResource] = {}
+    for resource in resources:
+        unique.setdefault((resource.kind.casefold(), resource.label.casefold()), resource)
+    return list(unique.values())
+
+
+def _conversation_prompts(
+    topics: tuple[str, ...],
+    skills: tuple[str, ...],
+    routines: tuple[str, ...],
+    resources: tuple[NewsletterResource, ...],
+) -> list[str]:
+    prompts: list[str] = []
+    books = [resource.label for resource in resources if resource.kind == "book"]
+    if books:
+        prompts.append(f"What do you remember about {books[0]}?")
+    joined = " ".join((*topics, *skills, *routines)).casefold()
+    candidates = (
+        ("circle meeting", "What did someone share during circle meeting?"),
+        ("honesty", "Which choice showed kindness, honesty, or responsibility this week?"),
+        ("standard, expanded", "Can you show one number in standard, expanded, and word form?"),
+        ("presentation voice", "What helped you use a clear presentation voice?"),
+        ("color theory", "Which colors or types of lines did you use in art?"),
+    )
+    prompts.extend(prompt for cue, prompt in candidates if cue in joined)
+    return list(dict.fromkeys(prompts))[:5]
+
+
+def _clean_book_title(value: str) -> str | None:
+    title = " ".join(value.strip(" “”\"'|:-").split())
+    if not title or len(title.split()) > 14:
+        return None
+    # Newsletter prose such as "we read phonics poems" is not a named work.
+    if not title[0].isupper():
+        return None
+    return title.replace("’", "'")
 
 
 def _section_after(text: str, start: int, *, stop_headings: tuple[str, ...]) -> str | None:
@@ -1182,6 +1538,12 @@ def _parsed_payload(parsed: NewsletterParsed) -> dict[str, Any]:
         "homework": [item.__dict__ for item in parsed.homework],
         "calendar": [item.__dict__ for item in parsed.calendar],
         "tasks": [item.__dict__ for item in parsed.tasks],
-        "learning_context": list(parsed.learning_context),
-        "books": list(parsed.books),
+        "knowledge": {
+            "topics": list(parsed.knowledge.topics),
+            "skills": list(parsed.knowledge.skills),
+            "routines": list(parsed.knowledge.routines),
+            "recommendations": list(parsed.knowledge.recommendations),
+            "resources": [item.__dict__ for item in parsed.knowledge.resources],
+            "conversation_prompts": list(parsed.knowledge.conversation_prompts),
+        },
     }

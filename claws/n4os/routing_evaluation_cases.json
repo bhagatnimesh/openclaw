@@ -27,5 +27,7 @@
   {"case_id":"holdout-library-checkout","utterance":"Add library checkout due August 1 with two books","expected_route":"library","expected_action":"record_checkout","modality":"natural","split":"holdout","origin":"history_redacted"},
   {"case_id":"holdout-calendar-multiline","utterance":"Add events to pay driver for below days\n10/1\n12/1\n2/1\n4/1","expected_route":"calendar","expected_action":"create_event","modality":"natural","split":"holdout","origin":"history_redacted"},
   {"case_id":"holdout-task-assistant","utterance":"Run Noah assistant help","expected_route":"tasks","expected_action":"run_assistant_help","modality":"natural","split":"holdout","origin":"history_redacted"},
-  {"case_id":"holdout-home-timed","utterance":"Add to home board give the bag to a family member tomorrow at 9 AM","expected_route":"home_board","expected_action":"add_item","modality":"natural","split":"holdout","origin":"history_redacted"}
+  {"case_id":"holdout-home-timed","utterance":"Add to home board give the bag to a family member tomorrow at 9 AM","expected_route":"home_board","expected_action":"add_item","modality":"natural","split":"holdout","origin":"history_redacted"},
+  {"case_id":"telegram-task-mark-done","utterance":"Task mark done pay PAMF","expected_route":"tasks","expected_action":"complete_task","modality":"natural","split":"development","origin":"telegram_regression"},
+  {"case_id":"natural-create-plan-as-task","utterance":"create a plan as a task","expected_route":"tasks","expected_action":"create_task","modality":"natural","split":"development","origin":"telegram_regression"}
 ]

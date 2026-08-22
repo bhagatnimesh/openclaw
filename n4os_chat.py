@@ -15,9 +15,12 @@ from n4os_advice import (
     OPENAI_RESPONSES_URL,
     _build_context,
     _collapse_excess_blank_lines,
-    _extract_response_text,
+    _extract_reasoning_summary,
+    _extract_transparent_response,
     _strip_basic_markdown,
     context_labels_from_context,
+    format_n4os_knowledge_preview,
+    N4OS_TRANSPARENT_RESPONSE_FORMAT,
 )
 
 
@@ -53,6 +56,8 @@ class N4OSChatResult:
     reply: str
     context_labels: list[str]
     model: str | None
+    reasoning_summary: str = ""
+    knowledge_preview: str = ""
 
 
 class N4OSChatSessionStore:
@@ -133,27 +138,37 @@ def format_n4os_chat(
     request: str,
     *,
     history: list[N4OSChatTurn] | None = None,
+    context: dict[str, Any] | None = None,
     n4os_root: Path = DEFAULT_N4OS_ROOT,
     api_key: str | None = None,
     model: str | None = None,
     urlopen: UrlOpen = urllib.request.urlopen,
 ) -> N4OSChatResult:
     cleaned_request = strip_n4os_chat_prefix(request)
-    context = _build_context(cleaned_request, n4os_root)
-    labels = context_labels_from_context(context)
+    prepared_context = context if context is not None else _build_context(cleaned_request, n4os_root)
+    prepared_history = history or []
+    labels = context_labels_from_context(prepared_context)
+    knowledge_preview = format_n4os_knowledge_preview(
+        prepared_context,
+        history_turns=len(prepared_history),
+    )
     resolved_model = (model or os.environ.get("N4OS_ADVICE_MODEL") or DEFAULT_CHAT_MODEL).strip()
     resolved_key = (api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", "")).strip()
     if not resolved_key:
         return N4OSChatResult(
             reply=RICH_CHAT_SETUP_MESSAGE,
             context_labels=labels,
-            model=resolved_model,
+            model=None,
+            reasoning_summary="The model was not called because OPENAI_API_KEY is not configured.",
+            knowledge_preview=knowledge_preview,
         )
 
     body = {
         "model": resolved_model,
         "store": False,
         "max_output_tokens": 1600,
+        "reasoning": {"summary": "concise"},
+        "text": {"format": N4OS_TRANSPARENT_RESPONSE_FORMAT},
         "input": [
             {
                 "role": "system",
@@ -165,7 +180,9 @@ def format_n4os_chat(
                     "Write plain text: no Markdown headings, no bold markers, no raw file paths, and no "
                     "links unless the user asks. For family memory, use current-pattern wording, not fixed "
                     "identity claims. End with 1-2 genuine follow-up questions when the topic would benefit "
-                    "from continued conversation."
+                    "from continued conversation. Return a concise reasoning_summary as 2-4 short "
+                    "newline-separated statements that name the relevant signals, assumptions, and why they "
+                    "support the answer. This is a high-level decision rationale, not hidden chain-of-thought."
                 ),
             },
             {
@@ -173,8 +190,8 @@ def format_n4os_chat(
                 "content": json.dumps(
                     {
                         "question": cleaned_request,
-                        "memory": context,
-                        "history": _history_payload(history or []),
+                        "memory": prepared_context,
+                        "history": _history_payload(prepared_history),
                         "format": "rich Telegram conversation",
                     },
                     sort_keys=True,
@@ -202,15 +219,23 @@ def format_n4os_chat(
             ),
             context_labels=labels,
             model=resolved_model,
+            reasoning_summary="The model request failed before a reasoning summary was available.",
+            knowledge_preview=knowledge_preview,
         )
 
-    text = _extract_response_text(payload)
+    text, disclosed_summary = _extract_transparent_response(payload)
     if not text:
         text = "I did not get a useful model response. Try again with the same topic."
     return N4OSChatResult(
         reply=_normalize_chat_output(text),
         context_labels=labels,
         model=resolved_model,
+        reasoning_summary=(
+            _extract_reasoning_summary(payload)
+            or disclosed_summary
+            or "The model did not return a reasoning summary."
+        ),
+        knowledge_preview=knowledge_preview,
     )
 
 

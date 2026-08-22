@@ -27,6 +27,7 @@ class N4OSChatTest(unittest.TestCase):
         self.assertIn("needs OPENAI_API_KEY", result.reply)
         self.assertIn("SOUL", result.context_labels)
         self.assertIn("Nysha", result.context_labels)
+        self.assertIsNone(result.model)
 
     def test_openai_chat_payload_includes_history_and_memory(self):
         class Response:
@@ -39,10 +40,26 @@ class N4OSChatTest(unittest.TestCase):
             def read(self):
                 return json.dumps(
                     {
-                        "output_text": (
-                            "**Start gently.** Use practice, teacher partnership, and one small "
-                            "confidence bridge.\n\nWhat feels hardest right now?"
-                        )
+                        "output_text": json.dumps(
+                            {
+                                "reasoning_summary": "Used current school and chat signals.",
+                                "answer": (
+                                    "**Start gently.** Use practice, teacher partnership, and one small "
+                                    "confidence bridge.\n\nWhat feels hardest right now?"
+                                ),
+                            }
+                        ),
+                        "output": [
+                            {
+                                "type": "reasoning",
+                                "summary": [
+                                    {
+                                        "type": "summary_text",
+                                        "text": "Connected the current question to recent history.",
+                                    }
+                                ],
+                            }
+                        ],
                     }
                 ).encode("utf-8")
 
@@ -74,6 +91,16 @@ class N4OSChatTest(unittest.TestCase):
         self.assertIn("n4os/SOUL.md", memory_paths)
         self.assertIn("n4os/family/Nysha.md", memory_paths)
         self.assertGreater(seen_body["payload"]["max_output_tokens"], 420)
+        self.assertEqual(seen_body["payload"]["reasoning"], {"summary": "concise"})
+        self.assertEqual(
+            seen_body["payload"]["text"]["format"]["type"],
+            "json_schema",
+        )
+        self.assertEqual(
+            result.reasoning_summary,
+            "Connected the current question to recent history.",
+        )
+        self.assertIn("Chat history: 1 turn", result.knowledge_preview)
 
     def test_session_store_expires_old_history(self):
         store = N4OSChatSessionStore(ttl=timedelta(minutes=10))

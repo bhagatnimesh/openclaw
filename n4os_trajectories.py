@@ -23,6 +23,8 @@ class N4OSTrajectoryRecord:
     context_labels: list[str]
     summary: str
     model: str | None = None
+    knowledge_preview: str | None = None
+    reasoning_summary: str | None = None
 
 
 def record_n4os_trajectory(
@@ -36,6 +38,8 @@ def record_n4os_trajectory(
     n4os_root: Path = DEFAULT_N4OS_ROOT,
     captured_at: datetime | None = None,
     model: str | None = None,
+    knowledge_preview: str | None = None,
+    reasoning_summary: str | None = None,
 ) -> N4OSTrajectoryRecord:
     record = N4OSTrajectoryRecord(
         captured_at=captured_at or datetime.now(),
@@ -46,6 +50,8 @@ def record_n4os_trajectory(
         context_labels=_dedupe_labels(context_labels),
         summary=_summarize(summary or assistant_text),
         model=_clean_inline(model) or None,
+        knowledge_preview=_limit_block(knowledge_preview or "") or None,
+        reasoning_summary=_limit_block(reasoning_summary or "") or None,
     )
     _append_trajectory(n4os_root / "trajectories", record)
     return record
@@ -181,6 +187,25 @@ def _trajectory_block(record: N4OSTrajectoryRecord) -> str:
     topics = _topic_labels(" ".join([record.user_text, record.assistant_text, record.summary]))
     labels = ", ".join(record.context_labels) if record.context_labels else "None"
     model = record.model or "unknown"
+    trace_sections: list[str] = []
+    if record.knowledge_preview:
+        trace_sections.extend(
+            [
+                "Knowledge selected:",
+                "",
+                indent(record.knowledge_preview, "  "),
+                "",
+            ]
+        )
+    if record.reasoning_summary:
+        trace_sections.extend(
+            [
+                "Reasoning summary:",
+                "",
+                indent(record.reasoning_summary, "  "),
+                "",
+            ]
+        )
     return "\n".join(
         [
             f"## {record.captured_at.isoformat(timespec='seconds')}",
@@ -196,6 +221,7 @@ def _trajectory_block(record: N4OSTrajectoryRecord) -> str:
             "",
             indent(_limit_block(record.user_text), "  "),
             "",
+            *trace_sections,
             "Assistant:",
             "",
             indent(_limit_block(record.assistant_text), "  "),

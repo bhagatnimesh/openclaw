@@ -71,12 +71,12 @@ class FailingExtractor:
 
 
 class TaskParsingExperimentTest(unittest.TestCase):
-    def test_task_corpus_has_thirty_scored_examples(self):
+    def test_task_corpus_has_expected_scored_examples(self):
         cases = load_task_cases()
         task_cases = [case for case in cases if case.expected_route == "tasks"]
         negative_controls = [case for case in cases if case.expected_route != "tasks"]
 
-        self.assertEqual(len(task_cases), 30)
+        self.assertEqual(len(task_cases), 32)
         self.assertGreaterEqual(len(negative_controls), 3)
         self.assertTrue(all(case.scored for case in cases))
 

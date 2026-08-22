@@ -1955,111 +1955,6 @@ main > .section:first-of-type {
   opacity: 0.88;
 }
 
-.bedtime-panel {
-  background: linear-gradient(135deg, #fff 0%, #f1fbf9 54%, #fff3eb 100%);
-}
-
-.bedtime-panel .panel-header {
-  align-items: flex-start;
-}
-
-.bedtime-panel .panel-header h3 {
-  margin-top: 2px;
-}
-
-.bedtime-hero {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 12px 0;
-  padding: 12px 14px;
-  border: 1px solid rgba(0, 106, 100, 0.2);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.74);
-}
-
-.bedtime-hero strong {
-  color: var(--secondary);
-  font-size: 22px;
-  line-height: 1.1;
-}
-
-.bedtime-hero span {
-  color: var(--muted);
-  font-size: 14px;
-  font-weight: 800;
-}
-
-.bedtime-steps {
-  display: grid;
-  gap: 10px;
-}
-
-.bedtime-step {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: center;
-  padding: 12px;
-  border: 1px solid rgba(226, 191, 176, 0.9);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.82);
-}
-
-.bedtime-step.is-active {
-  border-color: var(--primary-pop);
-  background: var(--warning-soft);
-  box-shadow: inset 4px 0 0 var(--primary-pop);
-}
-
-.bedtime-step.is-acked {
-  border-color: rgba(0, 106, 100, 0.32);
-  background: var(--secondary-pale);
-}
-
-.bedtime-time {
-  display: inline-flex;
-  min-width: 70px;
-  margin-right: 8px;
-  color: var(--primary);
-  font-size: 13px;
-  font-weight: 900;
-}
-
-.bedtime-step strong {
-  font-size: 16px;
-}
-
-.bedtime-step p {
-  margin: 5px 0 0;
-  color: var(--muted);
-  font-size: 14px;
-  line-height: 1.35;
-}
-
-.bedtime-ack-button {
-  min-width: 86px;
-  min-height: 42px;
-  border: 1px solid var(--secondary);
-  border-radius: 6px;
-  padding: 8px 12px;
-  background: var(--secondary);
-  color: #fff;
-  font: inherit;
-  font-size: 14px;
-  font-weight: 850;
-  cursor: pointer;
-}
-
-.bedtime-ack-button:disabled {
-  border-color: rgba(0, 106, 100, 0.24);
-  background: rgba(0, 106, 100, 0.16);
-  color: var(--secondary);
-  cursor: default;
-}
-
 .timeline-panel {
   background: var(--card);
 }
@@ -2459,6 +2354,8 @@ main > .section:first-of-type {
 
 .homework-item {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
   min-height: 76px;
   align-items: center;
   padding: 14px 16px;
@@ -2488,6 +2385,13 @@ main > .section:first-of-type {
   font-size: 18px;
   font-weight: 900;
   line-height: 1.2;
+}
+
+@media (max-width: 680px) {
+  .homework-item {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: start;
+  }
 }
 
 .homework-class-chip {

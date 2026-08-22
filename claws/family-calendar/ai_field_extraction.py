@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+import base64
 import json
+import mimetypes
 import os
+from pathlib import Path
 import re
 from typing import Any, Callable
 import urllib.request
@@ -57,6 +60,105 @@ VALID_GUEST_ALIASES = {
 UrlOpen = Callable[..., Any]
 
 
+CALENDAR_AI_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "operation": {
+            "type": "string",
+            "enum": sorted(VALID_ACTIONS),
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "calendar": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "name": {"type": ["string", "null"]},
+                "id_hint": {"type": ["string", "null"]},
+            },
+            "required": ["name", "id_hint"],
+        },
+        "event": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "location": {"type": ["string", "null"]},
+                "start": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "dateTime": {"type": ["string", "null"]},
+                        "date": {"type": ["string", "null"]},
+                        "timeZone": {"type": ["string", "null"]},
+                    },
+                    "required": ["dateTime", "date", "timeZone"],
+                },
+                "end": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "dateTime": {"type": ["string", "null"]},
+                        "date": {"type": ["string", "null"]},
+                        "timeZone": {"type": ["string", "null"]},
+                    },
+                    "required": ["dateTime", "date", "timeZone"],
+                },
+                "attendees": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "alias": {"type": "string", "enum": sorted(VALID_GUEST_ALIASES)},
+                        },
+                        "required": ["alias"],
+                    },
+                },
+                "recurrence": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": [
+                "summary",
+                "description",
+                "location",
+                "start",
+                "end",
+                "attendees",
+                "recurrence",
+            ],
+        },
+        "list": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "timeMin": {"type": ["string", "null"]},
+                "timeMax": {"type": ["string", "null"]},
+            },
+            "required": ["timeMin", "timeMax"],
+        },
+        "target": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"query": {"type": ["string", "null"]}},
+            "required": ["query"],
+        },
+        "missing_fields": {"type": "array", "items": {"type": "string"}},
+        "clarification_question": {"type": ["string", "null"]},
+    },
+    "required": [
+        "operation",
+        "confidence",
+        "calendar",
+        "event",
+        "list",
+        "target",
+        "missing_fields",
+        "clarification_question",
+    ],
+}
+
+
 def _clean_string(value: Any) -> str:
     return str(value or "").strip()
 
@@ -65,6 +167,37 @@ def _clean_string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item for item in (_clean_string(item) for item in value) if item]
+
+
+def _normalize_recurrence(values: Any) -> list[str]:
+    weekday_codes = {
+        "MON": "MO",
+        "TUE": "TU",
+        "WED": "WE",
+        "THU": "TH",
+        "FRI": "FR",
+        "SAT": "SA",
+        "SUN": "SU",
+    }
+    normalized = []
+    for value in _clean_string_list(values):
+        rule = value.strip().upper()
+        if not rule.startswith("RRULE:"):
+            continue
+
+        def normalize_byday(match: re.Match[str]) -> str:
+            tokens = []
+            for token in match.group(1).split(","):
+                parts = re.fullmatch(r"(?P<prefix>[+-]?\d+)?(?P<day>[A-Z]+)", token)
+                if parts is None:
+                    return match.group(0)
+                day = weekday_codes.get(parts.group("day"), parts.group("day"))
+                tokens.append(f"{parts.group('prefix') or ''}{day}")
+            return "BYDAY=" + ",".join(tokens)
+
+        rule = re.sub(r"BYDAY=([^;]+)", normalize_byday, rule)
+        normalized.append(rule)
+    return normalized
 
 
 def _round_confidence(value: Any) -> float:
@@ -125,7 +258,7 @@ def _clean_slots(value: Any) -> dict[str, Any]:
             slots[key] = bool(raw_value)
             continue
         if key == "recurrence":
-            recurrence = _clean_string_list(raw_value)
+            recurrence = _normalize_recurrence(raw_value)
             if recurrence:
                 slots[key] = recurrence
             continue
@@ -160,15 +293,23 @@ def validate_calendar_ai_fields(raw: dict[str, Any], request: str) -> dict[str, 
     if confidence < MIN_CONFIDENCE:
         raise ValueError("Calendar AI field extraction confidence below threshold")
 
+    slots = _clean_slots(raw.get("slots"))
     missing_fields = [
         field
         for field in _clean_string_list(raw.get("missing_fields"))
         if field in VALID_MISSING_FIELDS
     ]
+    supplied_fields = {
+        "title": bool(slots.get("title")),
+        "date": bool(slots.get("date")),
+        "time": bool(slots.get("start_time")) or slots.get("all_day") is True,
+        "event": bool(slots.get("target_reference")),
+    }
+    missing_fields = [field for field in missing_fields if not supplied_fields.get(field, False)]
     return {
         "action": action,
         "confidence": confidence,
-        "slots": _clean_slots(raw.get("slots")),
+        "slots": slots,
         "missing_fields": missing_fields,
         "clarification_question": _clean_string(raw.get("clarification_question")) or None,
         "normalized_request": request,
@@ -195,8 +336,10 @@ def _system_prompt() -> str:
         "normally contain email addresses, but this parser must use aliases only for "
         "mom, dad, family, parents, or both. For list requests, use operation list_events "
         "with a time window. For family planning summaries, use operation family_briefing. "
-        "Use operation clarify when required date, time, event target, or guest contact "
-        "information is missing. Resolve relative dates against the provided reference_time "
+        "For update, delete, or add-guests requests, put the existing event title or other "
+        "grounded target description in target.query. "
+        "Keep the requested operation and list required date, time, event target, or guest "
+        "contact information in missing_fields. Resolve relative dates against the provided reference_time "
         "and America/Los_Angeles. If the user says morning, afternoon, evening, or night "
         "without a clock time, mark time missing instead of guessing. For bare clock "
         "numbers like 'at 3', infer the most likely AM/PM from ordinary family scheduling "
@@ -206,7 +349,10 @@ def _system_prompt() -> str:
 
 def _api_context_schema() -> dict[str, Any]:
     return {
-        "operation": "create_event | list_events | family_briefing | clarify",
+        "operation": (
+            "create_event | update_event | delete_event | list_events | family_briefing | "
+            "preparation_checklist | add_guests"
+        ),
         "confidence": "number 0..1",
         "calendar": {
             "name": "optional user-visible calendar name",
@@ -247,18 +393,17 @@ def _parse_datetime(value: Any) -> datetime | None:
         return None
 
 
-def _operation_to_action(operation: str) -> str:
-    if operation in {"create_event", "list_events", "family_briefing", "add_guests"}:
-        return operation
-    return "create_event"
-
-
 def _api_context_fields_to_legacy_fields(raw: dict[str, Any], request: str) -> dict[str, Any]:
     slots: dict[str, Any] = {}
-    operation = _operation_to_action(_clean_string(raw.get("operation")) or "create_event")
+    operation = _clean_string(raw.get("operation")) or "create_event"
     event = raw.get("event") if isinstance(raw.get("event"), dict) else {}
     calendar = raw.get("calendar") if isinstance(raw.get("calendar"), dict) else {}
     list_window = raw.get("list") if isinstance(raw.get("list"), dict) else {}
+    target = raw.get("target") if isinstance(raw.get("target"), dict) else {}
+
+    target_query = _clean_string(target.get("query"))
+    if target_query:
+        slots["target_reference"] = target_query
 
     summary = _clean_string(event.get("summary"))
     if summary:
@@ -303,7 +448,7 @@ def _api_context_fields_to_legacy_fields(raw: dict[str, Any], request: str) -> d
         if aliases:
             slots["guest_aliases"] = aliases
 
-    recurrence = _clean_string_list(event.get("recurrence"))
+    recurrence = _normalize_recurrence(event.get("recurrence"))
     if recurrence:
         slots["recurrence"] = recurrence
 
@@ -363,30 +508,52 @@ class CalendarAIFieldExtractor:
         baseline_intent: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        context_payload = {
+            key: value
+            for key, value in (context or {}).items()
+            if key != "semantic_image_path"
+        }
+        user_payload = json.dumps(
+            {
+                "request": request,
+                "reference_time": _reference_time_text(now),
+                "baseline_intent": baseline_intent or {},
+                "context": context_payload,
+                "output_schema": _api_context_schema(),
+            },
+            sort_keys=True,
+        )
+        user_content: str | list[dict[str, str]] = user_payload
+        image_path = _clean_string((context or {}).get("semantic_image_path"))
+        if image_path and Path(image_path).is_file():
+            path = Path(image_path)
+            mime_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            user_content = [
+                {"type": "input_text", "text": user_payload},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{mime_type};base64,{encoded}",
+                    "detail": "high",
+                },
+            ]
         body = {
             "model": self.model,
             "store": False,
             "max_output_tokens": 500,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "n4os_calendar_operation",
+                    "strict": True,
+                    "schema": CALENDAR_AI_SCHEMA,
+                }
+            },
             "input": [
                 {"role": "system", "content": _system_prompt()},
                 {
                     "role": "user",
-                    "content": json.dumps(
-                        {
-                            "request": request,
-                            "reference_time": _reference_time_text(now),
-                            "baseline_intent": baseline_intent or {},
-                            "context": context or {},
-                            "output_schema": {
-                                **_api_context_schema(),
-                                "legacy_also_accepted": {
-                                    "action": "string",
-                                    "slots": "object",
-                                },
-                            },
-                        },
-                        sort_keys=True,
-                    ),
+                    "content": user_content,
                 },
             ],
         }

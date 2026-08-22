@@ -1082,6 +1082,27 @@ class HomeworkTools:
             "data": {"item": item},
         }
 
+    def complete_homework(self, homework_item_id: str, *, now: datetime | None = None) -> ToolResponse:
+        item = self.provider.capture_submission(
+            homework_item_id=homework_item_id,
+            source="dashboard",
+            raw_input="Marked complete from dashboard.",
+            notes="Marked complete from dashboard.",
+            created_at=(now or datetime.now().astimezone()).isoformat(),
+        )
+        if item is None:
+            return {
+                "status": "error",
+                "message": "Homework item not found.",
+                "data": {"homework_item_id": homework_item_id},
+            }
+        _write_markdown(self.provider, child=str(item["child"]), homework_root=self.homework_root)
+        return {
+            "status": "ok",
+            "message": f"Marked complete: {_title_line(item)}.",
+            "data": {"item": item},
+        }
+
     def resolve_duplicate_assignment(self, pending_action: dict[str, Any], response_text: str) -> ToolResponse:
         response = " ".join(response_text.lower().strip(" .!").split())
         if response in {"cancel", "no", "stop"}:

@@ -37,6 +37,9 @@ class CalendarProvider(Protocol):
         time_min: str,
         time_max: str,
         max_results: int = 10,
+        calendar_name: str | None = None,
+        writable: bool = False,
+        query: str | None = None,
     ) -> list[dict[str, Any]]:
         ...
 
@@ -186,6 +189,9 @@ class CalendarTools:
         time_min: str | None = None,
         time_max: str | None = None,
         max_results: int = 10,
+        calendar_name: str | None = None,
+        writable: bool = False,
+        query: str | None = None,
     ) -> ToolResponse:
         missing_fields: list[str] = []
         cleaned_min = _clean_optional(time_min)
@@ -200,11 +206,18 @@ class CalendarTools:
             return _missing_response(missing_fields)
 
         try:
-            events = self.provider.list_events(
-                time_min=cleaned_min,
-                time_max=cleaned_max,
-                max_results=max_results,
-            )
+            list_kwargs = {
+                "time_min": cleaned_min,
+                "time_max": cleaned_max,
+                "max_results": max_results,
+            }
+            if _clean_optional(calendar_name) is not None:
+                list_kwargs["calendar_name"] = _clean_optional(calendar_name)
+            if writable:
+                list_kwargs["writable"] = True
+            if _clean_optional(query) is not None:
+                list_kwargs["query"] = _clean_optional(query)
+            events = self.provider.list_events(**list_kwargs)
         except Exception as error:
             return _provider_error_response(error)
 

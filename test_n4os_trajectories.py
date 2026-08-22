@@ -25,6 +25,8 @@ class N4OSTrajectoriesTest(unittest.TestCase):
                 n4os_root=n4os_root,
                 captured_at=datetime(2026, 8, 8, 21, 15),
                 model="gpt-5.4-mini",
+                knowledge_preview="Knowledge selected\nSources: SOUL, Nysha, Parenting",
+                reasoning_summary="Prioritized the recent school transition signals.",
             )
 
             path = n4os_root / "trajectories" / "2026-08.md"
@@ -37,6 +39,10 @@ class N4OSTrajectoriesTest(unittest.TestCase):
         self.assertIn("How do I approach Nysha", text)
         self.assertIn("Assistant:", text)
         self.assertIn("calm first-week plan", text)
+        self.assertIn("Knowledge selected:", text)
+        self.assertIn("Sources: SOUL, Nysha, Parenting", text)
+        self.assertIn("Reasoning summary:", text)
+        self.assertIn("Prioritized the recent school transition signals.", text)
 
     def test_reads_recent_matching_summaries_for_future_context(self):
         with tempfile.TemporaryDirectory() as tmpdir:

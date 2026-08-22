@@ -5,7 +5,7 @@ from io import StringIO
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from claw import FamilyCalendarClaw, _format_created_event_message, match_events, run_cli
+from claw import FamilyCalendarClaw, PendingAction, _format_created_event_message, match_events, run_cli
 from intent import (
     extract_intent,
     read_metadata_from_event,
@@ -57,6 +57,7 @@ class FakeProvider:
         self.get_call_details = []
         self.created_calendar_names = []
         self.deleted_calls = []
+        self.list_calendar_names = []
 
     def create_event(
         self,
@@ -72,6 +73,7 @@ class FakeProvider:
         calendar_name=None,
         notify_attendees=False,
         all_day=False,
+        event_label_background_color=None,
     ):
         self.created_calendar_names.append(calendar_name)
         start = {"date": start_time} if all_day else {"dateTime": start_time, "timeZone": timezone}
@@ -98,12 +100,23 @@ class FakeProvider:
         self.created.append(event)
         return event
 
-    def list_events(self, time_min, time_max, max_results=10):
+    def list_events(
+        self,
+        time_min,
+        time_max,
+        max_results=10,
+        calendar_name=None,
+        writable=False,
+        query=None,
+    ):
+        self.list_calendar_names.append(calendar_name)
         self.list_calls.append(
             {
                 "time_min": time_min,
                 "time_max": time_max,
                 "max_results": max_results,
+                "writable": writable,
+                "query": query,
             }
         )
         return self.events[:max_results]
@@ -265,6 +278,46 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertIn("Art class", message)
         self.assertIsNotNone(claw.pending_action)
         self.assertEqual(claw.pending_action.event["calendarId"], "nysha-school-id")
+
+    def test_pronoun_delete_reuses_created_event_when_calendar_name_is_repeated(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 12, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add a recurring event to Nysha school calendar "
+                "for Art class at 10 AM every Saturday",
+                reference_time=reference,
+            )
+            message = claw.delete_event_from_request(
+                "Delete it from Nysha school calendar",
+                reference_time=reference,
+            )
+
+        self.assertEqual(provider.list_calls, [])
+        self.assertIn("Art class", message)
+        self.assertIsNotNone(claw.pending_action)
+        self.assertEqual(claw.pending_action.event["calendarId"], "Nysha school calendar")
+
+    def test_missing_time_followup_can_rename_event_with_instead(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 12, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add dentist Friday",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response(
+                "Lunch instead at 1 PM",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created[0]["summary"], "Lunch")
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-08-14T13:00:00-07:00")
 
     def test_created_event_message_falls_back_to_event_id_without_link(self):
         start = datetime(2026, 7, 3, 19, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -492,6 +545,43 @@ class FamilyCalendarClawTest(unittest.TestCase):
             {"email": "dad@example.test", "displayName": "Dad"},
         ])
 
+    def test_add_guests_target_query_searches_named_writable_calendar(self):
+        provider = FakeProvider()
+        provider.events = [
+            _fake_event(
+                "Dentist appointment",
+                "2026-12-29T12:20:00-08:00",
+                "2026-12-29T13:20:00-08:00",
+            )
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.last_created_event = _fake_event(
+            "Family dinner",
+            "2026-08-13T18:00:00-07:00",
+            "2026-08-13T19:00:00-07:00",
+        )
+        reference = datetime(2026, 8, 12, 18, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_guests_from_intent(
+                {
+                    "intent": "add_guests",
+                    "query": "dentist appointment",
+                    "target_calendar": "Nysha school calendar",
+                    "attendees": [FAMILY_ATTENDEES[0]],
+                    "missing_fields": [],
+                },
+                reference_time=reference,
+            )
+
+        self.assertIn("Added guest to Dentist appointment", message)
+        self.assertEqual(provider.updated[0]["id"], "dentist-appointment")
+        self.assertEqual(provider.list_calendar_names, ["Nysha school calendar"])
+        self.assertTrue(provider.list_calls[0]["writable"])
+        self.assertEqual(provider.list_calls[0]["query"], "dentist appointment")
+        self.assertLess(provider.list_calls[0]["time_min"], "2020-01-01")
+        self.assertGreater(provider.list_calls[0]["time_max"], "2030-01-01")
+
     def test_ai_field_extractor_failure_falls_back_to_deterministic_parse(self):
         provider = FakeProvider()
         extractor = FakeFieldExtractor(error=RuntimeError("model unavailable"))
@@ -582,7 +672,6 @@ class FamilyCalendarClawTest(unittest.TestCase):
                     "duration_minutes": 240,
                     "calendar_name": "sports calendar",
                     "location": "Memorial Park",
-                    "guest_aliases": ["parents"],
                     "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=SA"],
                 },
                 "missing_fields": [],
@@ -607,8 +696,8 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertEqual(created["calendarId"], "sports calendar")
         self.assertEqual(created["location"], "Memorial Park")
         self.assertEqual(created["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SA"])
-        self.assertEqual(created["attendees"], FAMILY_ATTENDEES)
-        self.assertTrue(created["notify_attendees"])
+        self.assertEqual(created["attendees"], [])
+        self.assertFalse(created["notify_attendees"])
 
     def test_api_context_ai_primary_creates_all_day_event(self):
         provider = FakeProvider()
@@ -929,7 +1018,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
         self.assertIsNotNone(claw.pending_action)
         self.assertEqual(provider.created, [])
 
-    def test_bulk_date_event_request_time_followup_creates_all_events(self):
+    def test_bulk_date_event_request_time_followup_requires_confirmation(self):
         provider = FakeProvider()
         claw = FamilyCalendarClaw.from_provider(provider)
         reference = datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -942,6 +1031,13 @@ class FamilyCalendarClawTest(unittest.TestCase):
             handled = claw.handle_pending_response("9 AM")
 
         self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual(provider.created, [])
+
+        with redirect_stdout(StringIO()):
+            confirmed = claw.handle_pending_response("yes")
+
+        self.assertTrue(confirmed)
         self.assertIsNone(claw.pending_action)
         self.assertEqual(
             [event["summary"] for event in provider.created],
@@ -957,7 +1053,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
             ],
         )
 
-    def test_bulk_date_event_request_full_day_followup_creates_all_day_events(self):
+    def test_bulk_date_event_request_full_day_followup_requires_confirmation(self):
         provider = FakeProvider()
         claw = FamilyCalendarClaw.from_provider(provider)
         reference = datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -970,6 +1066,13 @@ class FamilyCalendarClawTest(unittest.TestCase):
             handled = claw.handle_pending_response("Whenever time is missing make them full day")
 
         self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual(provider.created, [])
+
+        with redirect_stdout(StringIO()):
+            confirmed = claw.handle_pending_response("yes")
+
+        self.assertTrue(confirmed)
         self.assertIsNone(claw.pending_action)
         self.assertEqual(len(provider.created), 4)
         self.assertEqual(
@@ -978,7 +1081,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
         )
         self.assertTrue(all(event["all_day"] for event in provider.created))
 
-    def test_bulk_date_event_request_with_time_creates_all_events(self):
+    def test_bulk_date_event_request_with_time_requires_confirmation(self):
         provider = FakeProvider()
         claw = FamilyCalendarClaw.from_provider(provider)
         reference = datetime(2026, 8, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -989,11 +1092,133 @@ class FamilyCalendarClawTest(unittest.TestCase):
                 reference_time=reference,
             )
 
-        self.assertEqual(
-            message,
-            "Created 4 calendar events for Pay driver: Oct 1, Dec 1, Feb 1, Apr 1.",
-        )
+        self.assertIn("4 dates", message)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual(provider.created, [])
+
+        with redirect_stdout(StringIO()):
+            handled = claw.handle_pending_response("yes", reference_time=reference)
+
+        self.assertTrue(handled)
         self.assertEqual(len(provider.created), 4)
+
+    def test_confirmation_accepts_named_calendar_correction(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add swim class tomorrow at 6 PM",
+                reference_time=reference,
+                require_confirmation=True,
+            )
+            handled = claw.handle_pending_response(
+                "Nysha school calendar instead",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "confirm_create")
+        self.assertEqual(
+            claw.pending_action.payload["target_calendar"],
+            "Nysha school calendar",
+        )
+        self.assertEqual(provider.created, [])
+
+    def test_bulk_confirmation_accepts_named_calendar_correction(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        semantic_intent = {
+            "intent": "create_event",
+            "title": "Swim class",
+            "start_time": "18:00",
+            "target_calendar": "Family calendar",
+            "missing_fields": [],
+        }
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add swim class for these dates\n9/1\n9/8",
+                reference_time=reference,
+                semantic_intent=semantic_intent,
+            )
+            handled = claw.handle_pending_response(
+                "Nysha school calendar instead",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual(
+            [
+                item["target_calendar"]
+                for item in claw.pending_action.payload["intents"]
+            ],
+            ["Nysha school calendar", "Nysha school calendar"],
+        )
+        self.assertEqual(provider.created, [])
+
+    def test_bulk_date_preview_keeps_semantic_shared_fields(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        semantic_intent = {
+            "intent": "create_event",
+            "title": "Driver payment",
+            "start_time": "10:00",
+            "duration_minutes": 30,
+            "target_calendar": "Family calendar",
+            "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
+            "missing_fields": [],
+        }
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "Add events to pay driver for below days\n10/1\n12/1",
+                reference_time=datetime(2026, 8, 9, 12, tzinfo=ZoneInfo(DEFAULT_TIMEZONE)),
+                require_confirmation=True,
+                semantic_intent=semantic_intent,
+            )
+
+        intents = claw.pending_action.payload["intents"]
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual([item["title"] for item in intents], ["Driver payment", "Driver payment"])
+        self.assertEqual([item["target_calendar"] for item in intents], ["Family calendar"] * 2)
+        self.assertTrue(all(not item.get("recurrence") for item in intents))
+
+    def test_bulk_semantic_intent_preserves_missing_guest_contacts(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        semantic_intent = {
+            "intent": "create_event",
+            "title": "Swim class",
+            "start_time": "18:00",
+            "attendees": [],
+            "missing_guest_contacts": ["dad"],
+            "missing_fields": ["guest_contacts"],
+        }
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "Add swim class for these dates\n9/1\n9/8",
+                reference_time=datetime(
+                    2026,
+                    8,
+                    21,
+                    12,
+                    tzinfo=ZoneInfo(DEFAULT_TIMEZONE),
+                ),
+                semantic_intent=semantic_intent,
+            )
+
+        self.assertIn("guest", message.lower())
+        self.assertEqual(claw.pending_action.action, "create_bulk")
+        self.assertEqual(
+            [item["missing_guest_contacts"] for item in claw.pending_action.payload["intents"]],
+            [["dad"], ["dad"]],
+        )
+        self.assertEqual(provider.created, [])
 
     def test_pickup_without_time_asks_for_time_with_parsed_event(self):
         provider = FakeProvider()
@@ -1165,9 +1390,1003 @@ class FamilyCalendarClawTest(unittest.TestCase):
                 reference_time=reference,
             )
 
-        self.assertIn("Please provide a time for", message)
+        self.assertIn("Please provide:", message)
+        self.assertIn("time", message)
         self.assertEqual(provider.updated, [])
+        self.assertEqual(provider.created, [])
         self.assertIsNotNone(claw.pending_action)
+
+    def test_bracketed_telegram_photo_text_does_not_update_previous_event_as_context(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.last_created_event = _fake_event(
+            "Back to School Event",
+            "2026-08-15T10:00:00-07:00",
+            "2026-08-15T15:00:00-07:00",
+        )
+        reference = datetime(2026, 8, 15, 18, 3, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar in Nysha school calendar\n\n"
+                "[Image text extraction (machine-generated, untrusted)]:\n"
+                "Second Grade Homework\n"
+                "This homework packet is due Friday morning.",
+                reference_time=reference,
+            )
+
+        self.assertIn("Please provide:", message)
+        self.assertEqual(provider.updated, [])
+        self.assertEqual(provider.created, [])
+
+    def test_image_schedule_table_creates_each_specified_date_after_confirmation(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar add swim class starting 5.30 to 7 PM on specified days\n\n"
+                "[Image text extraction (machine-generated, untrusted)]:\n"
+                "School Day Date Time Attendance\n"
+                "Fremont Fri Sep 18th, 2026 6:00PM Mark absent\n"
+                "Fremont Fri Sep 25th, 2026 6:00PM Mark absent",
+                reference_time=reference,
+            )
+
+        self.assertEqual(
+            message,
+            "I found 2 dates for Swim class, Sep 18 through Sep 25, "
+            "5:30 PM–7:00 PM. Add all 2 events?",
+        )
+        self.assertEqual(provider.created, [])
+        self.assertIsNotNone(claw.pending_action)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+
+        with redirect_stdout(StringIO()):
+            handled = claw.handle_pending_response("yes", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertIsNone(claw.pending_action)
+        self.assertEqual([event["summary"] for event in provider.created], ["Swim class"] * 2)
+        self.assertEqual(
+            [event["start"]["dateTime"] for event in provider.created],
+            ["2026-09-18T17:30:00-07:00", "2026-09-25T17:30:00-07:00"],
+        )
+        self.assertEqual(
+            [event["end"]["dateTime"] for event in provider.created],
+            ["2026-09-18T19:00:00-07:00", "2026-09-25T19:00:00-07:00"],
+        )
+        self.assertTrue(all(event["recurrence"] is None for event in provider.created))
+
+    def test_bulk_confirmation_lists_per_date_ranges_when_durations_vary(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM - 7:00PM\n"
+                "Fri Sep 25th, 2026 6:00PM - 7:30PM",
+                reference_time=reference,
+            )
+
+        self.assertIn("Sep 18 6:00 PM–7:00 PM", message)
+        self.assertIn("Sep 25 6:00 PM–7:30 PM", message)
+
+    def test_image_schedule_confirmation_can_be_cancelled(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\n"
+                "Image text:\n"
+                "Fremont Fri Sep 18th, 2026 6:00PM Mark absent",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("no", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created, [])
+        self.assertIsNone(claw.pending_action)
+
+    def test_image_schedule_confirmation_accepts_natural_yes(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\n"
+                "Image text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("yes please.", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(len(provider.created), 1)
+
+    def test_image_schedule_confirmation_accepts_time_correction(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\n"
+                "Image text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("5:30 PM", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created, [])
+        self.assertEqual(claw.pending_action.payload["start_time"], "17:30")
+
+    def test_image_schedule_start_only_correction_preserves_duration(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class 5:30 to 7 PM\n\n"
+                "Image text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            claw.handle_pending_response("5 PM", reference_time=reference)
+
+        self.assertEqual(claw.pending_action.payload["start_time"], "17:00")
+        self.assertEqual(claw.pending_action.payload["duration_minutes"], 90)
+
+    def test_image_recurring_confirmation_time_correction_advances_past_occurrence(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 20, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\n"
+                "Image text:\n"
+                "Fri Aug 21st, 2026 9:00PM\n"
+                "Fri Aug 28th, 2026 9:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("5 PM", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["date"], "2026-08-28")
+
+    def test_image_schedule_confirmation_accepts_duration_only_correction(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\n"
+                "Image text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("for 90 minutes", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["duration_minutes"], 90)
+
+    def test_image_schedule_time_correction_clears_all_day(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim camp all day\n\n"
+                "Image text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("5 PM", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertFalse(claw.pending_action.payload["all_day"])
+        self.assertEqual(claw.pending_action.payload["start_time"], "17:00")
+
+    def test_image_bulk_confirmation_accepts_time_correction(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM\n"
+                "Fri Sep 25th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("5:30 PM", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            [item["start_time"] for item in claw.pending_action.payload["intents"]],
+            ["17:30", "17:30"],
+        )
+
+    def test_image_bulk_confirmation_accepts_time_range_correction(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM\n"
+                "Fri Sep 25th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("5:30 to 7 PM", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            [item["duration_minutes"] for item in claw.pending_action.payload["intents"]],
+            [90, 90],
+        )
+
+    def test_image_bulk_confirmation_accepts_hour_only_time_range(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM\n"
+                "Fri Sep 25th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("5 to 7 PM", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            [item["duration_minutes"] for item in claw.pending_action.payload["intents"]],
+            [120, 120],
+        )
+
+    def test_image_bulk_confirmation_accepts_single_corrected_date(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM\n"
+                "Fri Sep 25th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("Sep 26", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["dates"], ["2026-09-26"])
+
+    def test_image_bulk_existing_date_correction_keeps_that_rows_time(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM\n"
+                "Fri Sep 25th, 2026 7:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("Sep 25", reference_time=reference)
+
+        self.assertTrue(handled)
+        selected = claw.pending_action.payload["intents"][0]
+        self.assertEqual(selected["date"], "2026-09-25")
+        self.assertEqual(selected["start_time"], "19:00")
+
+    def test_image_bulk_new_date_correction_asks_for_time_when_row_times_vary(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM\n"
+                "Fri Sep 25th, 2026 7:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("Sep 26", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "create_bulk")
+        selected = claw.pending_action.payload["intents"][0]
+        self.assertEqual(selected["date"], "2026-09-26")
+        self.assertIsNone(selected["start_time"])
+        self.assertIn("time", selected["missing_fields"])
+
+    def test_image_bulk_new_date_and_time_correction_moves_to_confirmation(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM\n"
+                "Fri Sep 25th, 2026 7:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response(
+                "Sep 26 at 5:30 PM",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        selected = claw.pending_action.payload["intents"][0]
+        self.assertEqual(selected["date"], "2026-09-26")
+        self.assertEqual(selected["start_time"], "17:30")
+        self.assertNotIn("time", selected["missing_fields"])
+
+    def test_image_bulk_new_date_asks_for_duration_when_row_durations_vary(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM - 7:00PM\n"
+                "Fri Sep 25th, 2026 6:00PM - 7:30PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("Sep 26", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "create_bulk")
+        selected = claw.pending_action.payload["intents"][0]
+        self.assertIsNone(selected["duration_minutes"])
+        self.assertIn("duration", selected["missing_fields"])
+        self.assertEqual(provider.created, [])
+
+        with redirect_stdout(StringIO()):
+            corrected = claw.handle_pending_response(
+                "for 90 minutes",
+                reference_time=reference,
+            )
+
+        self.assertTrue(corrected)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        selected = claw.pending_action.payload["intents"][0]
+        self.assertEqual(selected["duration_minutes"], 90)
+        self.assertNotIn("duration", selected["missing_fields"])
+
+    def test_image_schedule_batch_ignores_past_dates(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fri Aug 14th, 2026 6:00PM\n"
+                "Fri Aug 21st, 2026 6:00PM\n"
+                "Fri Aug 28th, 2026 6:00PM",
+                reference_time=reference,
+            )
+
+        self.assertNotIn("Aug 14", message)
+        self.assertNotIn("2026-08-14", repr(claw.pending_action.payload))
+
+    def test_image_schedule_everyday_typo_still_creates_finite_date_batch(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        request = (
+            "/calendar add event everyday day mentioned from 5.30 pm to 7 pm. "
+            "Title: Swim Class at American swim academy\n\n"
+            "[Image text extraction (machine-generated, untrusted)]:\n"
+            "School Day Date Time Attendance\n"
+            "Fremont Fri Sep 18th, 2026 6:00PM Mark absent\n"
+            "Fremont Fri Sep 25th, 2026 6:00PM Mark absent\n"
+            "Fremont Fri Oct 2nd, 2026 6:00PM Mark absent"
+        )
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(request, reference_time=reference)
+
+        self.assertIn("I found 3 dates", message)
+        self.assertIn("Add all 3 events?", message)
+        self.assertIsNotNone(claw.pending_action)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual(
+            [intent["date"] for intent in claw.pending_action.payload["intents"]],
+            ["2026-09-18", "2026-09-25", "2026-10-02"],
+        )
+        self.assertTrue(
+            all(intent["recurrence"] is None for intent in claw.pending_action.payload["intents"])
+        )
+        self.assertTrue(
+            all(not intent["attendees"] for intent in claw.pending_action.payload["intents"])
+        )
+
+    def test_image_schedule_batch_uses_row_time_when_caption_omits_time(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fremont Fri Sep 18th, 2026 6:00PM Mark absent\n"
+                "Fremont Fri Sep 25th, 2026 6:00PM Mark absent",
+                reference_time=reference,
+            )
+
+        self.assertIn("6:00 PM–7:00 PM", message)
+        self.assertEqual(
+            [intent["start_time"] for intent in claw.pending_action.payload["intents"]],
+            ["18:00", "18:00"],
+        )
+
+    def test_image_schedule_batch_confirmation_reports_varying_row_times(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Fremont Fri Sep 18th, 2026 6:00PM Mark absent\n"
+                "Fremont Fri Sep 25th, 2026 7:00PM Mark absent",
+                reference_time=reference,
+            )
+
+        self.assertIn(
+            "times vary: Sep 18 6:00 PM–7:00 PM; Sep 25 7:00 PM–8:00 PM",
+            message,
+        )
+
+    def test_image_schedule_batch_does_not_use_dates_from_other_activities(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar add swim class on specified days\n\n"
+                "Image text:\n"
+                "Swim Fri Sep 18th, 2026 6:00PM\n"
+                "Chess Fri Sep 25th, 2026 6:00PM",
+                reference_time=reference,
+            )
+
+        self.assertNotIn("2 dates", message)
+        self.assertEqual(claw.pending_action.action, "confirm_create")
+        self.assertEqual(claw.pending_action.payload["date"], "2026-09-18")
+
+    def test_dates_in_image_request_creates_finite_batch_not_recurrence(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar add 5.30 to 7 PM for the dates in the image. "
+                "Title: Swim class at 6 for Nysha and Navya\n\n"
+                "Image text:\n"
+                "Fremont Fri Sep 18th, 2026 6:00PM Mark absent\n"
+                "Fremont Fri Sep 25th, 2026 6:00PM Mark absent\n"
+                "Fremont Fri Oct 2nd, 2026 6:00PM Mark absent",
+                reference_time=reference,
+            )
+
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual(
+            claw.pending_action.payload["dates"],
+            ["2026-09-18", "2026-09-25", "2026-10-02"],
+        )
+        self.assertTrue(
+            all(item["recurrence"] is None for item in claw.pending_action.payload["intents"])
+        )
+        self.assertTrue(
+            all(
+                item["title"] == "Swim class at 6 for Nysha and Navya"
+                and item["start_time"] == "17:30"
+                and item["duration_minutes"] == 90
+                for item in claw.pending_action.payload["intents"]
+            )
+        )
+        self.assertIn("3 dates", message)
+
+    def test_image_schedule_all_day_batch_does_not_require_time(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar add swim camp all day on specified days\n\n"
+                "Image text:\n"
+                "Fremont Fri Sep 18th, 2026 6:00PM Mark absent\n"
+                "Fremont Fri Sep 25th, 2026 6:00PM Mark absent",
+                reference_time=reference,
+            )
+
+        self.assertIn("all day", message)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertTrue(
+            all(intent["all_day"] for intent in claw.pending_action.payload["intents"])
+        )
+
+    def test_image_schedule_single_followup_still_requires_confirmation(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            first = claw.create_event_from_request(
+                "/calendar add\n\nImage text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("swim class", reference_time=reference)
+
+        self.assertEqual(first, "Please provide: title.")
+        self.assertTrue(handled)
+        self.assertEqual(provider.created, [])
+        self.assertEqual(claw.pending_action.action, "confirm_create")
+
+    def test_image_title_followup_date_and_time_override_ocr(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add\n\nImage text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response(
+                "swim class Sep 25 at 5 PM",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created, [])
+        self.assertEqual(claw.pending_action.payload["date"], "2026-09-25")
+        self.assertEqual(claw.pending_action.payload["start_time"], "17:00")
+
+    def test_image_date_correction_clears_inferred_recurrence(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM\n"
+                "Fri Sep 25th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("Sep 26", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["date"], "2026-09-26")
+        self.assertIsNone(claw.pending_action.payload["recurrence"])
+
+    def test_image_date_correction_clears_incompatible_typed_recurrence(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class every Friday\n\n"
+                "Image text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("Sep 19", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["date"], "2026-09-19")
+        self.assertIsNone(claw.pending_action.payload["recurrence"])
+
+    def test_image_confirmation_accepts_configured_guest_addition(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=True), redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\nImage text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("invite dad", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "confirm_create")
+        self.assertEqual(claw.pending_action.payload["attendees"], [FAMILY_ATTENDEES[0]])
+
+    def test_image_confirmation_accepts_yes_with_guest_without_replacing_title(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=True), redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\nImage text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("yes, invite dad", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["title"], "Swim class")
+        self.assertEqual(claw.pending_action.payload["attendees"], [FAMILY_ATTENDEES[0]])
+
+    def test_image_confirmation_accepts_exclamation_before_guest(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", GUEST_EMAIL_ENV, clear=True), redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\nImage text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("yes!invite dad", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["title"], "Swim class")
+        self.assertEqual(claw.pending_action.payload["attendees"], [FAMILY_ATTENDEES[0]])
+
+    def test_image_confirmation_strips_yes_before_weekday_correction(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class\n\nImage text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response(
+                "yes Friday at 5 PM",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["title"], "Swim class")
+        self.assertEqual(claw.pending_action.payload["start_time"], "17:00")
+
+    def test_image_missing_contact_followup_does_not_replace_title_with_yes(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", {}, clear=True), redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class and invite dad\n\n"
+                "Image text:\nFri Sep 18th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            original_title = claw.pending_action.payload["title"]
+            handled = claw.handle_pending_response("yes, invite dad", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "create")
+        self.assertEqual(claw.pending_action.payload["title"], original_title)
+
+    def test_missing_time_followup_uses_compatible_explicit_recurrence_date(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 22, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class every Friday",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response(
+                "Sep 11 at 5 PM",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-09-11T17:00:00-07:00")
+        self.assertEqual(provider.created[0]["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=FR"])
+
+    def test_image_date_correction_clears_incompatible_monthly_ordinal_recurrence(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add swim class every first Thursday\n\n"
+                "Image text:\nThu Sep 3rd, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("Sep 10", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["date"], "2026-09-10")
+        self.assertIsNone(claw.pending_action.payload["recurrence"])
+
+    def test_bulk_image_confirmation_requests_missing_guest_contact(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", {}, clear=True), redirect_stdout(StringIO()) as output:
+            claw.create_event_from_request(
+                "/calendar add swim class for all dates\n\n"
+                "Image text:\nFri Sep 18th, 2026 6:00PM\nFri Sep 25th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("invite dad", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "create_bulk")
+        self.assertIn("Please configure calendar guest email contacts for: dad.", output.getvalue())
+
+    def test_recurring_time_followup_advances_past_same_day_occurrence(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request("Add swim class every Friday", reference_time=reference)
+            handled = claw.handle_pending_response("5 PM", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-08-28T17:00:00-07:00")
+
+    def test_recurring_time_followup_accepts_naive_reference_time(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18)
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request("Add swim class every Friday", reference_time=reference)
+            handled = claw.handle_pending_response("5 PM", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-08-28T17:00:00-07:00")
+
+    def test_mixed_image_rows_recover_after_title_followup(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            first = claw.create_event_from_request(
+                "/calendar add\n\n"
+                "Image text:\n"
+                "Chess Fri Aug 28th, 2026 6:00PM\n"
+                "Swim Fri Sep 4th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("swim class", reference_time=reference)
+
+        self.assertIn("title", first)
+        self.assertTrue(handled)
+        self.assertEqual(provider.created, [])
+        self.assertEqual(claw.pending_action.action, "confirm_create")
+        self.assertEqual(claw.pending_action.payload["date"], "2026-09-04")
+
+    def test_mixed_image_bulk_recovers_matching_dates_after_title_followup(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add on specified days\n\n"
+                "Image text:\n"
+                "Chess Fri Aug 28th, 2026 6:00PM\n"
+                "Swim Fri Sep 4th, 2026 6:00PM\n"
+                "Swim Fri Sep 11th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response("swim class", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created, [])
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual(
+            claw.pending_action.payload["dates"],
+            ["2026-09-04", "2026-09-11"],
+        )
+
+    def test_image_bulk_title_followup_time_overrides_ocr_time(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add on specified days\n\n"
+                "Image text:\n"
+                "Chess Fri Aug 28th, 2026 6:00PM\n"
+                "Swim Fri Sep 4th, 2026 6:00PM\n"
+                "Swim Fri Sep 11th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response(
+                "swim class at 5:30 PM for 90 minutes",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual(
+            [item["start_time"] for item in claw.pending_action.payload["intents"]],
+            ["17:30", "17:30"],
+        )
+        self.assertEqual(
+            [item["duration_minutes"] for item in claw.pending_action.payload["intents"]],
+            [90, 90],
+        )
+        self.assertNotIn("time", claw.pending_action.payload["missing_fields"])
+        self.assertNotIn("duration", claw.pending_action.payload["missing_fields"])
+
+    def test_image_bulk_title_followup_single_date_replaces_ocr_batch(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 18, 18, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with redirect_stdout(StringIO()):
+            claw.create_event_from_request(
+                "/calendar add on specified days\n\n"
+                "Image text:\n"
+                "Chess Fri Aug 28th, 2026 6:00PM\n"
+                "Swim Fri Sep 18th, 2026 6:00PM\n"
+                "Swim Fri Sep 25th, 2026 6:00PM",
+                reference_time=reference,
+            )
+            handled = claw.handle_pending_response(
+                "swim class Sep 26",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["dates"], ["2026-09-26"])
+
+    def test_image_schedule_bulk_followup_still_requires_confirmation(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        base_intent = extract_intent("add", now=reference)
+        intents = []
+        for event_date in ("2026-09-18", "2026-09-25"):
+            intent = dict(base_intent)
+            intent.update(
+                date=event_date,
+                start_time="18:00",
+                confirmation_required=False,
+                missing_fields=["title"],
+            )
+            intents.append(intent)
+        claw.pending_action = PendingAction(
+            action="create_bulk",
+            payload={
+                "intent": "create_events",
+                "intents": intents,
+                "dates": ["2026-09-18", "2026-09-25"],
+                "confirmation_required": True,
+                "missing_fields": ["title"],
+            },
+        )
+
+        with redirect_stdout(StringIO()):
+            handled = claw.handle_pending_response("swim class", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created, [])
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+
+    def test_image_schedule_bulk_missing_title_strips_leading_yes(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        base_intent = extract_intent("add", now=reference)
+        intents = []
+        for event_date in ("2026-09-18", "2026-09-25"):
+            intent = dict(base_intent)
+            intent.update(date=event_date, start_time="18:00", missing_fields=["title"])
+            intents.append(intent)
+        claw.pending_action = PendingAction(
+            action="create_bulk",
+            payload={
+                "intent": "create_events",
+                "intents": intents,
+                "dates": ["2026-09-18", "2026-09-25"],
+                "confirmation_required": True,
+                "missing_fields": ["title"],
+            },
+        )
+
+        with redirect_stdout(StringIO()):
+            handled = claw.handle_pending_response("yes, swim class", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
+        self.assertEqual(
+            [item["title"] for item in claw.pending_action.payload["intents"]],
+            ["Swim class", "Swim class"],
+        )
+
+    def test_image_schedule_bulk_missing_title_preserves_title_starting_with_yes(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        base_intent = extract_intent("add", now=reference)
+        intent = {
+            **base_intent,
+            "date": "2026-09-18",
+            "start_time": "18:00",
+            "missing_fields": ["title"],
+        }
+        claw.pending_action = PendingAction(
+            action="create_bulk",
+            payload={
+                "intent": "create_events",
+                "intents": [intent],
+                "dates": ["2026-09-18"],
+                "missing_fields": ["title"],
+            },
+        )
+
+        with redirect_stdout(StringIO()):
+            handled = claw.handle_pending_response("Yes Day", reference_time=reference)
+
+        self.assertTrue(handled)
+        self.assertEqual(provider.created[0]["summary"], "Yes Day")
+
+    def test_image_schedule_bulk_missing_field_correction_replaces_date_and_duration(self):
+        claw = FamilyCalendarClaw.from_provider(FakeProvider())
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intents = [
+            {
+                **extract_intent("add swim class", now=reference),
+                "date": event_date,
+                "start_time": "18:00",
+                "missing_guest_contacts": ["dad"],
+                "missing_fields": ["guest_contacts"],
+            }
+            for event_date in ("2026-09-18", "2026-09-25")
+        ]
+        claw.pending_action = PendingAction(
+            action="create_bulk",
+            payload={
+                "intent": "create_events",
+                "intents": intents,
+                "dates": ["2026-09-18", "2026-09-25"],
+                "confirmation_required": True,
+                "missing_fields": ["guest_contacts"],
+            },
+        )
+
+        with patch.dict("os.environ", {}, clear=True), redirect_stdout(StringIO()):
+            handled = claw.handle_pending_response(
+                "Sep 26 at 5:30 to 7 PM",
+                reference_time=reference,
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(claw.pending_action.payload["dates"], ["2026-09-26"])
+        corrected = claw.pending_action.payload["intents"][0]
+        self.assertEqual(corrected["start_time"], "17:30")
+        self.assertEqual(corrected["duration_minutes"], 90)
+
+    def test_image_schedule_bulk_preserves_missing_guest_contacts(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+        reference = datetime(2026, 8, 21, 20, 14, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        with patch.dict("os.environ", {}, clear=True), redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "/calendar add swim class for all dates and invite dad\n\n"
+                "Image text:\n"
+                "Fri Sep 18th, 2026 6:00PM\n"
+                "Fri Sep 25th, 2026 6:00PM",
+                reference_time=reference,
+            )
+
+        self.assertEqual(message, "Please configure calendar guest email contacts for: dad.")
+        self.assertEqual(provider.created, [])
+        self.assertEqual(claw.pending_action.action, "create_bulk")
+        self.assertIn("guest_contacts", claw.pending_action.payload["missing_fields"])
 
     def test_create_recurring_weekday_event(self):
         provider = FakeProvider()
@@ -1229,10 +2448,10 @@ class FamilyCalendarClawTest(unittest.TestCase):
             claw.create_event_from_request(
                 "Add medication every day at 8am",
                 reference_time=reference,
-            )
+        )
 
         self.assertEqual(provider.created[0]["summary"], "Medication")
-        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-02T08:00:00-07:00")
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-07-03T08:00:00-07:00")
         self.assertEqual(provider.created[0]["recurrence"], ["RRULE:FREQ=DAILY"])
 
     def test_list_events_from_tomorrow_request(self):
@@ -1817,6 +3036,61 @@ class FamilyCalendarClawTest(unittest.TestCase):
             claw.handle_pending_response("yes")
 
         self.assertEqual(provider.deleted, ["dinner-1"])
+
+    def test_delete_event_searches_named_calendar(self):
+        provider = FakeProvider()
+        provider.events = [
+            {
+                "id": "swim-1",
+                "summary": "Swim class",
+                "calendarId": "nysha-school-id",
+                "start": {"dateTime": "2026-07-03T17:00:00-07:00"},
+                "end": {"dateTime": "2026-07-03T18:00:00-07:00"},
+            }
+        ]
+        claw = FamilyCalendarClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.delete_event_from_request("Delete swim class from Nysha school calendar")
+
+        self.assertEqual(provider.list_calendar_names, ["Nysha school calendar"])
+        self.assertTrue(provider.list_calls[0]["writable"])
+
+    def test_preparation_searches_named_calendar(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.preparation_from_request(
+                "What should we prepare for from Nysha school calendar next week?",
+                reference_time=datetime(
+                    2026,
+                    8,
+                    21,
+                    12,
+                    tzinfo=ZoneInfo(DEFAULT_TIMEZONE),
+                ),
+            )
+
+        self.assertEqual(provider.list_calendar_names, ["Nysha school calendar"])
+
+    def test_pronoun_delete_with_named_calendar_does_not_reuse_other_calendar_context(self):
+        provider = FakeProvider()
+        provider.events = []
+        claw = FamilyCalendarClaw.from_provider(provider)
+        claw.last_created_event = {
+            "id": "family-event",
+            "summary": "Family dinner",
+            "calendarId": "family-id",
+            "start": {"dateTime": "2026-07-03T18:00:00-07:00"},
+            "end": {"dateTime": "2026-07-03T19:00:00-07:00"},
+        }
+
+        with redirect_stdout(StringIO()):
+            claw.delete_event_from_request("Delete it from Nysha school calendar")
+
+        self.assertEqual(provider.list_calendar_names, ["Nysha school calendar"])
+        self.assertIsNone(claw.pending_action)
 
     def test_delete_event_partial_title_match(self):
         provider = FakeProvider()
@@ -2607,6 +3881,24 @@ class MilestoneOneRegressionTest(unittest.TestCase):
         self.assertIn("Things to clarify:", message)
         self.assertIn("- Who owns Passport renewal appointment?", message)
         self.assertNotIn("- Does Family photos need preparation?", message)
+
+    def test_briefing_searches_named_calendar(self):
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            claw.briefing_from_request(
+                "Give me next week's briefing from Nysha school calendar",
+                reference_time=datetime(
+                    2026,
+                    8,
+                    21,
+                    12,
+                    tzinfo=ZoneInfo(DEFAULT_TIMEZONE),
+                ),
+            )
+
+        self.assertEqual(provider.list_calendar_names, ["Nysha school calendar"])
 
     def test_briefing_deduplicates_unassigned_and_caps_clarifications(self):
         provider = FakeProvider()

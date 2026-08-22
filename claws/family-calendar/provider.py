@@ -134,16 +134,19 @@ class GoogleCalendarProvider:
                 return label.get("id")
         raise ValueError(f"Calendar event label color not found: {background_color}")
 
-    def _calendar_id_for_name(self, calendar_name):
+    def _calendar_id_for_name(self, calendar_name, min_access_role="writer"):
         if not calendar_name:
             return self.calendar_id
         if calendar_name == self.calendar_id:
             return self.calendar_id
 
         requested = _normalize_calendar_name(calendar_name)
+        requested_names = _calendar_name_aliases(calendar_name)
+        exact_matches = []
+        alias_matches = []
         page_token = None
         while True:
-            list_kwargs = {"maxResults": 250, "minAccessRole": "writer"}
+            list_kwargs = {"maxResults": 250, "minAccessRole": min_access_role}
             if page_token:
                 list_kwargs["pageToken"] = page_token
             response = (
@@ -160,33 +163,63 @@ class GoogleCalendarProvider:
                     calendar.get("summary"),
                     calendar.get("summaryOverride"),
                 ]
-                if calendar_id and any(
-                    _normalize_calendar_name(name) == requested
+                if not calendar_id:
+                    continue
+                normalized_names = {
+                    _normalize_calendar_name(name)
+                    for name in names
+                    if name
+                }
+                if requested in normalized_names:
+                    exact_matches.append(calendar_id)
+                elif any(
+                    requested_names & _calendar_name_aliases(name)
                     for name in names
                     if name
                 ):
-                    return calendar_id
+                    alias_matches.append(calendar_id)
 
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
 
+        unique_exact_matches = list(dict.fromkeys(exact_matches))
+        if len(unique_exact_matches) == 1:
+            return unique_exact_matches[0]
+        if unique_exact_matches:
+            raise ValueError(f"Calendar name is ambiguous: {calendar_name}")
+        unique_matches = list(dict.fromkeys(alias_matches))
+        if len(unique_matches) == 1:
+            return unique_matches[0]
+        if unique_matches:
+            raise ValueError(f"Calendar name is ambiguous: {calendar_name}")
         raise ValueError(f"Calendar not found: {calendar_name}")
 
-    def list_events(self, time_min, time_max, max_results=10):
-        return (
-            self.service.events()
-            .list(
-                calendarId=self.calendar_id,
-                timeMin=time_min,
-                timeMax=time_max,
-                maxResults=max_results,
-                singleEvents=True,
-                orderBy="startTime",
-            )
-            .execute()
-            .get("items", [])
-        )
+    def list_events(
+        self,
+        time_min,
+        time_max,
+        max_results=10,
+        calendar_name=None,
+        writable=False,
+        query=None,
+    ):
+        access_role = "writer" if writable else "reader"
+        calendar_id = self._calendar_id_for_name(calendar_name, min_access_role=access_role)
+        list_kwargs = {
+            "calendarId": calendar_id,
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "maxResults": max_results,
+            "singleEvents": True,
+            "orderBy": "startTime",
+        }
+        if query:
+            list_kwargs["q"] = query
+        events = self.service.events().list(**list_kwargs).execute().get("items", [])
+        for event in events:
+            event["calendarId"] = calendar_id
+        return events
 
     def get_event(self, event_id, calendar_id=None):
         calendar_id = calendar_id or self.calendar_id
@@ -259,3 +292,9 @@ class GoogleCalendarProvider:
 
 def _normalize_calendar_name(value):
     return " ".join(re.findall(r"[a-z0-9]+", str(value).lower()))
+
+
+def _calendar_name_aliases(value):
+    normalized = _normalize_calendar_name(value)
+    without_suffix = re.sub(r"\s+calendar$", "", normalized).strip()
+    return {name for name in (normalized, without_suffix) if name}

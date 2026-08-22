@@ -43,7 +43,7 @@ type TelegramInboundBodyParams = Parameters<typeof resolveTelegramInboundBody>[0
 const imageNotesInstruction =
   "Read the attached image and convert any visible notes into text. If it contains observations, tasks, or things to do, organize them clearly.";
 const imageNotesActionHint =
-  "If the user asks to add or create tasks/items from this image, treat the extracted rows as new items. Do not update a prior task/item unless the user explicitly asks to update, edit, or change an existing one.";
+  "If the user asks to add or create tasks, reminders, calendar events, or items from this image, treat the extracted rows as new items. Do not update a prior task/item unless the user explicitly asks to update, edit, or change an existing one.";
 
 function resolveTelegramBody(overrides: Partial<TelegramInboundBodyParams>) {
   const chatId = overrides.chatId ?? 42;
@@ -376,7 +376,7 @@ describe("resolveTelegramInboundBody", () => {
       filePath: "/tmp/photo-1.webp",
       mime: "image/webp",
       prompt:
-        "Extract all visible notes, observations, tasks, and things to do from this image. Preserve wording when legible. Organize the result clearly and include uncertainty for unclear handwriting.",
+        "Extract all visible notes, observations, tasks, schedules, and things to do from this image. Preserve wording when legible. For schedule tables or flyers, preserve each visible row with date, weekday, time, title/class, location/school, and any first/last date or recurrence wording. Include uncertainty for unclear handwriting or OCR.",
       scopeContext: { channel: "telegram", chatType: "direct" },
     });
     expect(describeImageCall(1)).toMatchObject({

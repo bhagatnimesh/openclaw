@@ -684,6 +684,17 @@ class HomeworkToolsTest(unittest.TestCase):
         titles = [item["title"] for item in response["data"]["items"]]
         self.assertEqual(titles, ["Math homework", "Reading homework"])
 
+    def test_complete_homework_marks_item_submitted(self):
+        captured = self.tools.capture_assignment("/capture homework Nysha reading due 2026-08-22")
+        item_id = captured["data"]["item"]["id"]
+
+        response = self.tools.complete_homework(item_id, now=REFERENCE_TIME)
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["status"], "submitted")
+        open_items = self.tools.list_homework(child="Nysha")["data"]["items"]
+        self.assertEqual(open_items, [])
+
     def test_submission_links_to_best_open_assignment(self):
         self.tools.capture_assignment("/capture homework Nysha All About Me writing due 2026-08-21")
 
@@ -695,6 +706,26 @@ class HomeworkToolsTest(unittest.TestCase):
 
         self.assertEqual(response["status"], "ok")
         self.assertEqual(response["data"]["item"]["status"], "submitted")
+        assets = self.provider.list_assets(response["data"]["item"]["id"])
+        self.assertEqual(assets[-1]["kind"], "submission_photo")
+
+    def test_homework_complete_command_does_not_create_new_assignment(self):
+        captured = self.tools.capture_assignment(
+            "/capture homework Nysha art class due 2026-08-22",
+            now=REFERENCE_TIME,
+        )
+
+        response = self.tools.capture_submission(
+            "/homework complete art class Nysha\n\nImage text:\nSpring season",
+            now=REFERENCE_TIME,
+            source="telegram_photo",
+            photo_path="/static/dashboard/uploads/homework/completed-art.jpg",
+        )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["item"]["id"], captured["data"]["item"]["id"])
+        self.assertEqual(response["data"]["item"]["status"], "submitted")
+        self.assertEqual(len(self.provider.list_items(child="Nysha", limit=20)), 1)
         assets = self.provider.list_assets(response["data"]["item"]["id"])
         self.assertEqual(assets[-1]["kind"], "submission_photo")
 

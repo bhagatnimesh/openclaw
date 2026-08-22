@@ -13,11 +13,9 @@
   var lastShoppingData = {};
   var lastHomeworkData = {};
   var lastBacklogData = {};
-  var lastBedtimeData = {};
   var backlogReviewIndex = -1;
   var selectedReadingChild = "Nysha";
   var selectedShoppingList = "all";
-  var bedtimeVoiceEnabled = false;
 
   function byId(id) {
     return document.getElementById(id);
@@ -93,14 +91,13 @@
     while (target && target !== document) {
       if (
         target.getAttribute("data-task-complete") !== null ||
+        target.getAttribute("data-homework-complete") !== null ||
         target.getAttribute("data-task-tag-filter") !== null ||
         target.getAttribute("data-task-owner-chip") !== null ||
         target.getAttribute("data-reading-child") !== null ||
         target.getAttribute("data-reading-heatmap-day") !== null ||
         target.getAttribute("data-reading-update") !== null ||
         target.getAttribute("data-reading-delete") !== null ||
-        target.getAttribute("data-bedtime-ack") !== null ||
-        target.getAttribute("data-bedtime-voice") !== null ||
         target.getAttribute("data-decision-complete") !== null ||
         target.getAttribute("data-backlog-action") !== null ||
         target.getAttribute("data-shopping-tab") !== null ||
@@ -586,159 +583,6 @@
         );
       })
       .join("");
-  }
-
-  function bedtimeVoiceStorageKey() {
-    return "n4os-dashboard-bedtime-voice";
-  }
-
-  function bedtimeStepMinutes(step) {
-    return parseClockMinutes(step.time || "");
-  }
-
-  function currentClockMinutes() {
-    var now = new Date();
-    return now.getHours() * 60 + now.getMinutes();
-  }
-
-  function setBedtimeStatus(message, state) {
-    var node = byId("bedtime-action-status");
-    if (!node) return;
-    node.textContent = text(message);
-    node.dataset.state = state || "";
-  }
-
-  function setBedtimeVoiceButton() {
-    var button = byId("bedtime-voice-button");
-    if (!button) return;
-    button.textContent = bedtimeVoiceEnabled ? "Voice on" : "Enable voice";
-    button.classList.toggle("is-called-out", bedtimeVoiceEnabled);
-    button.setAttribute("aria-pressed", bedtimeVoiceEnabled ? "true" : "false");
-  }
-
-  function speakBedtimeNudge(message) {
-    if (!bedtimeVoiceEnabled) return false;
-    if (!("speechSynthesis" in window) || typeof window.SpeechSynthesisUtterance !== "function") {
-      setBedtimeStatus("Voice is not supported in this browser.", "error");
-      return false;
-    }
-    try {
-      var utterance = new window.SpeechSynthesisUtterance(message);
-      utterance.rate = 0.98;
-      utterance.pitch = 1.02;
-      utterance.volume = 0.82;
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(utterance);
-      return true;
-    } catch (_error) {
-      setBedtimeVoiceEnabled(false);
-      setBedtimeStatus("Voice failed in this browser, so it was turned off.", "error");
-      return false;
-    }
-  }
-
-  function setBedtimeVoiceEnabled(enabled) {
-    bedtimeVoiceEnabled = !!enabled;
-    try {
-      window.localStorage.setItem(bedtimeVoiceStorageKey(), bedtimeVoiceEnabled ? "1" : "0");
-    } catch (_error) {}
-    setBedtimeVoiceButton();
-  }
-
-  function loadBedtimeVoicePreference() {
-    bedtimeVoiceEnabled = false;
-    try {
-      window.localStorage.setItem(bedtimeVoiceStorageKey(), "0");
-    } catch (_error) {}
-    setBedtimeVoiceButton();
-  }
-
-  function renderBedtime(data) {
-    data = data || {};
-    lastBedtimeData = data;
-    setCardHidden("bedtime", false);
-    setText("bedtime-target", data.target || "7:15 PM upstairs");
-    setText("bedtime-status", data.enabled ? data.status || "School-night routine" : "Off tonight");
-    setBedtimeVoiceButton();
-
-    var node = byId("bedtime-steps");
-    if (!node) return;
-    var steps = data.steps || [];
-    if (!data.enabled) {
-      node.innerHTML = '<p class="empty">No bedtime launch routine tonight.</p>';
-      return;
-    }
-    if (!steps.length) {
-      node.innerHTML = '<p class="empty">No bedtime steps configured.</p>';
-      return;
-    }
-
-    var currentMinutes = currentClockMinutes();
-    node.innerHTML = steps
-      .map(function (step) {
-        var stepMinutes = bedtimeStepMinutes(step);
-        var active = stepMinutes !== null && !step.acknowledged && currentMinutes >= stepMinutes;
-        var ackLabel = step.acknowledged
-          ? "Acked " + new Date(step.acked_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
-          : "Ack";
-        return (
-          '<div class="bedtime-step' +
-          (active ? " is-active" : "") +
-          (step.acknowledged ? " is-acked" : "") +
-          '"><div><span class="bedtime-time">' +
-          escapeHtml(formatClockMinutes(stepMinutes || 0)) +
-          "</span><strong>" +
-          escapeHtml(step.label || "Bedtime step") +
-          "</strong><p>" +
-          escapeHtml(step.detail || "") +
-          '</p></div><button class="bedtime-ack-button" type="button" data-bedtime-ack="' +
-          escapeHtml(step.id || "") +
-          '"' +
-          (step.acknowledged ? " disabled" : "") +
-          ">" +
-          escapeHtml(ackLabel) +
-          "</button></div>"
-        );
-      })
-      .join("");
-  }
-
-  function postBedtimeAck(stepId, button) {
-    if (!stepId) return;
-    if (button) {
-      button.disabled = true;
-      button.textContent = "Acking";
-    }
-    setBedtimeStatus("Acknowledging bedtime step...", "pending");
-
-    var request = new XMLHttpRequest();
-    request.open("POST", "/api/bedtime/ack", true);
-    request.setRequestHeader("Content-Type", "application/json");
-    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
-    request.onreadystatechange = function () {
-      if (request.readyState !== 4) return;
-      var response = {};
-      try {
-        response = JSON.parse(request.responseText || "{}");
-      } catch (_error) {
-        response = {};
-      }
-      if (request.status >= 200 && request.status < 300 && response.status === "ok") {
-        setBedtimeStatus("Bedtime step acknowledged.", "ok");
-        if (response.data && response.data.bedtime) {
-          renderBedtime(response.data.bedtime);
-        } else {
-          loadDashboard();
-        }
-        return;
-      }
-      setBedtimeStatus(response.message || "Bedtime ack failed.", "error");
-      if (button) {
-        button.disabled = false;
-        button.textContent = "Ack";
-      }
-    };
-    request.send(JSON.stringify({ step_id: stepId }));
   }
 
   function readingGardenWeekDays(history, recentEvents, fallbackActiveDays, readToday) {
@@ -2110,6 +1954,19 @@
     ].join("");
   }
 
+  function homeworkCompleteButton(item) {
+    if (!item.id) return "";
+    return (
+      '<button class="task-complete-button" type="button" data-homework-complete="' +
+      escapeHtml(item.id) +
+      '" data-homework-title="' +
+      escapeHtml(item.title || "Homework") +
+      '" aria-label="Complete homework: ' +
+      escapeHtml(item.title || "Homework") +
+      '">Complete</button>'
+    );
+  }
+
   function homeworkItemRow(item) {
     return (
       '<div class="homework-item ' +
@@ -2118,8 +1975,48 @@
       escapeHtml(item.title || "Homework") +
       '</strong><div class="pending-task-badges">' +
       homeworkBadges(item) +
-      "</div></div></div>"
+      "</div></div>" +
+      homeworkCompleteButton(item) +
+      "</div>"
     );
+  }
+
+  function postCompleteHomework(homeworkItemId, button) {
+    if (!homeworkItemId) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Completing";
+    }
+    setTaskActionStatus("Completing homework...", "pending");
+
+    var request = new XMLHttpRequest();
+    request.open("POST", "/api/homework/complete", true);
+    request.setRequestHeader("Content-Type", "application/json");
+    request.setRequestHeader("X-N4OS-Dashboard-Action-Token", actionToken());
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      var payload = {};
+      try {
+        payload = JSON.parse(request.responseText || "{}");
+      } catch (_error) {
+        payload = {};
+      }
+      if (request.status >= 200 && request.status < 300 && payload.status === "ok") {
+        setTaskActionStatus("Homework completed.", "ok");
+        showTaskCelebration(
+          button ? button.getAttribute("data-homework-title") : "",
+          "",
+        );
+        loadDashboard();
+        return;
+      }
+      setTaskActionStatus(payload.message || "Homework completion failed.", "error");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Complete";
+      }
+    };
+    request.send(JSON.stringify({ homework_item_id: homeworkItemId }));
   }
 
   function renderHomework(data) {
@@ -2732,7 +2629,6 @@
     renderTimeline(calendar.today || []);
     renderReadingGarden(data.reading_garden || {});
     renderHomeBoard(data.home_board || {});
-    renderBedtime(data.bedtime || {});
     renderShopping(data.shopping || {});
     renderHomework(data.homework || {});
     renderPrep(calendar.prep_needed || []);
@@ -2799,7 +2695,6 @@
     request.send();
   }
 
-  loadBedtimeVoicePreference();
   loadDashboard();
   syncWakeLock();
   window.setInterval(loadDashboard, refreshMs);
@@ -2846,21 +2741,12 @@
       postReadingDelete(target.getAttribute("data-reading-delete") || "", target);
       return;
     }
-    if (target.getAttribute("data-bedtime-voice") !== null) {
-      setBedtimeVoiceEnabled(!bedtimeVoiceEnabled);
-      if (bedtimeVoiceEnabled) {
-        speakBedtimeNudge("Bedtime voice is on.");
-      } else {
-        setBedtimeStatus("Bedtime voice off.", "pending");
-      }
-      return;
-    }
-    if (target.getAttribute("data-bedtime-ack") !== null) {
-      postBedtimeAck(target.getAttribute("data-bedtime-ack") || "", target);
-      return;
-    }
     if (target.getAttribute("data-decision-complete") !== null) {
       postCompleteDecision(target.getAttribute("data-decision-complete"), target);
+      return;
+    }
+    if (target.getAttribute("data-homework-complete") !== null) {
+      postCompleteHomework(target.getAttribute("data-homework-complete"), target);
       return;
     }
     if (target.getAttribute("data-shopping-tab") !== null) {

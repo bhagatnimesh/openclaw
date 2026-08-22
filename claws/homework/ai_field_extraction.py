@@ -249,6 +249,10 @@ def merge_ai_homework_fields(
         refined["intent"] = "clarify"
         refined["clarification_question"] = _clean_string(ai_fields.get("clarification_question")) or None
         refined["missing_fields"] = list(ai_fields.get("missing_fields") or [])
+    elif refined.get("intent") == "capture_submission" and action == "capture_assignment":
+        # Explicit completion commands are authoritative; AI refinement may enrich
+        # the match fields but must not turn a submission back into a new assignment.
+        refined["intent"] = "capture_submission"
     elif action in VALID_ACTIONS:
         refined["intent"] = action
 
@@ -270,6 +274,8 @@ def merge_ai_homework_fields(
         value = _clean_string(slots.get(slot_key))
         if value:
             refined[intent_key] = value
+    if refined.get("intent") == "capture_submission":
+        refined["status"] = "submitted"
     if refined.get("child"):
         refined["children"] = [str(refined["child"])]
     refined["ai_field_extraction"] = {

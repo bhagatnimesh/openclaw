@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta
 from io import StringIO
+import inspect
 import os
 import re
 import sys
@@ -103,6 +104,17 @@ def _request_with_default_owner(
     if isinstance(metadata, dict) and str(metadata.get("owner") or "unknown").lower() != "unknown":
         return request
     return f"{request}\nOwner: {owner}"
+
+
+def _supports_keyword(callable_value: Any, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_value).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == keyword or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _calendar_module() -> Any:
@@ -562,6 +574,7 @@ class N4OSClaw:
     route_context: RouteContext = field(default_factory=RouteContext)
     last_turn_decision: TurnDecision | None = None
     last_domain_status: str | None = None
+    active_semantic_image_path: str | None = field(default=None, repr=False)
 
     @classmethod
     def default(cls) -> "N4OSClaw":
@@ -580,13 +593,21 @@ class N4OSClaw:
         self,
         request: str,
         reference_time: datetime | None = None,
+        *,
+        source: str = "telegram_text",
+        semantic_image_path: str | None = None,
     ) -> N4OSIntentFrame:
         request = request if parse_explicit_route(request) is not None else improve_entered_text(request)
+        context = self._context_payload()
+        context["input_modality"] = source.split(":", 1)[0]
+        if semantic_image_path:
+            context["semantic_image_path"] = semantic_image_path
         return interpret_request(
             request,
             now=reference_time,
-            context=self._context_payload(),
+            context=context,
             interpreter=self.intent_interpreter,
+            prefer_interpreter=source.startswith(("telegram_voice", "telegram_photo")),
         )
 
     def recognize(
@@ -639,8 +660,11 @@ class N4OSClaw:
         source: str = "telegram_text",
         default_owner: str | None = None,
         photo_path: str | None = None,
+        semantic_image_path: str | None = None,
     ) -> dict[str, Any]:
-        request = request if parse_explicit_route(request) is not None else improve_entered_text(request)
+        self.active_semantic_image_path = semantic_image_path
+        explicit_route = parse_explicit_route(request)
+        request = request if explicit_route is not None else improve_entered_text(request)
         calendar = self.calendar_claw
         tasks = self.tasks_claw
         home_board = self.home_board_claw
@@ -675,6 +699,29 @@ class N4OSClaw:
 
         pending_owner = _pending_owner(calendar, tasks, self.shopping_claw, home_board, decisions)
         if pending_owner is not None:
+            explicit_reply_request = explicit_route.body.strip() if explicit_route else ""
+            explicit_reply_body = explicit_route.body.strip().lower().strip(" .!?") if explicit_route else ""
+            explicit_confirmation_reply = (
+                explicit_route is not None
+                and explicit_route.route == pending_owner
+                and re.fullmatch(
+                    r"(?:yes|y|no|n|cancel)(?:\s+please)?",
+                    explicit_reply_body,
+                )
+                is not None
+            )
+            explicit_value_reply = (
+                explicit_route is not None
+                and explicit_route.route == pending_owner
+                and re.fullmatch(
+                    r"(?:\d+|\d{1,2}(?::\d{2})?\s*(?:am|pm))",
+                    explicit_reply_body,
+                )
+                is not None
+            )
+            if explicit_confirmation_reply or explicit_value_reply:
+                request = explicit_reply_request
+                explicit_route = None
             frame = interpret_request(
                 request,
                 now=reference_time,
@@ -682,7 +729,9 @@ class N4OSClaw:
                 interpreter=None,
             )
             decision = frame.to_route_decision()
-            if _is_confident_new_route(decision, pending_owner):
+            # A slash command starts a new operation even within the same domain.
+            # Otherwise stale clarification state consumes the explicit command.
+            if explicit_route is not None or _is_confident_new_route(decision, pending_owner):
                 _clear_pending_action(calendar)
                 _clear_pending_action(tasks)
                 _clear_pending_action(self.shopping_claw)
@@ -793,7 +842,12 @@ class N4OSClaw:
             self._remember_route(dispatch_request, frame)
             return decision
 
-        frame = self.interpret(request, reference_time=reference_time)
+        frame = self.interpret(
+            request,
+            reference_time=reference_time,
+            source=source,
+            semantic_image_path=semantic_image_path,
+        )
         decision = frame.to_route_decision()
         if (
             decision["route"] == "unknown"
@@ -830,6 +884,7 @@ class N4OSClaw:
         source: str = "telegram_text",
         default_owner: str | None = None,
         photo_path: str | None = None,
+        semantic_image_path: str | None = None,
     ) -> OperationResult:
         """Return one structured turn result while legacy domain CLIs still print."""
 
@@ -844,6 +899,7 @@ class N4OSClaw:
                 source=source,
                 default_owner=default_owner,
                 photo_path=photo_path,
+                semantic_image_path=semantic_image_path,
             )
 
         route = cast(RouteId, str(decision.get("route") or "unknown"))
@@ -960,6 +1016,7 @@ class N4OSClaw:
                 action="family_briefing" if decision["route"] == "both" else action,
                 default_owner=prepared_owner,
                 prepared_fields=prepared.fields,
+                source=source,
             )
             if response:
                 responses.append(response)
@@ -974,6 +1031,7 @@ class N4OSClaw:
                 action="recommend_tasks" if decision["route"] == "both" else action,
                 default_owner=prepared_owner,
                 prepared_fields=prepared.fields,
+                source=source,
             )
             if response:
                 responses.append(response)
@@ -1065,7 +1123,11 @@ class N4OSClaw:
             route=cast(RouteId, frame.route),
             action=frame.action,
             original_input=domain_input,
-            fields={"target": target, "slots": dict(frame.slots)},
+            fields={
+                "target": target,
+                "slots": dict(frame.slots),
+                "decision_source": frame.decision_source,
+            },
         )
 
     def _remember_mutation_route(
@@ -1202,6 +1264,7 @@ class N4OSClaw:
         action: str | None = None,
         default_owner: str | None = None,
         prepared_fields: dict[str, Any] | None = None,
+        source: str = "telegram_text",
     ) -> str:
         module = _calendar_module()
         claw = self._calendar()
@@ -1210,7 +1273,10 @@ class N4OSClaw:
             return _missing_google_dependency_message("Family Calendar")
         extract_calendar_intent = getattr(claw, "_extract_intent_from_request", None)
         if callable(extract_calendar_intent):
-            intent = extract_calendar_intent(request, reference_time)
+            extract_kwargs = {}
+            if _supports_keyword(extract_calendar_intent, "semantic_image_path"):
+                extract_kwargs["semantic_image_path"] = self.active_semantic_image_path
+            intent = extract_calendar_intent(request, reference_time, **extract_kwargs)
         else:
             intent = module.extract_intent(request, now=reference_time)
         if intent.get("intent") == "add_guests" and action in {None, "create_event", "update_event"}:
@@ -1275,6 +1341,11 @@ class N4OSClaw:
                     intent,
                     event_id=event_id,
                     calendar_id=calendar_id,
+                    **(
+                        {"reference_time": reference_time}
+                        if _supports_keyword(claw.add_guests_from_intent, "reference_time")
+                        else {}
+                    ),
                 )
             return claw.add_guests_from_request(
                 request,
@@ -1301,10 +1372,28 @@ class N4OSClaw:
                     event_id=event_id,
                     calendar_id=calendar_id,
                 )
-            return claw.create_event_from_request(
-                _request_with_default_owner(request, intent, default_owner),
-                reference_time=reference_time,
-            )
+            create_request = _request_with_default_owner(request, intent, default_owner)
+            create_intent = dict(intent)
+            owner = (default_owner or "").strip().lower()
+            metadata = dict(create_intent.get("metadata") or {})
+            if owner in DEFAULT_OWNER_VALUES and str(metadata.get("owner") or "unknown") == "unknown":
+                metadata["owner"] = owner
+                create_intent["metadata"] = metadata
+            if source.startswith(("telegram_voice", "telegram_photo")) and _supports_keyword(
+                claw.create_event_from_request,
+                "require_confirmation",
+            ):
+                create_kwargs = {
+                    "reference_time": reference_time,
+                    "require_confirmation": True,
+                }
+                if _supports_keyword(claw.create_event_from_request, "semantic_intent"):
+                    create_kwargs["semantic_intent"] = create_intent
+                return claw.create_event_from_request(create_request, **create_kwargs)
+            create_kwargs = {"reference_time": reference_time}
+            if _supports_keyword(claw.create_event_from_request, "semantic_intent"):
+                create_kwargs["semantic_intent"] = create_intent
+            return claw.create_event_from_request(create_request, **create_kwargs)
 
     def _handle_tasks_request(
         self,
@@ -1313,36 +1402,116 @@ class N4OSClaw:
         action: str | None = None,
         default_owner: str | None = None,
         prepared_fields: dict[str, Any] | None = None,
+        source: str = "telegram_text",
     ) -> str:
         module = _tasks_module()
         claw = self._tasks()
         if claw is None:
             self.last_domain_status = "error"
             return _missing_google_dependency_message("Family Tasks")
-        intent = module.extract_intent(request, now=reference_time)
-        action = action or intent["intent"]
-        task_id = _prepared_target_id(prepared_fields, "task_id", "id")
-        if action == "create_task":
-            return claw.add_task_from_request(
-                _request_with_default_owner(request, intent, default_owner),
+        interpret_tasks = getattr(claw, "interpret_request", None)
+        intent = (
+            interpret_tasks(
+                request,
                 reference_time=reference_time,
+                **(
+                    {"semantic_image_path": self.active_semantic_image_path}
+                    if _supports_keyword(interpret_tasks, "semantic_image_path")
+                    else {}
+                ),
             )
+            if callable(interpret_tasks)
+            else module.extract_intent(request, now=reference_time)
+        )
+        action = action or intent["intent"]
+        if intent.get("intent") != action:
+            semantic_destination = {
+                key: intent.get(key)
+                for key in ("task_list_name", "task_list_id_hint")
+                if intent.get(key)
+            }
+            deterministic_tasks = getattr(claw, "deterministic_intent", None)
+            intent = (
+                deterministic_tasks(request, reference_time=reference_time)
+                if callable(deterministic_tasks)
+                else module.extract_intent(request, now=reference_time)
+            )
+            intent.update(semantic_destination)
+        task_id = _prepared_target_id(prepared_fields, "task_id", "id")
+        task_list_id = (
+            _prepared_target_value(prepared_fields, "task_list_id", "taskListId")
+            or "@default"
+        )
+        resolve_task_list = getattr(claw, "_resolve_task_list", None)
+        if callable(resolve_task_list) and (
+            intent.get("task_list_name") or intent.get("task_list_id_hint")
+        ):
+            task_list_id, task_list_error = resolve_task_list(intent)
+            if task_list_error is not None:
+                claw.last_result = {"status": "needs_information"}
+                return task_list_error
+        if action == "create_task":
+            create_request = _request_with_default_owner(request, intent, default_owner)
+            should_confirm = bool(
+                source.startswith(("telegram_voice", "telegram_photo"))
+                or "Image text:" in request
+                or len(re.findall(r"(?im)^\s*/tasks?\b", request)) > 1
+                or (
+                    callable(getattr(claw, "requires_create_confirmation", None))
+                    and claw.requires_create_confirmation(request)
+                )
+            )
+            if should_confirm and _supports_keyword(
+                claw.add_task_from_request,
+                "require_confirmation",
+            ):
+                return claw.add_task_from_request(
+                    create_request,
+                    reference_time=reference_time,
+                    require_confirmation=True,
+                    semantic_intent=intent,
+                )
+            create_kwargs = {"reference_time": reference_time}
+            if _supports_keyword(claw.add_task_from_request, "semantic_intent"):
+                create_kwargs["semantic_intent"] = intent
+            return claw.add_task_from_request(create_request, **create_kwargs)
         elif action == "update_task":
             if hasattr(claw, "update_task_from_request"):
-                return claw.update_task_from_request(request, task_id=task_id)
+                update_kwargs = {"task_id": task_id}
+                if _supports_keyword(claw.update_task_from_request, "task_list_id"):
+                    update_kwargs["task_list_id"] = task_list_id
+                if _supports_keyword(claw.update_task_from_request, "semantic_intent"):
+                    update_kwargs["semantic_intent"] = intent
+                return claw.update_task_from_request(request, **update_kwargs)
             else:
                 return claw.assign_owner_from_request(request)
         elif action == "complete_task":
-            return claw.complete_task_from_request(request, task_id=task_id)
+            complete_kwargs = {"task_id": task_id}
+            if _supports_keyword(claw.complete_task_from_request, "task_list_id"):
+                complete_kwargs["task_list_id"] = task_list_id
+            if _supports_keyword(claw.complete_task_from_request, "query"):
+                complete_kwargs["query"] = intent.get("query")
+            return claw.complete_task_from_request(request, **complete_kwargs)
         elif action == "delete_task":
-            return claw.delete_task_from_request(request, task_id=task_id)
+            delete_kwargs = {"task_id": task_id}
+            if _supports_keyword(claw.delete_task_from_request, "task_list_id"):
+                delete_kwargs["task_list_id"] = task_list_id
+            if _supports_keyword(claw.delete_task_from_request, "query"):
+                delete_kwargs["query"] = intent.get("query")
+            return claw.delete_task_from_request(request, **delete_kwargs)
         elif action == "run_assistant_help":
-            return claw.run_noah_assistant_help_from_request(
-                request,
-                reference_time=reference_time,
-            )
+            assistant_kwargs = {"reference_time": reference_time}
+            if _supports_keyword(claw.run_noah_assistant_help_from_request, "task_list_id"):
+                assistant_kwargs["task_list_id"] = task_list_id
+            return claw.run_noah_assistant_help_from_request(request, **assistant_kwargs)
         else:
-            return claw.recommend_tasks_from_request(request, reference_time=reference_time)
+            recommend_kwargs = {"reference_time": reference_time}
+            if _supports_keyword(claw.recommend_tasks_from_request, "semantic_intent"):
+                recommend_kwargs.update(
+                    semantic_intent=intent,
+                    task_list_id=task_list_id,
+                )
+            return claw.recommend_tasks_from_request(request, **recommend_kwargs)
 
     def _handle_home_board_request(
         self,

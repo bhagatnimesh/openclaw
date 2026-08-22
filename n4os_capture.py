@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
+import os
 import re
+import threading
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -48,6 +51,7 @@ CAPTURE_REPLY_SNIPPET_LIMIT = 3
 CAPTURE_REPLY_SNIPPET_CHARS = 180
 URL_FETCH_TIMEOUT_SECONDS = 4
 URL_FETCH_MAX_BYTES = 512_000
+_FILE_WRITE_LOCKS: dict[str, threading.Lock] = {}
 
 PEOPLE = {
     "nysha": ("Nysha", "[[family/Nysha|Nysha]]"),
@@ -153,39 +157,56 @@ def ingest_capture_notes(
     default_date: date | None = None,
     source: str = "Telegram",
     url_fetcher: Callable[[str], str | None] | None = None,
+    enrich_links: bool = True,
 ) -> CaptureIngestResult:
     notes = _parse_capture_notes(text, default_date=default_date, source=source)
-    notes = [
-        _enrich_capture_note(note, url_fetcher=url_fetcher)
-        for note in notes
-    ]
-    family_text = _family_ingest_text(notes)
-    family_result = ingest_memory_inbox_notes(
-        family_text,
-        observations_root=n4os_root / "family" / "observations",
-        default_date=default_date,
-        source=source,
-    ) if family_text else MemoryIngestResult(added=[], skipped_duplicates=[])
-
+    if enrich_links:
+        notes = [
+            _enrich_capture_note(note, url_fetcher=url_fetcher)
+            for note in notes
+        ]
+    snapshots = _snapshot_files(_capture_write_paths(notes, n4os_root))
+    family_result = MemoryIngestResult(added=[], skipped_duplicates=[])
     added_journal: list[JournalEntry] = []
     skipped_journal: list[JournalEntry] = []
-    existing_journal_keys = _load_existing_journal_keys(n4os_root / "journal")
-    for note in notes:
-        if not _should_write_journal(note):
-            continue
-        entry = JournalEntry(
-            captured_on=note.captured_on,
-            text=note.text,
-            topics=_topic_labels(note.text),
-            source=note.source,
+    try:
+        family_text = _family_ingest_text(notes)
+        family_result = ingest_memory_inbox_notes(
+            family_text,
+            observations_root=n4os_root / "family" / "observations",
+            default_date=default_date,
+            source=source,
+        ) if family_text else family_result
+
+        existing_journal_keys = _load_existing_journal_keys(n4os_root / "journal")
+        for note in notes:
+            if not _should_write_journal(note):
+                continue
+            entry = JournalEntry(
+                captured_on=note.captured_on,
+                text=note.text,
+                topics=_topic_labels(note.text),
+                source=note.source,
+            )
+            key = _journal_key(entry)
+            if key in existing_journal_keys:
+                skipped_journal.append(entry)
+                continue
+            _append_journal_entry(n4os_root / "journal", entry)
+            existing_journal_keys.add(key)
+            added_journal.append(entry)
+    except Exception:
+        partial_result = CaptureIngestResult(
+            family=family_result,
+            journal_entries=added_journal,
+            skipped_journal_duplicates=skipped_journal,
+            notes=notes,
         )
-        key = _journal_key(entry)
-        if key in existing_journal_keys:
-            skipped_journal.append(entry)
-            continue
-        _append_journal_entry(n4os_root / "journal", entry)
-        existing_journal_keys.add(key)
-        added_journal.append(entry)
+        with suppress(Exception):
+            undo_capture_ingest(partial_result, n4os_root=n4os_root)
+        with suppress(Exception):
+            _restore_file_snapshots(snapshots)
+        raise
 
     return CaptureIngestResult(
         family=family_result,
@@ -193,6 +214,27 @@ def ingest_capture_notes(
         skipped_journal_duplicates=skipped_journal,
         notes=notes,
     )
+
+
+def count_capture_notes(
+    text: str,
+    *,
+    default_date: date | None = None,
+    source: str = "Telegram",
+) -> int:
+    return len(_parse_capture_notes(text, default_date=default_date, source=source))
+
+
+def _capture_write_paths(notes: list[CaptureNote], n4os_root: Path) -> list[Path]:
+    paths: list[Path] = []
+    family_root = n4os_root / "family" / "observations"
+    journal_root = n4os_root / "journal"
+    for note in notes:
+        if _family_observations(note):
+            paths.append(family_root / f"{note.captured_on:%Y-%m}.md")
+        if _should_write_journal(note):
+            paths.append(journal_root / f"{note.captured_on.isoformat()}.md")
+    return paths
 
 
 @dataclass(frozen=True)
@@ -429,7 +471,8 @@ def _enrich_capture_note(
     *,
     url_fetcher: Callable[[str], str | None] | None,
 ) -> CaptureNote:
-    urls = _extract_urls(note.text)
+    preview_urls = set(_extract_link_preview_urls(note.text))
+    urls = [url for url in _extract_urls(note.text) if url not in preview_urls]
     if not urls:
         return note
 
@@ -458,6 +501,19 @@ def _extract_urls(text: str) -> list[str]:
     urls: list[str] = []
     for match in URL_RE.finditer(text):
         url = match.group(0).rstrip(".,;:!?)]}'\"")
+        if url:
+            urls.append(url)
+    return _dedupe_preserving_order(urls)
+
+
+def _extract_link_preview_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    for match in re.finditer(
+        r"\[Link:\s+(?P<url>https?://[^\s;\]]+)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        url = match.group("url").rstrip(".,;:!?)]}'\"")
         if url:
             urls.append(url)
     return _dedupe_preserving_order(urls)
@@ -619,7 +675,12 @@ def _sentences(text: str) -> list[str]:
 
 
 def _remove_person_prefix(text: str, person: str) -> str:
-    stripped = re.sub(rf"^\s*{re.escape(person)}\s*[:,-]?\s*", "", text, flags=re.I)
+    stripped = re.sub(
+        rf"^\s*{re.escape(person)}(?:\s*[:,-]\s*|\s+(?!['’]s\b))",
+        "",
+        text,
+        flags=re.I,
+    )
     return stripped.strip() or text.strip()
 
 
@@ -631,13 +692,12 @@ def _append_journal_entry(journal_root: Path, entry: JournalEntry) -> None:
     journal_root.mkdir(parents=True, exist_ok=True)
     path = journal_root / f"{entry.captured_on.isoformat()}.md"
     links = _capture_note_links(entry.text)
-    if not path.exists():
-        path.write_text(_journal_header(entry, links), encoding="utf-8")
-    else:
-        _merge_frontmatter_links(path, links)
-
-    with path.open("a", encoding="utf-8") as file:
-        file.write(_journal_entry_block(entry) + "\n")
+    with _file_write_lock(path):
+        if path.exists():
+            text = _merge_frontmatter_links_text(path.read_text(encoding="utf-8"), links)
+        else:
+            text = _journal_header(entry, links)
+        _write_text_atomic(path, text + _journal_entry_block(entry) + "\n")
 
 
 def _journal_entry_block(entry: JournalEntry) -> str:
@@ -736,17 +796,26 @@ def _dedupe_preserving_order(values: list[str]) -> list[str]:
 def _merge_frontmatter_links(path: Path, links: list[str]) -> None:
     if not links:
         return
-    text = path.read_text(encoding="utf-8")
+    with _file_write_lock(path):
+        text = path.read_text(encoding="utf-8")
+        updated = _merge_frontmatter_links_text(text, links)
+        if updated != text:
+            _write_text_atomic(path, updated)
+
+
+def _merge_frontmatter_links_text(text: str, links: list[str]) -> str:
+    if not links:
+        return text
     if not text.startswith("---\n"):
-        return
+        return text
     end = text.find("\n---\n", 4)
     if end == -1:
-        return
+        return text
     frontmatter = text[4:end].splitlines()
     existing_links = set(_frontmatter_list_values(frontmatter, "links"))
     new_links = [link for link in links if link not in existing_links]
     if not new_links:
-        return
+        return text
 
     insert_at = _frontmatter_list_end(frontmatter, "links")
     if insert_at is None:
@@ -756,8 +825,44 @@ def _merge_frontmatter_links(path: Path, links: list[str]) -> None:
         frontmatter.insert(insert_at, f"  - \"{link}\"")
 
     body = text[end + len("\n---\n") :]
-    updated = "---\n" + "\n".join(frontmatter) + "\n---\n" + body
-    path.write_text(updated, encoding="utf-8")
+    return "---\n" + "\n".join(frontmatter) + "\n---\n" + body
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{id(text)}.tmp")
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        with suppress(FileNotFoundError):
+            tmp_path.unlink()
+
+
+def _snapshot_files(paths: list[Path]) -> dict[Path, str | None]:
+    snapshots: dict[Path, str | None] = {}
+    for path in paths:
+        if path in snapshots:
+            continue
+        snapshots[path] = path.read_text(encoding="utf-8") if path.exists() else None
+    return snapshots
+
+
+def _restore_file_snapshots(snapshots: dict[Path, str | None]) -> None:
+    for path, text in snapshots.items():
+        if text is None:
+            with suppress(FileNotFoundError):
+                path.unlink()
+            continue
+        _write_text_atomic(path, text)
+
+
+@contextmanager
+def _file_write_lock(path: Path):
+    key = str(path)
+    lock = _FILE_WRITE_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        yield
 
 
 def _frontmatter_list_values(lines: list[str], key: str) -> list[str]:

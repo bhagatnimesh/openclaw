@@ -4,7 +4,9 @@ from datetime import date
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import n4os_memory_inbox
 from n4os_capture import (
     format_capture_reply,
     ingest_capture_notes,
@@ -66,6 +68,23 @@ class N4OSCaptureTest(unittest.TestCase):
         self.assertEqual(len(result.family.added), 1)
         self.assertIn("asked why we do not travel business class", month_text)
 
+    def test_possessive_child_name_is_not_stripped_from_observation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            result = ingest_capture_notes(
+                "Capture Navya's showing interesting skill creating stories.",
+                n4os_root=n4os_root,
+                default_date=date(2026, 7, 21),
+            )
+
+            month_text = (n4os_root / "family" / "observations" / "2026-07.md").read_text(
+                encoding="utf-8",
+            )
+
+        self.assertEqual(len(result.family.added), 1)
+        self.assertIn("Navya's showing interesting skill", month_text)
+        self.assertNotIn("Observation: 's showing", month_text)
+
     def test_capture_enriches_link_context_for_future_patterns(self):
         html = """
         <html>
@@ -98,6 +117,30 @@ class N4OSCaptureTest(unittest.TestCase):
         self.assertIn("title: 60 Brain Teasers for kids {With Answers}", month_text)
         self.assertIn("problem-solving skills and memory", month_text)
         self.assertIn("Easy Brain Teasers (With Answers) for Kids", month_text)
+
+    def test_capture_enrichment_skips_urls_with_existing_previews(self):
+        html = "<html><head><title>New Title</title></head></html>"
+        calls: list[str] = []
+
+        def fetch(url: str) -> str | None:
+            calls.append(url)
+            return html
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            result = ingest_capture_notes(
+                (
+                    "/capture I saved https://new.example and https://keep.example "
+                    "[Link: https://keep.example; title: Keep Title]"
+                ),
+                n4os_root=n4os_root,
+                default_date=date(2026, 7, 21),
+                url_fetcher=fetch,
+            )
+
+        self.assertEqual(calls, ["https://new.example"])
+        self.assertEqual(result.notes[0].text.count("title: Keep Title"), 1)
+        self.assertIn("[Link: https://new.example; title: New Title]", result.notes[0].text)
 
     def test_personal_capture_writes_journal(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -148,6 +191,71 @@ class N4OSCaptureTest(unittest.TestCase):
         self.assertIn("was nervous about school", month_text)
         self.assertIn("[[family/Nysha|Nysha]] was nervous", journal_text)
         self.assertIn("[[playbooks/Fear|unsure]]", journal_text)
+
+    def test_ingest_rolls_back_family_write_when_journal_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            with patch("n4os_capture._write_text_atomic", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    ingest_capture_notes(
+                        "/capture Nysha was nervous about school. I felt proud.",
+                        n4os_root=n4os_root,
+                        default_date=date(2026, 7, 21),
+                    )
+
+            month_path = n4os_root / "family" / "observations" / "2026-07.md"
+            month_text = month_path.read_text(encoding="utf-8") if month_path.exists() else ""
+            month_exists = month_path.exists()
+            journal_path = n4os_root / "journal" / "2026-07-21.md"
+            journal_exists = journal_path.exists()
+
+        self.assertNotIn("was nervous about school", month_text)
+        self.assertFalse(month_exists)
+        self.assertFalse(journal_exists)
+
+    def test_family_capture_does_not_leave_file_when_atomic_write_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            with patch("n4os_memory_inbox._write_text_atomic", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    ingest_capture_notes(
+                        "/capture Nysha was nervous about school.",
+                        n4os_root=n4os_root,
+                        default_date=date(2026, 7, 21),
+                    )
+
+            month_path = n4os_root / "family" / "observations" / "2026-07.md"
+            month_exists = month_path.exists()
+
+        self.assertFalse(month_exists)
+
+    def test_family_batch_rolls_back_first_observation_when_second_write_fails(self):
+        original_append = n4os_memory_inbox._append_observation
+        calls = 0
+
+        def append_then_fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("boom")
+            return original_append(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            with patch("n4os_memory_inbox._append_observation", side_effect=append_then_fail_second):
+                with self.assertRaises(RuntimeError):
+                    ingest_capture_notes(
+                        "/capture Nysha was nervous.\nNavya was focused.",
+                        n4os_root=n4os_root,
+                        default_date=date(2026, 7, 21),
+                    )
+
+            month_path = n4os_root / "family" / "observations" / "2026-07.md"
+            month_text = month_path.read_text(encoding="utf-8") if month_path.exists() else ""
+            month_exists = month_path.exists()
+
+        self.assertEqual(month_text, "")
+        self.assertFalse(month_exists)
 
     def test_capture_updates_existing_journal_frontmatter_links(self):
         with tempfile.TemporaryDirectory() as tmpdir:

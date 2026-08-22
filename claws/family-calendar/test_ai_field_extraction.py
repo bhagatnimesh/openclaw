@@ -53,6 +53,21 @@ class CalendarAIFieldExtractionTest(unittest.TestCase):
                 {"action": "send_email", "confidence": 0.99, "slots": {}},
                 "request",
             )
+
+    def test_validate_rejects_clarify_operation_instead_of_coercing_to_create(self):
+        with self.assertRaises(ValueError):
+            validate_calendar_ai_fields(
+                {
+                    "operation": "clarify",
+                    "confidence": 0.99,
+                    "event": {},
+                    "calendar": {},
+                    "list": {},
+                    "target": {},
+                    "missing_fields": ["date"],
+                },
+                "Add dentist",
+            )
         with self.assertRaises(ValueError):
             validate_calendar_ai_fields(
                 {"action": "create_event", "confidence": 0.4, "slots": {}},
@@ -110,6 +125,10 @@ class CalendarAIFieldExtractionTest(unittest.TestCase):
         self.assertEqual(frame["action"], "add_guests")
         self.assertEqual(calls[0]["timeout"], 8)
         self.assertFalse(calls[0]["body"]["store"])
+        schema_format = calls[0]["body"]["text"]["format"]
+        self.assertEqual(schema_format["type"], "json_schema")
+        self.assertTrue(schema_format["strict"])
+        self.assertFalse(schema_format["schema"]["additionalProperties"])
 
     def test_validate_maps_google_calendar_api_context_fields(self):
         frame = validate_calendar_ai_fields(
@@ -141,6 +160,42 @@ class CalendarAIFieldExtractionTest(unittest.TestCase):
                 "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TH"],
             },
         )
+
+    def test_validate_maps_mutation_target_query(self):
+        frame = validate_calendar_ai_fields(
+            {
+                "operation": "update_event",
+                "confidence": 0.96,
+                "calendar": {"name": "Kids"},
+                "event": {},
+                "list": {},
+                "target": {"query": "dentist appointment"},
+                "missing_fields": [],
+            },
+            "Move the dentist appointment to Friday",
+        )
+
+        self.assertEqual(frame["slots"]["target_reference"], "dentist appointment")
+
+    def test_validate_normalizes_model_weekday_and_drops_contradictory_missing_date(self):
+        frame = validate_calendar_ai_fields(
+            {
+                "operation": "create_event",
+                "confidence": 0.96,
+                "calendar": {"name": "Kids"},
+                "event": {
+                    "summary": "Soccer practice",
+                    "start": {"dateTime": "2026-08-27T17:00:00-07:00"},
+                    "end": {"dateTime": "2026-08-27T18:00:00-07:00"},
+                    "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=THU"],
+                },
+                "missing_fields": ["date"],
+            },
+            "Soccer practice every Thursday starting next week",
+        )
+
+        self.assertEqual(frame["slots"]["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=TH"])
+        self.assertEqual(frame["missing_fields"], [])
 
     def test_from_env_or_none_is_explicit_opt_in(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True):

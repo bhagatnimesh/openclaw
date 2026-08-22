@@ -221,6 +221,46 @@ DEFAULT_METADATA = {
     "assistant_context": "",
 }
 
+
+TASK_COMMAND_ACTIONS = {
+    "create_task",
+    "complete_task",
+    "delete_task",
+    "update_task",
+    "recommend_tasks",
+    "run_assistant_help",
+}
+TASK_PREFIX_RE = re.compile(
+    r"^\s*/?(?:tasks?|todos?|to-dos?)(?:@[A-Za-z0-9_]+)?(?:\s+|:\s*|$)",
+    re.IGNORECASE,
+)
+TASK_READ_ACTION_RE = re.compile(
+    r"^\s*(?:show|list|what|which|recommend|give)\b",
+    re.IGNORECASE,
+)
+TASK_COMPLETE_ACTION_RE = re.compile(
+    r"^\s*(?:complete|completed|finish|finished|done|"
+    r"mark\s+(?:(?:task|todo|to-do)\s+)?(?:done\s+)?)\b",
+    re.IGNORECASE,
+)
+TASK_DELETE_ACTION_RE = re.compile(
+    r"^\s*(?:delete|remove)\b",
+    re.IGNORECASE,
+)
+TASK_UPDATE_ACTION_RE = re.compile(
+    r"^\s*(?:update|change|assign|set|make|put)\b",
+    re.IGNORECASE,
+)
+TASK_HELP_ACTION_RE = re.compile(
+    r"^\s*(?:help(?:\s+(?:how|with|on|for|what|commands?|\?))?|"
+    r"how\s+do\s+i|how\s+to|what\s+command|commands?\b|\?)",
+    re.IGNORECASE,
+)
+TASK_AS_TASK_RE = re.compile(
+    r"\b(?:as|into)\s+(?:a\s+)?(?:task|todo|to-do|open loop)\b",
+    re.IGNORECASE,
+)
+
 HOUSEHOLD_PHYSICAL_WORDS = (
     "change",
     "fix",
@@ -303,7 +343,8 @@ CREATE_TASK_REQUEST_RE = re.compile(
     r"^\s*(?:(?:/tasks?|tasks?)\s+)?(?:please\s+)?"
     r"(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
     r"(?:add|create|capture|remember)\s+(?:an?\s+)?"
-    r"(?:task|todo|to-do|open loop)\b",
+    r"(?:(?:task|todo|to-do|open loop)\b|"
+    r"(?:tasks|todos|to-dos|open loops)\b(?=\s+to\b))",
     re.IGNORECASE,
 )
 CREATE_TASK_TRANSCRIPTION_RE = re.compile(
@@ -1280,7 +1321,8 @@ def _strip_create_words(user_text: str) -> str:
         r"^\s*(?:(?:/tasks?|tasks?)\s+)?(?:please\s+)?(?:"
         r"(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
         r"(?:add|create|capture|remember)\s+(?:an?\s+)?"
-        r"(?:(?:task|todo|to-do|open loop)\b[:\s-]*)?(?:to\s+)?"
+        r"(?:(?:(?:task|todo|to-do|open loop)\b[:\s-]*(?:to\s+)?|"
+        r"(?:tasks|todos|to-dos|open loops)\b[:\s-]*to\s+))?"
         r"|to\s+)",
         "",
         user_text,
@@ -1538,14 +1580,167 @@ def _extract_recommendation_filters(
 
 def _extract_query_after_action(user_text: str) -> str | None:
     cleaned = re.sub(
-        r"^\s*(?:complete|finish|mark|delete|remove)\s+(?:task\s+)?",
+        r"^\s*(?:(?:/tasks?|tasks?|todos?|to-dos?)(?:@[A-Za-z0-9_]+)?\s+)?"
+        r"(?:(?:complete|completed|finish|finished|done|delete|remove|"
+        r"update|change|assign|set|make|put)\s+"
+        r"(?:(?:task|todo|to-do)\s+)?|mark\s+(?:(?:task|todo|to-do)\s+)?(?:done\s+)?)",
         "",
         user_text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s+(?:(?:with\s+)?owner\s*(?::|is)?\s+|assigned?\s+to\s+)"
+        rf"(?:{OWNER_ALIAS_PATTERN})\b.*$",
+        "",
+        cleaned,
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(r"\s+done$", "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.strip(" .")
     return cleaned or None
+
+
+def _task_command_parts(user_text: str) -> tuple[bool, str]:
+    match = TASK_PREFIX_RE.match(user_text)
+    if match is None:
+        return False, user_text.strip()
+    return True, user_text[match.end() :].strip()
+
+
+def _as_task_create_body(text: str) -> str | None:
+    match = TASK_AS_TASK_RE.search(text)
+    if match is None:
+        return None
+    body = text[: match.start()].strip(" .,:;-")
+    body = re.sub(r"^\s*help\s+me\s+", "", body, flags=re.IGNORECASE)
+    body = re.sub(
+        r"^\s*(?:please\s+)?(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+",
+        "",
+        body,
+        flags=re.IGNORECASE,
+    )
+    return _clean_spaces(body) or None
+
+
+def _task_create_request_for_action(user_text: str) -> str:
+    has_prefix, body = _task_command_parts(user_text)
+    as_task_body = _as_task_create_body(body)
+    if as_task_body is None:
+        as_task_body = _as_task_create_body(user_text)
+    if as_task_body is not None:
+        return f"add task: {as_task_body}"
+    return _normalize_create_request_text(body if has_prefix else user_text)
+
+
+def _can_default_create_from_task_prefix(body: str) -> bool:
+    words = re.findall(r"[A-Za-z0-9]+", body)
+    if len(words) < 3:
+        return False
+    return bool(
+        _has_explicit_clock_time(body)
+        or re.search(
+            r"\b(today|tomorrow|tonight|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next\s+week)\b",
+            body,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def score_task_command_candidates(user_text: str, now: datetime | None = None) -> list[dict[str, Any]]:
+    del now
+    has_prefix, body = _task_command_parts(user_text)
+    target_text = body if has_prefix else user_text.strip()
+    lowered = target_text.lower().strip()
+    candidates: list[dict[str, Any]] = []
+
+    def add(action: str, confidence: float, normalized_request: str, *evidence: str) -> None:
+        candidates.append(
+            {
+                "action": action,
+                "confidence": round(max(0.0, min(confidence, 1.0)), 2),
+                "normalized_request": normalized_request,
+                "evidence": tuple(value for value in evidence if value),
+            }
+        )
+
+    if not lowered:
+        return candidates
+
+    if TASK_HELP_ACTION_RE.match(lowered):
+        add(
+            "help_task",
+            0.98 if has_prefix else 0.72,
+            user_text.strip(),
+            "task prefix + help cue" if has_prefix else "task help cue",
+        )
+
+    if _is_run_assistant_help_request(target_text):
+        add("run_assistant_help", 0.96, target_text, "assistant help run cue")
+
+    if TASK_COMPLETE_ACTION_RE.match(lowered):
+        add(
+            "complete_task",
+            0.96 if has_prefix else 0.9,
+            target_text,
+            "task prefix + completion cue" if has_prefix else "completion cue",
+        )
+
+    if TASK_DELETE_ACTION_RE.match(lowered):
+        add(
+            "delete_task",
+            0.95 if has_prefix else 0.88,
+            target_text,
+            "task prefix + delete cue" if has_prefix else "delete cue",
+        )
+
+    if TASK_UPDATE_ACTION_RE.match(lowered):
+        add(
+            "update_task",
+            0.92 if has_prefix else 0.72,
+            target_text,
+            "task prefix + update cue" if has_prefix else "update cue",
+        )
+
+    as_task_body = _as_task_create_body(target_text) or _as_task_create_body(user_text)
+    has_create_request = CREATE_TASK_REQUEST_RE.search(lowered) is not None
+    has_bare_task_start = CREATE_TASK_START_RE.search(lowered) is not None
+    has_reminder = re.search(r"^\s*remind\s+me\s+to\b", lowered) is not None
+    if as_task_body is not None or has_create_request or has_reminder or (
+        has_bare_task_start
+        and not _has_explicit_clock_time(target_text)
+        and not TASK_READ_ACTION_RE.match(lowered)
+    ):
+        add(
+            "create_task",
+            0.93 if as_task_body is not None else (0.92 if has_prefix or has_create_request else 0.86),
+            _task_create_request_for_action(user_text),
+            "as-task create cue" if as_task_body is not None else "create cue",
+        )
+    elif (
+        has_prefix
+        and not TASK_READ_ACTION_RE.match(lowered)
+        and not TASK_HELP_ACTION_RE.match(lowered)
+        and _can_default_create_from_task_prefix(body)
+    ):
+        add(
+            "create_task",
+            0.84,
+            _normalize_create_request_text(body),
+            "task prefix + task body",
+        )
+
+    if TASK_READ_ACTION_RE.match(lowered):
+        add(
+            "recommend_tasks",
+            0.9 if has_prefix else 0.72,
+            target_text,
+            "task prefix + read cue" if has_prefix else "read cue",
+        )
+
+    return sorted(
+        candidates,
+        key=lambda candidate: (-float(candidate["confidence"]), str(candidate["action"])),
+    )
 
 
 def _normalize_create_request_text(user_text: str) -> str:
@@ -1581,26 +1776,45 @@ def extract_intent(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     reference = _default_now(now)
-    intent_text, assistant_metadata, _ = _extract_assistant_help(user_text)
-    request_text = _normalize_create_request_text(intent_text or user_text)
+    intent_text, assistant_metadata, assistant_notes = _extract_assistant_help(user_text)
+    action_text = intent_text or user_text
+    candidates = score_task_command_candidates(action_text, now=reference)
+    executable_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("action") in TASK_COMMAND_ACTIONS
+    ]
+    top_action = executable_candidates[0] if executable_candidates else None
+    request_text = str(
+        top_action.get("normalized_request")
+        if top_action is not None
+        else _normalize_create_request_text(action_text)
+    )
     lowered = request_text.lower().strip()
 
-    if _is_run_assistant_help_request(request_text):
+    if top_action is not None and top_action.get("action") == "run_assistant_help":
         return {
             "intent": "run_assistant_help",
             "missing_fields": [],
         }
 
-    if re.search(r"^\s*(?:complete|finish|mark)\b", lowered):
+    if top_action is not None and top_action.get("action") == "complete_task":
         return {
             "intent": "complete_task",
             "query": _extract_query_after_action(request_text),
             "missing_fields": [],
         }
 
-    if re.search(r"^\s*(?:delete|remove)\b", lowered):
+    if top_action is not None and top_action.get("action") == "delete_task":
         return {
             "intent": "delete_task",
+            "query": _extract_query_after_action(request_text),
+            "missing_fields": [],
+        }
+
+    if top_action is not None and top_action.get("action") == "update_task":
+        return {
+            "intent": "update_task",
             "query": _extract_query_after_action(request_text),
             "missing_fields": [],
         }
@@ -1608,11 +1822,24 @@ def extract_intent(
     has_assistant_help = bool(assistant_metadata.get("assistant_help_needed"))
     has_create_request = CREATE_TASK_REQUEST_RE.search(lowered) is not None
     has_bare_task_start = CREATE_TASK_START_RE.search(lowered) is not None
-    if (has_assistant_help and request_text) or has_create_request or (
+    if (
+        top_action is not None
+        and top_action.get("action") == "create_task"
+    ) or (has_assistant_help and request_text) or has_create_request or (
         has_bare_task_start
         and not _has_explicit_clock_time(request_text)
     ):
-        return _extract_create_intent(_normalize_create_request_text(user_text), reference)
+        result = _extract_create_intent(request_text, reference)
+        if assistant_metadata:
+            metadata = dict(result.get("metadata") or {})
+            metadata.update(assistant_metadata)
+            result["metadata"] = normalize_metadata(metadata)
+        if assistant_notes:
+            result["notes"] = _join_note_sections(
+                result.get("notes") if isinstance(result.get("notes"), str) else None,
+                assistant_notes,
+            )
+        return result
 
     return {
         "intent": "recommend_tasks",

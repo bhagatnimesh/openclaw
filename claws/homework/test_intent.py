@@ -4,7 +4,7 @@ from datetime import datetime
 import unittest
 from zoneinfo import ZoneInfo
 
-from claws.homework.intent import extract_intent
+from claws.homework.intent import extract_intent, is_homework_capture
 
 
 REFERENCE_TIME = datetime(2026, 8, 14, 9, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -76,6 +76,18 @@ class HomeworkIntentTest(unittest.TestCase):
 
         self.assertEqual(intent["intent"], "capture_submission")
         self.assertEqual(intent["status"], "submitted")
+
+    def test_homework_complete_command_is_submission(self):
+        request = "/homework complete art class Nysha"
+
+        intent = extract_intent(request, now=REFERENCE_TIME)
+
+        self.assertTrue(is_homework_capture(request))
+        self.assertEqual(intent["intent"], "capture_submission")
+        self.assertEqual(intent["status"], "submitted")
+        self.assertEqual(intent["child"], "Nysha")
+        self.assertEqual(intent["subject"], "Art")
+        self.assertEqual(intent["title"], "art class")
 
     def test_missing_due_date_still_creates_assignment_intent(self):
         intent = extract_intent("/capture homework Nysha spelling worksheet", now=REFERENCE_TIME)

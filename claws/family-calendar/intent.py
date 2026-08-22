@@ -58,11 +58,14 @@ CALENDAR_TARGET_FOLLOW_WORD_PATTERN = "|".join(
         "around",
         "on",
         "from",
+        "to",
         "every",
         "repeat",
         "repeating",
         "today",
         "tomorrow",
+        "this",
+        "next",
         "time",
         "location",
         MONTH_NAME_PATTERN,
@@ -82,6 +85,27 @@ WEEKDAY_RRULE_CODES = {
     "saturday": "SA",
     "sunday": "SU",
 }
+RRULE_CODE_WEEKDAYS = {
+    code: WEEKDAYS[name]
+    for name, code in WEEKDAY_RRULE_CODES.items()
+}
+WEEKDAY_ALIASES = {
+    **WEEKDAYS,
+    "mon": WEEKDAYS["monday"],
+    "tue": WEEKDAYS["tuesday"],
+    "tues": WEEKDAYS["tuesday"],
+    "wed": WEEKDAYS["wednesday"],
+    "thu": WEEKDAYS["thursday"],
+    "thur": WEEKDAYS["thursday"],
+    "thurs": WEEKDAYS["thursday"],
+    "fri": WEEKDAYS["friday"],
+    "sat": WEEKDAYS["saturday"],
+    "sun": WEEKDAYS["sunday"],
+}
+WEEKDAY_ALIAS_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(WEEKDAY_ALIASES, key=len, reverse=True)
+)
 ORDINAL_WEEKDAY_POSITIONS = {
     "first": 1,
     "1st": 1,
@@ -549,6 +573,364 @@ def _current_or_next_weekday(reference: datetime, weekday: int) -> datetime:
     return reference + timedelta(days=(weekday - reference.weekday()) % 7)
 
 
+def _recurring_weekdays(recurrence: dict[str, Any]) -> set[int] | None:
+    rrule = str(recurrence.get("rrule") or "").upper()
+    if "FREQ=DAILY" in rrule:
+        return set(range(7))
+
+    match = re.search(r"(?:^|;)BYDAY=([A-Z,]+)", rrule.removeprefix("RRULE:"))
+    if match is None:
+        return None
+
+    weekdays = {
+        RRULE_CODE_WEEKDAYS[code]
+        for code in match.group(1).split(",")
+        if code in RRULE_CODE_WEEKDAYS
+    }
+    return weekdays or None
+
+
+def _advance_recurring_date_after_reference(
+    event_date: str | None,
+    start_time: str | None,
+    recurrence: dict[str, Any],
+    reference: datetime,
+) -> str | None:
+    if event_date is None or start_time is None:
+        return event_date
+
+    try:
+        parsed = datetime.fromisoformat(f"{event_date}T{start_time}:00").replace(
+            tzinfo=reference.tzinfo or ZoneInfo(DEFAULT_TIMEZONE),
+        )
+    except ValueError:
+        return event_date
+
+    rrule = str(recurrence.get("rrule") or "").upper()
+    ordinal_match = re.search(
+        r"(?:^|;)FREQ=MONTHLY(?:;[^;]+)*;BYDAY=(?P<weekday>[A-Z]{2})"
+        r"(?:;[^;]+)*;BYSETPOS=(?P<position>-?\d+)",
+        rrule.removeprefix("RRULE:"),
+    )
+    if ordinal_match is not None and ordinal_match.group("weekday") in RRULE_CODE_WEEKDAYS:
+        weekday = RRULE_CODE_WEEKDAYS[ordinal_match.group("weekday")]
+        position = int(ordinal_match.group("position"))
+        candidate = _current_or_next_ordinal_weekday(reference, weekday, position).replace(
+            hour=parsed.hour,
+            minute=parsed.minute,
+        )
+        if candidate <= reference:
+            next_month = reference.month % 12 + 1
+            next_year = reference.year + (1 if reference.month == 12 else 0)
+            candidate = _current_or_next_ordinal_weekday(
+                datetime(next_year, next_month, 1, tzinfo=reference.tzinfo),
+                weekday,
+                position,
+            ).replace(hour=parsed.hour, minute=parsed.minute)
+        return candidate.date().isoformat()
+
+    frequency_match = re.search(
+        r"(?:^|;)FREQ=(?P<frequency>[A-Z]+)(?:;|$)",
+        rrule.removeprefix("RRULE:"),
+    )
+    frequency = frequency_match.group("frequency") if frequency_match is not None else None
+    if frequency not in {"DAILY", "WEEKLY"}:
+        # Keep DTSTART unchanged for recurrence shapes this helper cannot
+        # advance exactly; Google Calendar will expand their future instances.
+        return event_date
+
+    weekdays = _recurring_weekdays(recurrence)
+    while parsed <= reference or (
+        weekdays is not None and parsed.weekday() not in weekdays
+    ):
+        # The first occurrence for implicit recurring requests must be future
+        # and must still land on one of the recurrence days.
+        parsed += timedelta(days=1)
+    return parsed.date().isoformat()
+
+
+def _image_text_from_request(user_text: str) -> str:
+    markers = (
+        r"(?im)^\s*Image text:\s*$",
+        r"(?im)^\s*\[Image text extraction[^\]]*\]:\s*$",
+    )
+    starts = [
+        match.end()
+        for marker in markers
+        for match in [re.search(marker, user_text)]
+        if match is not None
+    ]
+    if not starts:
+        return ""
+
+    image_text = user_text[min(starts) :]
+    image_text = re.split(
+        r"(?im)^\s*If the user asks to add or create tasks",
+        image_text,
+        maxsplit=1,
+    )[0]
+    return image_text.strip()
+
+
+def _request_without_image_text(user_text: str) -> str:
+    marker = re.search(
+        r"(?im)^\s*(?:Image text:|\[Image text extraction[^\]]*\]:)\s*$",
+        user_text,
+    )
+    if marker is None:
+        return user_text
+    return user_text[: marker.start()].strip()
+
+
+def _parse_image_schedule_rows(
+    image_text: str,
+    reference: datetime,
+) -> list[dict[str, Any]]:
+    if not image_text:
+        return []
+
+    weekday_pattern = rf"(?P<weekday>{WEEKDAY_ALIAS_PATTERN})"
+    date_pattern = (
+        rf"(?P<date>(?:{MONTH_NAME_PATTERN})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?"
+        r"(?:,?\s+\d{2,4})?|\d{1,2}/\d{1,2}(?:/\d{2,4})?|"
+        r"\d{4}-\d{1,2}-\d{1,2})"
+    )
+    clock_pattern = r"\d{1,2}(?:(?::|\.|．)\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)"
+    time_pattern = rf"(?P<time>{clock_pattern})"
+    end_time_pattern = rf"(?P<end_time>{clock_pattern})"
+    row_re = re.compile(
+        rf"(?:\b{weekday_pattern}\b[,\s]+)?{date_pattern}[^\n]{{0,80}}?\b{time_pattern}\b"
+        rf"(?:\s*(?:-|–|—|to)\s*\b{end_time_pattern}\b)?",
+        re.IGNORECASE,
+    )
+    month_date_re = re.compile(
+        rf"(?P<month>{MONTH_NAME_PATTERN})\.?\s+(?P<day>\d{{1,2}})"
+        r"(?:st|nd|rd|th)?(?:,?\s+(?P<year>\d{2,4}))?",
+        re.IGNORECASE,
+    )
+    numeric_date_re = re.compile(
+        r"(?P<month>\d{1,2})/(?P<day>\d{1,2})(?:/(?P<year>\d{2,4}))?",
+    )
+    year_range_match = re.search(
+        r"\b(?P<start>20\d{2})\s*[-–—/]\s*(?P<end>20\d{2})\b",
+        image_text,
+    )
+    year_range = (
+        (int(year_range_match.group("start")), int(year_range_match.group("end")))
+        if year_range_match is not None
+        else None
+    )
+    row_matches = [
+        (line, match)
+        for line in image_text.splitlines()
+        for match in row_re.finditer(line)
+    ]
+    yearless_months: list[int] = []
+    for _, match in row_matches:
+        date_match = month_date_re.fullmatch(match.group("date").strip())
+        date_match = date_match or numeric_date_re.fullmatch(match.group("date").strip())
+        if date_match is None or date_match.group("year") is not None:
+            continue
+        month_text = date_match.group("month")
+        yearless_months.append(
+            int(month_text) if month_text.isdigit() else MONTHS[month_text.rstrip(".").lower()]
+        )
+    has_yearless_wrap = any(
+        current < previous for previous, current in zip(yearless_months, yearless_months[1:])
+    )
+    starts_in_next_year = (
+        bool(yearless_months)
+        and yearless_months[0] < reference.month
+        and not has_yearless_wrap
+    )
+    previous_yearless_month: int | None = None
+    yearless_offset = 1 if starts_in_next_year else 0
+
+    rows: list[dict[str, Any]] = []
+    for line, match in row_matches:
+        date_text = match.group("date").strip()
+        month_match = month_date_re.fullmatch(date_text)
+        numeric_match = numeric_date_re.fullmatch(date_text)
+        if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", date_text):
+            try:
+                parsed_date = datetime.fromisoformat(date_text).date().isoformat()
+            except ValueError:
+                parsed_date = None
+        else:
+            date_match = month_match or numeric_match
+            if date_match is None:
+                parsed_date = None
+            else:
+                month_text = date_match.group("month")
+                month = (
+                    int(month_text)
+                    if month_text.isdigit()
+                    else MONTHS[month_text.rstrip(".").lower()]
+                )
+                day = int(date_match.group("day"))
+                if date_match.group("year") is None:
+                    if year_range is not None:
+                        school_year = year_range[0] if month >= 7 else year_range[1]
+                        try:
+                            parsed_date = datetime(school_year, month, day).date().isoformat()
+                        except ValueError:
+                            parsed_date = None
+                    else:
+                        if previous_yearless_month is not None and month < previous_yearless_month:
+                            yearless_offset += 1
+                        try:
+                            parsed_date = datetime(
+                                reference.year + yearless_offset,
+                                month,
+                                day,
+                            ).date().isoformat()
+                        except ValueError:
+                            parsed_date = None
+                    previous_yearless_month = month
+                else:
+                    parsed_date = _date_for_month_day(
+                        month,
+                        day,
+                        date_match.group("year"),
+                        reference,
+                    )
+        parsed_time = _time_from_slot(match.group("time"))
+        if parsed_date is None or parsed_time is None:
+            continue
+        end_time = _time_from_slot(match.group("end_time")) if match.group("end_time") else None
+        duration_minutes = None
+        if end_time is not None:
+            start_minutes = int(parsed_time[:2]) * 60 + int(parsed_time[3:])
+            end_minutes = int(end_time[:2]) * 60 + int(end_time[3:])
+            duration_minutes = (end_minutes - start_minutes) % (24 * 60)
+            if duration_minutes == 0:
+                duration_minutes = None
+        actual_weekday = datetime.fromisoformat(f"{parsed_date}T00:00:00").weekday()
+        weekday_text = match.group("weekday")
+        stated_weekday = (
+            WEEKDAY_ALIASES[_alias_key(weekday_text)]
+            if weekday_text is not None
+            else actual_weekday
+        )
+        rows.append(
+            {
+                "date": parsed_date,
+                "start_time": parsed_time,
+                "duration_minutes": duration_minutes,
+                "weekday": actual_weekday,
+                "weekday_matches_date": stated_weekday == actual_weekday,
+                "context": _clean_spaces(
+                    f"{line[: match.start()]} {line[match.end() :]}"
+                ).strip(" -|:"),
+                "source_text": _clean_spaces(match.group(0)),
+            }
+        )
+    return rows
+
+
+def _select_image_schedule_rows(
+    rows: list[dict[str, Any]],
+    title: str | None,
+) -> list[dict[str, Any]]:
+    contexts = {
+        _alias_key(str(row.get("context") or ""))
+        for row in rows
+        if str(row.get("context") or "").strip()
+    }
+    if len(contexts) <= 1:
+        return rows
+    if not title:
+        return []
+
+    generic_activity_tokens = {
+        "activity",
+        "appointment",
+        "class",
+        "event",
+        "lesson",
+        "meeting",
+        "practice",
+        "session",
+    }
+    title_tokens = set(re.findall(r"[a-z0-9]+", title.lower())) - generic_activity_tokens
+    if not title_tokens:
+        return []
+    return [
+        row
+        for row in rows
+        if title_tokens
+        & set(re.findall(r"[a-z0-9]+", str(row.get("context") or "").lower()))
+    ]
+
+
+def _is_future_image_schedule_row(row: dict[str, Any], reference: datetime) -> bool:
+    candidate = datetime.fromisoformat(f"{row['date']}T{row['start_time']}:00").replace(
+        tzinfo=reference.tzinfo or ZoneInfo(DEFAULT_TIMEZONE),
+    )
+    normalized_reference = (
+        reference
+        if reference.tzinfo is not None
+        else reference.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+    )
+    return candidate > normalized_reference
+
+
+def _image_schedule_evidence(
+    user_text: str,
+    reference: datetime,
+    title: str | None = None,
+) -> dict[str, Any] | None:
+    rows = _parse_image_schedule_rows(_image_text_from_request(user_text), reference)
+    rows = _select_image_schedule_rows(rows, title)
+    rows = [row for row in rows if _is_future_image_schedule_row(row, reference)]
+    if not rows:
+        return None
+
+    first = sorted(rows, key=lambda row: row["date"])[0]
+    weekdays = sorted({int(row["weekday"]) for row in rows})
+    schedule_dates = sorted({str(row["date"]) for row in rows})
+    row_contexts = {
+        _alias_key(str(row.get("context") or ""))
+        for row in rows
+        if str(row.get("context") or "").strip()
+    }
+    has_weekly_cadence = (
+        len(schedule_dates) >= 2
+        and len(row_contexts) <= 1
+        and len({str(row["start_time"]) for row in rows}) == 1
+        and all(bool(row["weekday_matches_date"]) for row in rows)
+        and all(
+            (
+                datetime.fromisoformat(f"{current}T00:00:00")
+                - datetime.fromisoformat(f"{previous}T00:00:00")
+            ).days
+            == 7
+            for previous, current in zip(schedule_dates, schedule_dates[1:])
+        )
+    )
+    weekday_codes = [
+        WEEKDAY_RRULE_CODES[name]
+        for weekday in weekdays
+        for name, value in WEEKDAYS.items()
+        if value == weekday
+    ]
+    evidence: dict[str, Any] = {
+        "source": "image",
+        "date": first["date"],
+        "start_time": first["start_time"],
+        "row_count": len(rows),
+        "source_text": first["source_text"],
+    }
+    if first.get("duration_minutes"):
+        evidence["duration_minutes"] = first["duration_minutes"]
+    if len(weekday_codes) == 1 and has_weekly_cadence:
+        evidence["recurrence"] = [f"RRULE:FREQ=WEEKLY;BYDAY={','.join(weekday_codes)}"]
+        if len(weekday_codes) == 1:
+            weekday_name = next(name for name, value in WEEKDAYS.items() if value == weekdays[0])
+            evidence["recurrence_label"] = f"every {weekday_name.title()}"
+    return evidence
+
+
 def _weekday_in_next_calendar_week(reference: datetime, weekday: int) -> datetime:
     days_until_next_monday = 7 - reference.weekday()
     next_monday = reference + timedelta(days=days_until_next_monday)
@@ -883,9 +1265,9 @@ def _time_from_match(match: re.Match[str], context: str) -> str | None:
 
 def _time_range_match(user_text: str) -> re.Match[str] | None:
     return re.search(
-        r"(?:\btime\s*:\s*)?\b(?P<start_hour>\d{1,2})(?::(?P<start_minute>\d{2}))?\s*"
+        r"(?:\btime\s*:\s*)?\b(?P<start_hour>\d{1,2})(?:(?::|\.|．)(?P<start_minute>\d{2}))?\s*"
         r"(?P<start_meridiem>am|pm|a\.m\.|p\.m\.)?\s*(?:-|–|to)\s*"
-        r"(?P<end_hour>\d{1,2})(?::(?P<end_minute>\d{2}))?\s*"
+        r"(?P<end_hour>\d{1,2})(?:(?::|\.|．)(?P<end_minute>\d{2}))?\s*"
         r"(?P<end_meridiem>am|pm|a\.m\.|p\.m\.)?\b",
         user_text,
         flags=re.IGNORECASE,
@@ -938,7 +1320,7 @@ def _extract_standalone_time(user_text: str, context: str) -> str | None:
         return named_time
 
     match = re.search(
-        r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)\b",
+        r"\b(\d{1,2})(?:(?::|\.|．)(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)\b",
         user_text,
         flags=re.IGNORECASE,
     )
@@ -956,7 +1338,7 @@ def _extract_named_time(user_text: str) -> str | None:
 
 def _extract_action_time(user_text: str) -> str | None:
     match = re.search(
-        r"\b(?:need to leave at|leave at|depart at|head out at)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?\b",
+        r"\b(?:need to leave at|leave at|depart at|head out at)\s+(\d{1,2})(?:(?::|\.|．)(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?\b",
         user_text,
         flags=re.IGNORECASE,
     )
@@ -985,7 +1367,7 @@ def _extract_time(user_text: str) -> str | None:
         return named_time
 
     match = re.search(
-        r"\b(?:at|around)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?\b",
+        r"\b(?:at|around|starting)\s+(\d{1,2})(?:(?::|\.|．)(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?\b",
         user_text,
         flags=re.IGNORECASE,
     )
@@ -997,7 +1379,7 @@ def _extract_time(user_text: str) -> str | None:
 
 def _extract_update_time(target_text: str, user_text: str) -> str | None:
     match = re.search(
-        r"\b(?:at|around)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?\b",
+        r"\b(?:at|around|starting)\s+(\d{1,2})(?:(?::|\.|．)(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?\b",
         target_text,
         flags=re.IGNORECASE,
     )
@@ -1227,15 +1609,21 @@ def _extract_purpose(user_text: str) -> str | None:
 
 def _extract_target_calendar(user_text: str) -> str | None:
     patterns = [
+        rf"^\s*(?:show|list|open|view)\s+(?:the\s+)?"
+        rf"(?P<calendar>[A-Za-z0-9&' -]+?\s+calendar)\b{CALENDAR_TARGET_TERMINATOR}",
         rf"\b(?:add|put|save)\s+(?:it\s+)?(?:to|into|onto|on|in)\s+"
         rf"(?:the\s+)?(?!{EVENT_TITLE_ACTION_WORD_PATTERN}\b)"
         rf"(?P<calendar>[A-Za-z0-9&' -]+?\s+calendar)\b{CALENDAR_TARGET_TERMINATOR}",
         rf"\b(?:in|on|into|onto)\s+(?:the\s+)?(?!{EVENT_TITLE_ACTION_WORD_PATTERN}\b)"
         rf"(?P<calendar>[A-Za-z0-9&' -]+?\s+calendar)\b{CALENDAR_TARGET_TERMINATOR}",
+        rf"\bfrom\s+(?:the\s+)?(?!{EVENT_TITLE_ACTION_WORD_PATTERN}\b)"
+        rf"(?P<calendar>[A-Za-z0-9&' -]+?\s+calendar)\b{CALENDAR_TARGET_TERMINATOR}",
         rf"^\s*(?:/?(?:calendar|event|schedule)\s+)?"
         r"(?:(?:creating|create|add|schedule)\s+(?:an?\s+)?(?:recurring\s+)?(?:event\s+)?)?"
         rf"to\s+(?:the\s+)?(?!{EVENT_TITLE_ACTION_WORD_PATTERN}\b)"
         rf"(?P<calendar>[A-Za-z0-9&' -]+?\s+calendar)\b{CALENDAR_TARGET_TERMINATOR}",
+        rf"^\s*(?:use\s+)?(?:the\s+)?"
+        rf"(?P<calendar>[A-Za-z0-9&' -]+?\s+calendar)\s+instead\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, user_text, flags=re.IGNORECASE)
@@ -1265,6 +1653,8 @@ def _strip_calendar_target_phrase(title: str) -> str:
         rf"(?:the\s+)?(?!{EVENT_TITLE_ACTION_WORD_PATTERN}\b)"
         rf"(?P<calendar>.+?\s+calendar)\b{CALENDAR_TARGET_TERMINATOR}",
         rf"\b(?:in|on|into|onto)\s+(?:the\s+)?(?!{EVENT_TITLE_ACTION_WORD_PATTERN}\b)"
+        rf"(?P<calendar>.+?\s+calendar)\b{CALENDAR_TARGET_TERMINATOR}",
+        rf"\bfrom\s+(?:the\s+)?(?!{EVENT_TITLE_ACTION_WORD_PATTERN}\b)"
         rf"(?P<calendar>.+?\s+calendar)\b{CALENDAR_TARGET_TERMINATOR}",
         rf"^\s*to\s+(?:the\s+)?(?!{EVENT_TITLE_ACTION_WORD_PATTERN}\b)"
         rf"(?P<calendar>.+?\s+calendar)\b{CALENDAR_TARGET_TERMINATOR}",
@@ -1434,6 +1824,14 @@ def _extract_guest_instruction(
     return _clean_spaces(cleaned), deduped, missing_deduped
 
 
+def _has_explicit_guest_alias_request(value: str) -> bool:
+    return re.search(
+        rf"(?:^\s*(?:or\s+)?(?:add\s+)?guests?\s*:|\b(?:invite|add\s+guests?)\s+(?:{GUEST_ALIAS_PATTERN})\b|\b(?:{GUEST_ALIAS_PATTERN})\b.+\bto\s+(?:the\s+)?(?:invite|invitation|event)\b)",
+        value,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
 def _extract_flight_description(user_text: str, location: str | None) -> str | None:
     match = re.search(
         r"\bflight\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?",
@@ -1545,6 +1943,12 @@ def _strip_event_display_annotations(value: str) -> str:
         title,
         flags=re.IGNORECASE,
     )
+    title = re.sub(
+        r"\s+\bon\s+(?:the\s+)?specified\s+(?:days|dates)\b\s*$",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
     return _clean_spaces(title.strip(" ,."))
 
 
@@ -1565,6 +1969,17 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
     pickup = _extract_pickup_parts(user_text)
     if pickup is not None:
         return pickup["title"]
+
+    explicit_title = re.search(
+        r"\btitle\s*:?\s*(?P<title>.+?)\s*$",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if explicit_title is not None:
+        title = _strip_event_display_annotations(explicit_title.group("title"))
+        title = _clean_spaces(title.strip(" ."))
+        if title:
+            return title[:1].upper() + title[1:]
 
     lowered = user_text.lower()
     if location and "flight" in lowered and any(
@@ -1605,20 +2020,31 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
     title = re.sub(r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", " ", title, flags=re.IGNORECASE)
     title = _strip_absolute_date_text(title)
     title = re.sub(
-        r"(?:\btime\s*:\s*)?\b\d{1,2}(?::\d{2})?\s*"
+        r"(?:\btime\s*:\s*)?\b\d{1,2}(?:(?::|\.|．)\d{2})?\s*"
         r"(?:am|pm|a\.m\.|p\.m\.)?\s*(?:-|–|to)\s*"
-        r"\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?\b",
+        r"\d{1,2}(?:(?::|\.|．)\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?\b",
         " ",
         title,
         flags=re.IGNORECASE,
     )
-    title = re.sub(r"\b(?:at|around)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(
+        r"\b(?:at|around|starting)\s+\d{1,2}(?:(?::|\.|．)\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?\b",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
     title = re.sub(r"\b(?:at|around)\s+noon\b", " ", title, flags=re.IGNORECASE)
-    title = re.sub(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(
+        r"\b\d{1,2}(?:(?::|\.|．)\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)\b",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
     title = re.sub(r"\bnoon\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bfor\s+\d+\s*(?:minute|minutes|min|hour|hours|hr|hrs)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bnext\s+(?=monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bnext\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bstarting\b", " ", title, flags=re.IGNORECASE)
     title = _strip_calendar_target_phrase(title)
     title = re.sub(r"^\s*for\s+", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\btime\s*:\s*.*$", " ", title, flags=re.IGNORECASE)
@@ -1756,6 +2182,7 @@ def _list_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         "intent": "list_events",
         "start": start.isoformat() if start is not None else None,
         "end": end.isoformat() if end is not None else None,
+        "target_calendar": _extract_target_calendar(user_text),
         "metadata_filter": metadata_filter,
         "missing_fields": missing_fields,
     }
@@ -1768,6 +2195,7 @@ def _briefing_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         "start": start.isoformat(),
         "end": end.isoformat(),
         "label": label,
+        "target_calendar": _extract_target_calendar(user_text),
         "missing_fields": [],
     }
 
@@ -1838,7 +2266,8 @@ def _preparation_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         "start": start.isoformat(),
         "end": end.isoformat(),
         "label": label,
-        "query": _extract_preparation_query(user_text),
+        "query": _extract_preparation_query(_strip_calendar_target_phrase(user_text)),
+        "target_calendar": _extract_target_calendar(user_text),
         "missing_fields": [],
     }
 
@@ -1907,6 +2336,9 @@ def _update_intent(user_text: str, reference: datetime) -> dict[str, Any]:
     if relative_delta_minutes is None:
         start_time = _extract_update_time(target_text, user_text)
     query = _extract_update_query(user_text)
+    target_calendar = _extract_target_calendar(user_text)
+    if query and target_calendar:
+        query = _strip_calendar_target_phrase(query)
     missing_fields = []
     if query is None:
         missing_fields.append("event")
@@ -1916,6 +2348,7 @@ def _update_intent(user_text: str, reference: datetime) -> dict[str, Any]:
     return {
         "intent": "update_event",
         "query": query,
+        "target_calendar": target_calendar,
         "new_date": date,
         "new_start_time": start_time,
         "relative_delta_minutes": relative_delta_minutes,
@@ -1936,6 +2369,9 @@ def _update_intent(user_text: str, reference: datetime) -> dict[str, Any]:
 def _delete_intent(user_text: str, reference: datetime) -> dict[str, Any]:
     search_start, search_end = _extract_delete_range(user_text, reference)
     query = _extract_delete_query(user_text)
+    target_calendar = _extract_target_calendar(user_text)
+    if query and target_calendar:
+        query = _strip_calendar_target_phrase(query)
     missing_fields = []
     if query is None:
         missing_fields.append("event")
@@ -1943,6 +2379,7 @@ def _delete_intent(user_text: str, reference: datetime) -> dict[str, Any]:
     return {
         "intent": "delete_event",
         "query": query,
+        "target_calendar": target_calendar,
         "search_start": search_start.isoformat(),
         "search_end": search_end.isoformat(),
         "missing_fields": missing_fields,
@@ -1953,16 +2390,27 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
     event_text, assistant_metadata, assistant_description = _extract_assistant_help(
         user_text,
     )
+    event_text = _request_without_image_text(event_text)
     intent_text, attendees, missing_guest_contacts = _extract_guest_instruction(event_text or user_text)
     intent_text = intent_text or event_text or user_text
     recurrence = _extract_recurrence(intent_text, reference)
-    date, _ = _extract_date(intent_text, reference)
-    if recurrence is not None:
+    date, date_text = _extract_date(intent_text, reference)
+    has_explicit_date = date is not None and (
+        date_text.lower() not in WEEKDAYS or _has_explicit_next_weekday(intent_text)
+    )
+    if recurrence is not None and not has_explicit_date:
         date = recurrence["start_date"]
     start_time = _extract_time(intent_text) or _extract_standalone_time(
         intent_text,
         intent_text,
     )
+    if recurrence is not None and not has_explicit_date:
+        date = _advance_recurring_date_after_reference(
+            date,
+            start_time,
+            recurrence,
+            reference,
+        )
     all_day = _is_all_day_request(intent_text)
     if all_day:
         start_time = None
@@ -1989,6 +2437,34 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
     )
     description = _append_assistant_description(description, assistant_description)
     title = _title_from_text(intent_text, location, purpose)
+    duration_minutes = _extract_duration_minutes(intent_text)
+    duration_was_explicit = (
+        _extract_time_range_duration_minutes(intent_text) is not None
+        or re.search(
+            r"\bfor\s+\d+\s*(?:minutes?|mins?|hours?|hrs?)\b",
+            intent_text,
+            flags=re.IGNORECASE,
+        )
+        is not None
+    )
+    schedule_evidence = _image_schedule_evidence(user_text, reference, title)
+    image_used_fields: list[str] = []
+    if schedule_evidence is not None:
+        if not has_explicit_date and schedule_evidence.get("date"):
+            date = str(schedule_evidence["date"])
+            image_used_fields.append("date")
+        if start_time is None and schedule_evidence.get("start_time"):
+            start_time = str(schedule_evidence["start_time"])
+            image_used_fields.append("time")
+        if not duration_was_explicit and schedule_evidence.get("duration_minutes"):
+            duration_minutes = int(schedule_evidence["duration_minutes"])
+            image_used_fields.append("duration")
+        if not has_explicit_date and recurrence is None and schedule_evidence.get("recurrence"):
+            recurrence = {
+                "rrule": str(schedule_evidence["recurrence"][0]),
+                "label": str(schedule_evidence.get("recurrence_label") or "recurring"),
+            }
+            image_used_fields.append("recurrence")
 
     missing_fields = []
     if title is None:
@@ -2006,7 +2482,7 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         "date": date,
         "start_time": start_time,
         "all_day": all_day,
-        "duration_minutes": _extract_duration_minutes(user_text),
+        "duration_minutes": duration_minutes,
         "timezone": DEFAULT_TIMEZONE,
         "location": location,
         "description": description,
@@ -2016,6 +2492,10 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         "target_calendar": target_calendar,
         "recurrence": [recurrence["rrule"]] if recurrence is not None else None,
         "recurrence_label": recurrence["label"] if recurrence is not None else None,
+        "date_was_explicit": has_explicit_date,
+        "schedule_evidence": schedule_evidence,
+        "schedule_evidence_used_fields": image_used_fields,
+        "confirmation_required": bool(image_used_fields),
         "missing_fields": missing_fields,
     }
 
@@ -2522,6 +3002,14 @@ def merge_ai_calendar_fields(
         refined["target_calendar"] = calendar_name
 
     guest_aliases = slots.get("guest_aliases")
+    if (
+        refined.get("intent") == "create_event"
+        and isinstance(guest_aliases, list)
+        and not refined.get("attendees")
+        and not refined.get("missing_guest_contacts")
+        and not _has_explicit_guest_alias_request(_request_without_image_text(request))
+    ):
+        guest_aliases = None
     if isinstance(guest_aliases, list):
         resolved_alias_keys = {
             key
@@ -2562,7 +3050,11 @@ def merge_ai_calendar_fields(
             refined["missing_guest_contacts"] = existing_missing
 
     if primary:
-        _repair_primary_ai_calendar_intent(refined, request, reference)
+        _repair_primary_ai_calendar_intent(
+            refined,
+            _request_without_image_text(request),
+            reference,
+        )
 
     refined["ai_field_extraction"] = {
         "confidence": ai_fields.get("confidence"),

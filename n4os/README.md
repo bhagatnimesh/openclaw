@@ -49,6 +49,7 @@ Open these first when using N4OS as an Obsidian vault:
 - Use `SOUL.md`, `MISSION.md`, and `VISION.md` as the stable north-star stack.
 - Use `IDENTITY.md`, `PRIORITIES.md`, and `PRINCIPLES.md` as the human operating context.
 - Use `DECISION_FILTER.md`, `OPERATING_RULES.md`, and the playbooks when helping with a live situation.
+- Use [IMPORTER.md](IMPORTER.md) to convert files, links, documents, and school materials into reusable second-brain Markdown.
 - Use [FAMILY_DECISIONS_GUIDE.md](FAMILY_DECISIONS_GUIDE.md) to capture, enrich, brief, and close family decisions from chat.
 - Use daily and review templates to convert principles into action.
 - Use `PERSONAL_MODEL.md` to understand how to coach me well.

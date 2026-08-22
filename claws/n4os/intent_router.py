@@ -100,6 +100,7 @@ DECISION_UPDATE_INTENTS = {
 LIBRARY_INTENTS = set(ROUTE_REGISTRY["library"].actions)
 
 LOCAL_MODULES = (
+    "ai_field_extraction",
     "constants",
     "intent",
     "matcher",
@@ -165,6 +166,10 @@ EXPLICIT_TASK_CREATE_TEXT_RE = re.compile(
     r"(?:(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+to\s+)?"
     r"(?:add|create|capture|remember)\s+(?:an?\s+)?"
     r"(?:task|todo|to-do|open loop)\b)",
+    re.IGNORECASE,
+)
+AS_TASK_CREATE_TEXT_RE = re.compile(
+    r"\b(?:as|into)\s+(?:a\s+)?(?:task|todo|to-do|open loop)\b",
     re.IGNORECASE,
 )
 EXPLICIT_CALENDAR_CREATE_TEXT_RE = re.compile(
@@ -409,6 +414,10 @@ def _is_create_calendar_request(calendar_intent: dict[str, Any]) -> bool:
 
 def _is_explicit_task_create_text(text: str) -> bool:
     return EXPLICIT_TASK_CREATE_TEXT_RE.search(text) is not None
+
+
+def _has_as_task_create_cue(text: str) -> bool:
+    return AS_TASK_CREATE_TEXT_RE.search(text) is not None
 
 
 def _is_explicit_calendar_create_text(text: str) -> bool:
@@ -1014,6 +1023,9 @@ def recognize_route_candidates(
         and not ambiguous_shopping_item
     ):
         scores["tasks"] = max(scores["tasks"], 0.9)
+    if task_intent.get("intent") == "create_task" and _has_as_task_create_cue(text):
+        scores["tasks"] = max(scores["tasks"], 0.97)
+        claimed_route = "tasks"
     if task_intent.get("intent") == "recommend_tasks" and task_intent.get("filters", {}).get("tags"):
         scores["tasks"] = max(scores["tasks"], 0.9)
         claimed_route = claimed_route or "tasks"
@@ -1051,7 +1063,10 @@ def recognize_route_candidates(
     best_by_route: dict[Route, RouteCandidate] = {}
     for candidate in candidates:
         current = best_by_route.get(candidate.route)
-        if current is None or candidate.confidence > current.confidence:
+        if current is None or (
+            not any("follow-up" in evidence for evidence in current.evidence)
+            and candidate.confidence > current.confidence
+        ):
             best_by_route[candidate.route] = candidate
     return tuple(
         sorted(
@@ -1130,15 +1145,40 @@ def _explicit_intent_frame(
         if direct_verb is not None:
             intent = {**intent, "intent": calendar_action_by_verb[direct_verb]}
     elif explicit.route == "tasks":
-        direct_task_action = re.match(
-            r"^\s*(?:complete|finish|done|delete|remove|update|change|assign|run)\b",
-            body,
-            flags=re.IGNORECASE,
-        )
-        domain_request = body if direct_task_action else improve_entered_text(request)
-        intent = _tasks_intent_module().extract_intent(domain_request, now=now)
-        if re.match(r"^\s*(?:update|change|assign)\b", body, flags=re.IGNORECASE):
-            intent = {**intent, "intent": "update_task"}
+        tasks_module = _tasks_intent_module()
+        task_control_candidates = tasks_module.score_task_command_candidates(body, now=now)
+        if task_control_candidates and task_control_candidates[0].get("action") == "help_task":
+            return N4OSIntentFrame(
+                route="unknown",
+                action="unknown",
+                confidence=0.0,
+                followup_kind="clarification",
+                normalized_request=request,
+                clarification_question="Use /task help to see task commands.",
+                decision_source="clarification",
+                candidates=(
+                    RouteCandidate(
+                        route="tasks",
+                        action="recommend_tasks",
+                        confidence=float(task_control_candidates[0].get("confidence") or 0.0),
+                        evidence=tuple(task_control_candidates[0].get("evidence") or ()),
+                    ),
+                ),
+            )
+        task_action_candidates = [
+            candidate
+            for candidate in task_control_candidates
+            if candidate.get("action") in TASK_INTENTS
+        ]
+        task_action = task_action_candidates[0] if task_action_candidates else None
+        task_action_name = str(task_action.get("action") or "") if task_action is not None else ""
+        if task_action_name in {"complete_task", "delete_task", "update_task", "run_assistant_help"}:
+            domain_request = str(task_action.get("normalized_request"))
+        else:
+            domain_request = improve_entered_text(request)
+        intent = tasks_module.extract_intent(domain_request, now=now)
+        if task_action_name == "update_task":
+            intent = {**intent, "intent": task_action_name}
     elif explicit.route == "shopping":
         domain_request = request
         intent = _shopping_intent_module().extract_intent(domain_request, now=now)
@@ -1615,6 +1655,7 @@ def interpret_request(
     now: datetime | None = None,
     context: dict[str, Any] | None = None,
     interpreter: IntentInterpreter | InterpreterCallable | None = None,
+    prefer_interpreter: bool = False,
 ) -> N4OSIntentFrame:
     explicit_frame = _explicit_intent_frame(request, now)
     if explicit_frame is not None:
@@ -1637,9 +1678,16 @@ def interpret_request(
         )
         if existing_index is None:
             candidates.append(fallback_candidate)
+        elif any(
+            "follow-up" in evidence
+            for evidence in candidates[existing_index].evidence
+        ):
+            pass
         elif (
             fallback_candidate.confidence >= DETERMINISTIC_CONFIDENCE_THRESHOLD
-            or fallback_candidate.confidence > candidates[existing_index].confidence
+            and fallback_candidate.confidence - candidates[existing_index].confidence >= DETERMINISTIC_MARGIN_THRESHOLD
+        ) or (
+            fallback_candidate.confidence > candidates[existing_index].confidence
         ):
             candidates[existing_index] = fallback_candidate
     ordered = tuple(
@@ -1653,13 +1701,27 @@ def interpret_request(
         and top.confidence >= DETERMINISTIC_CONFIDENCE_THRESHOLD
         and top.confidence - runner_up_confidence >= DETERMINISTIC_MARGIN_THRESHOLD
     )
+    if (
+        top is not None
+        and top.route == "tasks"
+        and top.action == "create_task"
+        and _has_as_task_create_cue(request)
+    ):
+        has_decisive_candidate = True
     fallback_requires_clarification = bool(
         top is not None
         and top.route == "decisions"
         and top.action == "add_evidence"
         and re.fullmatch(r"\s*add\s+(?:note|evidence)\s*", request, flags=re.IGNORECASE)
     )
-    if has_decisive_candidate and not fallback_requires_clarification:
+    prefer_model_for_candidate = bool(
+        prefer_interpreter and top is not None and top.route in {"calendar", "tasks", "both"}
+    )
+    if (
+        has_decisive_candidate
+        and not fallback_requires_clarification
+        and not prefer_model_for_candidate
+    ):
         assert top is not None
         return N4OSIntentFrame(
             route=top.route,
@@ -1691,6 +1753,22 @@ def interpret_request(
                 )
         except Exception:
             pass
+
+    # Voice and photo inputs get a semantic pass even when rules look decisive.
+    # If that optional pass is unavailable, preserve the already-proven route;
+    # domain owners still validate fields and gate uncertain writes.
+    if has_decisive_candidate and not fallback_requires_clarification:
+        assert top is not None
+        return N4OSIntentFrame(
+            route=top.route,
+            action=top.action,
+            confidence=top.confidence,
+            slots=dict(top.slots),
+            missing_fields=list(top.missing_fields),
+            normalized_request=request,
+            decision_source="rules",
+            candidates=ordered,
+        )
 
     clarification = fallback.clarification_question or _targeted_clarification(ordered)
     missing_fields = fallback.missing_fields or (

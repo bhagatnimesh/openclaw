@@ -6,6 +6,7 @@ from intent import (
     DEFAULT_TIMEZONE,
     extract_intent,
     read_metadata_from_notes,
+    score_task_command_candidates,
     write_metadata_to_notes,
 )
 
@@ -171,6 +172,53 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["due"], "2026-08-10")
         self.assertEqual(intent["metadata"]["owner"], "nysha")
         self.assertEqual(intent["missing_fields"], [])
+
+    def test_task_prefixed_mark_done_completes_matching_task(self):
+        intent = extract_intent("Task mark done pay PAMF")
+
+        self.assertEqual(intent["intent"], "complete_task")
+        self.assertEqual(intent["query"], "pay PAMF")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_slash_task_completed_completes_matching_task(self):
+        intent = extract_intent("/task completed pay PAMF")
+
+        self.assertEqual(intent["intent"], "complete_task")
+        self.assertEqual(intent["query"], "pay PAMF")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_as_task_phrase_creates_task_and_preserves_action_title(self):
+        intent = extract_intent("create a plan as a task")
+
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Create a plan")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_help_me_as_task_phrase_prefers_task_creation_over_help_control(self):
+        candidates = score_task_command_candidates("help me create a plan as a task")
+        intent = extract_intent("help me create a plan as a task")
+
+        self.assertEqual(candidates[0]["action"], "create_task")
+        self.assertEqual(candidates[1]["action"], "help_task")
+        self.assertEqual(intent["intent"], "create_task")
+        self.assertEqual(intent["title"], "Create a plan")
+
+    def test_task_help_question_scores_as_control_not_creation(self):
+        candidates = score_task_command_candidates("/task help how do I mark a task done")
+
+        self.assertEqual(candidates[0]["action"], "help_task")
+        self.assertGreater(candidates[0]["confidence"], 0.9)
+
+    def test_short_task_prefix_inputs_do_not_default_to_creation(self):
+        for request in ("/task today", "/task home", "/task stauts"):
+            with self.subTest(request=request):
+                candidates = score_task_command_candidates(request)
+                intent = extract_intent(request)
+
+                self.assertFalse(
+                    any(candidate["action"] == "create_task" for candidate in candidates)
+                )
+                self.assertEqual(intent["intent"], "recommend_tasks")
 
     def test_below_email_followup_creates_readable_title_and_notes(self):
         now = datetime(2026, 7, 9, 12, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
@@ -878,6 +926,12 @@ class TaskIntentTest(unittest.TestCase):
         self.assertTrue(metadata["assistant_help_needed"])
         self.assertEqual(metadata["assistant_help_request"], "Look up the FUSD phone number")
         self.assertEqual(metadata["assistant_context"], "Email: waitlist@example.com")
+
+    def test_update_query_excludes_action_and_owner_clause(self):
+        intent = extract_intent("/task update call FUSD owner mom")
+
+        self.assertEqual(intent["intent"], "update_task")
+        self.assertEqual(intent["query"], "call FUSD")
 
 
 if __name__ == "__main__":

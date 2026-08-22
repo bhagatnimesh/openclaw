@@ -11,7 +11,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from ai_refinement import OpenAIN4OSIntentInterpreter, validate_ai_intent_frame
-from claw import N4OSClaw, PendingRouteClarification
+from claw import N4OSClaw, PendingRouteClarification, _calendar_module, _tasks_module
 from input_normalizer import improve_entered_text
 from intent_router import N4OSIntentFrame, interpret_request, route_request
 import note_capture
@@ -212,6 +212,7 @@ class FakeTasksClaw:
         self.tools = FakeTaskTools(tasks, recommended)
         self.undo_stack = []
         self.target_ids = []
+        self.task_list_ids = []
 
     def handle_pending_response(self, request):
         return False
@@ -223,13 +224,17 @@ class FakeTasksClaw:
     def recommend_tasks_from_request(self, request, reference_time=None):
         self.calls.append(("recommend", request, reference_time))
 
-    def complete_task_from_request(self, request, task_id=None):
+    def complete_task_from_request(self, request, task_id=None, task_list_id="@default"):
         self.target_ids.append(task_id)
+        if hasattr(self, "task_list_ids"):
+            self.task_list_ids.append(task_list_id)
         self.calls.append(("complete", request, None))
         self.undo_stack.append({"action": "complete"})
 
-    def delete_task_from_request(self, request, task_id=None):
+    def delete_task_from_request(self, request, task_id=None, task_list_id="@default"):
         self.target_ids.append(task_id)
+        if hasattr(self, "task_list_ids"):
+            self.task_list_ids.append(task_list_id)
         self.calls.append(("delete", request, None))
         self.undo_stack.append({"action": "delete"})
 
@@ -240,8 +245,10 @@ class FakeTasksClaw:
         self.calls.append(("assign_owner", request, None))
         self.undo_stack.append({"action": "assign_owner"})
 
-    def update_task_from_request(self, request, task_id=None):
+    def update_task_from_request(self, request, task_id=None, task_list_id="@default"):
         self.target_ids.append(task_id)
+        if hasattr(self, "task_list_ids"):
+            self.task_list_ids.append(task_list_id)
         self.calls.append(("update", request, None))
         self.undo_stack.append({"action": "update"})
 
@@ -656,6 +663,19 @@ class IntentRouterTest(unittest.TestCase):
         self.assertIsNone(claw.intent_interpreter)
         warning.assert_called_once()
 
+    def test_calendar_then_tasks_loads_each_domain_ai_extractor(self):
+        calendar_module = _calendar_module()
+        tasks_module = _tasks_module()
+
+        self.assertEqual(
+            Path(calendar_module.CalendarAIFieldExtractor.__init__.__code__.co_filename).parent.name,
+            "family-calendar",
+        )
+        self.assertEqual(
+            Path(tasks_module.TaskAIFieldExtractor.__init__.__code__.co_filename).parent.name,
+            "family-tasks",
+        )
+
     def test_interpret_request_accepts_schema_valid_ai_frame(self):
         interpreter = FakeIntentInterpreter(
             {
@@ -741,6 +761,34 @@ class IntentRouterTest(unittest.TestCase):
 
         self.assertEqual(tasks.target_ids, ["task-1"])
         self.assertEqual(calendar.target_ids, ["event-1"])
+
+    def test_typed_task_target_preserves_task_list_id_for_owner(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(
+            tasks_claw=tasks,
+            intent_interpreter=FakeIntentInterpreter(
+                {
+                    "route": "tasks",
+                    "action": "complete_task",
+                    "confidence": 0.91,
+                    "target": {
+                        "task_id": "task-1",
+                        "task_list_id": "school-id",
+                    },
+                }
+            ),
+        )
+        claw.route_context.last_artifact = {
+            "target": {
+                "task_id": "task-1",
+                "task_list_id": "school-id",
+            }
+        }
+
+        claw.handle_turn("same task please", reference_time=REFERENCE_TIME)
+
+        self.assertEqual(tasks.target_ids, ["task-1"])
+        self.assertEqual(tasks.task_list_ids, ["school-id"])
 
     def test_typed_calendar_target_preserves_calendar_id_for_owner(self):
         calendar = FakeCalendarClaw()
@@ -1057,6 +1105,8 @@ class IntentRouterTest(unittest.TestCase):
             ("/calendar list", "calendar", "list_events"),
             ("/calendar brief", "calendar", "family_briefing"),
             ("/task complete call FUSD", "tasks", "complete_task"),
+            ("/task completed pay PAMF", "tasks", "complete_task"),
+            ("/task mark done pay PAMF", "tasks", "complete_task"),
             ("/task update call FUSD owner mom", "tasks", "update_task"),
         )
 
@@ -1066,6 +1116,26 @@ class IntentRouterTest(unittest.TestCase):
 
                 self.assertEqual(frame.route, route)
                 self.assertEqual(frame.action, action)
+
+    def test_task_prefixed_mark_done_routes_to_completion(self):
+        frame = interpret_request("Task mark done pay PAMF", now=REFERENCE_TIME)
+
+        self.assertEqual(frame.route, "tasks")
+        self.assertEqual(frame.action, "complete_task")
+
+    def test_as_task_phrase_routes_to_task_creation_not_decision(self):
+        frame = interpret_request("create a plan as a task", now=REFERENCE_TIME)
+
+        self.assertEqual(frame.route, "tasks")
+        self.assertEqual(frame.action, "create_task")
+        self.assertEqual(frame.slots.get("title"), "Create a plan")
+
+    def test_task_slash_help_question_does_not_create_task_when_routed_directly(self):
+        frame = interpret_request("/task help how do I mark a task done", now=REFERENCE_TIME)
+
+        self.assertEqual(frame.route, "unknown")
+        self.assertEqual(frame.action, "unknown")
+        self.assertIn("/task help", frame.clarification_question or "")
 
     def test_explicit_calendar_brief_dispatches_without_create_parsing(self):
         calendar = FakeCalendarClaw()
@@ -2258,6 +2328,37 @@ class IntentRouterTest(unittest.TestCase):
         self.assertGreaterEqual(decision["confidence"], 0.6)
         self.assertIn("create_event", decision["intent_summary"])
 
+    def test_dispatches_calendar_image_schedule_to_calendar(self):
+        calendar = FakeCalendarClaw()
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=tasks)
+        request = (
+            "/calendar add swim class starting 5.30 PM every Friday\n\n"
+            "[Image text extraction (machine-generated, untrusted)]:\n"
+            "School Day Date Time Attendance\n"
+            "Fremont Fri Sep 18th, 2026 6:00PM Mark absent\n"
+            "Fremont Fri Sep 25th, 2026 6:00PM Mark absent"
+        )
+
+        decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "calendar")
+        self.assertEqual(
+            calendar.calls,
+            [
+                (
+                    "create",
+                    "add event swim class starting 5.30 PM every Friday\n"
+                    "[Image text extraction (machine-generated, untrusted)]:\n"
+                    "School Day Date Time Attendance\n"
+                    "Fremont Fri Sep 18th, 2026 6:00PM Mark absent\n"
+                    "Fremont Fri Sep 25th, 2026 6:00PM Mark absent",
+                    REFERENCE_TIME,
+                )
+            ],
+        )
+        self.assertEqual(tasks.calls, [])
+
     def test_task_create_with_owner_chatter_stays_create_task(self):
         request = improve_entered_text(
             "Add a task for tomorrow at 2pm to call up home warranty to check "
@@ -2291,6 +2392,18 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(decision["route"], "tasks")
         self.assertGreaterEqual(decision["confidence"], 0.6)
         self.assertIn("family-tasks", decision["intent_summary"])
+
+    def test_routes_repeated_task_commands_to_tasks(self):
+        request = (
+            "Add tasks to complete the school donation contribution. Tag school\n\n"
+            "Add task to email Ms. Thompson thanking and then asking about the computer piece. Tag school"
+        )
+
+        decision = route_request(request, now=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertGreaterEqual(decision["confidence"], 0.6)
+        self.assertIn("create_task", decision["intent_summary"])
 
     def test_routes_image_task_entries_with_due_date_to_tasks(self):
         request = (
@@ -2618,6 +2731,40 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(decision["route"], "tasks")
         self.assertEqual(calendar.calls, [])
         self.assertEqual(tasks.calls, [("run_assistant_help", request, REFERENCE_TIME)])
+
+    def test_dispatches_noah_assistant_run_to_named_task_list(self):
+        class NamedHelpTasksClaw(FakeTasksClaw):
+            def interpret_request(self, request, reference_time=None):
+                return {
+                    "intent": "run_assistant_help",
+                    "task_list_name": "School",
+                    "missing_fields": [],
+                }
+
+            def _resolve_task_list(self, intent):
+                return "school-id", None
+
+            def run_noah_assistant_help_from_request(
+                self,
+                request,
+                reference_time=None,
+                task_list_id="@default",
+            ):
+                self.calls.append(
+                    ("run_assistant_help", request, reference_time, task_list_id)
+                )
+
+        tasks = NamedHelpTasksClaw()
+        claw = N4OSClaw(calendar_claw=FakeCalendarClaw(), tasks_claw=tasks)
+        request = "Run Noah assistant help in School list"
+
+        with redirect_stdout(StringIO()):
+            claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(
+            tasks.calls,
+            [("run_assistant_help", request, REFERENCE_TIME, "school-id")],
+        )
 
     def test_dispatches_polite_timed_task_request_to_task_creation(self):
         calendar = FakeCalendarClaw()
@@ -3181,6 +3328,39 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
         self.assertEqual(library.calls, [])
 
+    def test_dispatches_repeated_task_commands_to_tasks_claw(self):
+        tasks = FakeTasksClaw()
+        library = FakeLibraryClaw()
+        claw = N4OSClaw(tasks_claw=tasks, library_claw=library)
+        request = (
+            "Add tasks to complete the school donation contribution. Tag school\n\n"
+            "Add task to email Ms. Thompson thanking and then asking about the computer piece. Tag school"
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(decision["intent_summary"], "Route to family-tasks for create_task.")
+        self.assertEqual(tasks.calls, [("create", improve_entered_text(request), REFERENCE_TIME)])
+        self.assertEqual(library.calls, [])
+
+    def test_dispatches_voice_style_repeated_task_commands_to_tasks_claw(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+        request = (
+            "Add task to complete the school donation contribution. "
+            "Add task to email Ms. Thompson thanking and then asking about the computer piece.\n\n"
+            "Add task to review presentation."
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(decision["intent_summary"], "Route to family-tasks for create_task.")
+        self.assertEqual(tasks.calls, [("create", improve_entered_text(request), REFERENCE_TIME)])
+
     def test_route_clarification_dispatches_original_request(self):
         calendar = FakeCalendarClaw()
         tasks = FakeTasksClaw()
@@ -3211,6 +3391,116 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(calendar.pending_responses, [])
         self.assertIsNone(calendar.pending_action)
         self.assertEqual(tasks.calls, [("create", request, REFERENCE_TIME)])
+
+    def test_explicit_calendar_command_replaces_pending_calendar_clarification(self):
+        calendar = PendingCalendarClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=FakeTasksClaw())
+        request = (
+            "/calendar add event every day mentioned from 5.30 pm to 7 pm. "
+            "Title: Swim Class at American swim academy\n\n"
+            "[Image text extraction (machine-generated, untrusted)]:\n"
+            "School Day Date Time Attendance\n"
+            "Fremont Fri Sep 18th, 2026 6:00PM Mark absent\n"
+            "Fremont Fri Sep 25th, 2026 6:00PM Mark absent"
+        )
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["route"], "calendar")
+        self.assertEqual(calendar.pending_responses, [])
+        self.assertIsNone(calendar.pending_action)
+        self.assertEqual(len(calendar.calls), 1)
+        self.assertEqual(calendar.calls[0][0], "create")
+        self.assertIn("Swim Class at American swim academy", calendar.calls[0][1])
+        self.assertIn("Sep 18th, 2026", calendar.calls[0][1])
+
+    def test_explicit_calendar_yes_answers_pending_calendar_confirmation(self):
+        calendar = PendingCalendarClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=FakeTasksClaw())
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request("/calendar yes", reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["action"], "pending_response")
+        self.assertEqual(calendar.pending_responses, ["yes"])
+
+    def test_explicit_calendar_yes_with_punctuation_answers_pending(self):
+        calendar = PendingCalendarClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=FakeTasksClaw())
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request("/calendar yes.", reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["action"], "pending_response")
+        self.assertEqual(calendar.pending_responses, ["yes."])
+
+    def test_explicit_calendar_time_answers_pending_clarification(self):
+        calendar = PendingCalendarClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=FakeTasksClaw())
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request("/calendar 5 PM", reference_time=REFERENCE_TIME)
+
+        self.assertEqual(decision["action"], "pending_response")
+        self.assertEqual(calendar.pending_responses, ["5 PM"])
+
+    def test_explicit_calendar_tomorrow_replaces_pending_clarification(self):
+        calendar = PendingCalendarClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=FakeTasksClaw())
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "/calendar tomorrow",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "calendar")
+        self.assertEqual(calendar.pending_responses, [])
+        self.assertIsNone(calendar.pending_action)
+
+    def test_explicit_task_today_replaces_pending_task_action(self):
+        tasks = FakeTasksClaw()
+        tasks.pending_action = {"action": "clarify_create"}
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "/task today",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertIsNone(tasks.pending_action)
+        self.assertEqual(tasks.calls, [("create", "add task today", REFERENCE_TIME)])
+
+    def test_explicit_calendar_invite_replaces_pending_clarification(self):
+        calendar = PendingCalendarClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=FakeTasksClaw())
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "/calendar invite dad to the event",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "calendar")
+        self.assertEqual(calendar.pending_responses, [])
+        self.assertIsNone(calendar.pending_action)
+
+    def test_explicit_calendar_query_replaces_pending_clarification(self):
+        calendar = PendingCalendarClaw()
+        claw = N4OSClaw(calendar_claw=calendar, tasks_claw=FakeTasksClaw())
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "/calendar what is tomorrow's schedule?",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "calendar")
+        self.assertEqual(calendar.pending_responses, [])
+        self.assertIsNone(calendar.pending_action)
 
     def test_bare_home_board_command_lists_without_clarification_loop(self):
         calendar = FakeCalendarClaw()
@@ -3538,6 +3828,202 @@ class IntentRouterTest(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_voice_prefers_semantic_interpreter_for_decisive_task_phrase(self):
+        interpreter = FakeIntentInterpreter(
+            {
+                "route": "calendar",
+                "action": "create_event",
+                "confidence": 0.96,
+                "missing_fields": [],
+            }
+        )
+
+        frame = interpret_request(
+            "remember to call the dentist tomorrow at three",
+            now=REFERENCE_TIME,
+            interpreter=interpreter,
+            prefer_interpreter=True,
+        )
+
+        self.assertEqual(frame.route, "calendar")
+        self.assertEqual(frame.decision_source, "llm")
+        self.assertEqual(len(interpreter.calls), 1)
+
+    def test_voice_uses_decisive_rule_when_semantic_interpreter_fails(self):
+        class FailingInterpreter:
+            def interpret(self, request, *, now=None, context=None):
+                raise RuntimeError("temporary model failure")
+
+        frame = interpret_request(
+            "add task buy milk",
+            now=REFERENCE_TIME,
+            interpreter=FailingInterpreter(),
+            prefer_interpreter=True,
+        )
+
+        self.assertEqual(frame.route, "tasks")
+        self.assertEqual(frame.action, "create_task")
+        self.assertEqual(frame.decision_source, "rules")
+
+    def test_explicit_task_action_is_not_overridden_by_domain_ai(self):
+        class ConflictingSemanticTasksClaw(FakeTasksClaw):
+            def interpret_request(self, request, reference_time=None):
+                return {
+                    "intent": "create_task",
+                    "title": "Wrong mutation",
+                    "metadata": {},
+                    "missing_fields": [],
+                    "ai_field_extraction": {"confidence": 0.99},
+                }
+
+        tasks = ConflictingSemanticTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "/task complete pay PAMF",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["action"], "complete_task")
+        self.assertEqual(tasks.calls[0][0], "complete")
+
+    def test_explicit_task_action_keeps_named_list_when_domain_ai_conflicts(self):
+        class ConflictingSemanticTasksClaw(FakeTasksClaw):
+            def interpret_request(self, request, reference_time=None):
+                return {
+                    "intent": "create_task",
+                    "title": "Wrong mutation",
+                    "task_list_name": "School",
+                    "metadata": {},
+                    "missing_fields": [],
+                }
+
+            def _resolve_task_list(self, intent):
+                return "school-id", None
+
+            def deterministic_intent(self, request, reference_time=None):
+                return {
+                    "intent": "complete_task",
+                    "query": "pay PAMF",
+                    "task_list_name": "School",
+                    "missing_fields": [],
+                }
+
+            def complete_task_from_request(
+                self,
+                request,
+                task_list_id="@default",
+                task_id=None,
+                query=None,
+            ):
+                self.calls.append(("complete", request, task_list_id, query))
+
+        tasks = ConflictingSemanticTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            claw.handle_request(
+                "/task complete pay PAMF in School list",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(tasks.calls[0][2], "school-id")
+        self.assertEqual(tasks.calls[0][3], "pay PAMF")
+
+    def test_natural_task_action_is_not_overridden_by_domain_ai(self):
+        class ConflictingSemanticTasksClaw(FakeTasksClaw):
+            def interpret_request(self, request, reference_time=None):
+                return {
+                    "intent": "create_task",
+                    "title": "Wrong mutation",
+                    "metadata": {},
+                    "missing_fields": [],
+                    "ai_field_extraction": {"confidence": 0.99},
+                }
+
+        tasks = ConflictingSemanticTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "complete task pay PAMF",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["action"], "complete_task")
+        self.assertEqual(tasks.calls[0][0], "complete")
+
+    def test_semantic_calendar_create_preserves_sender_default_owner(self):
+        class SemanticCalendarClaw(FakeCalendarClaw):
+            def __init__(self):
+                super().__init__()
+                self.semantic_intent = None
+
+            def _extract_intent_from_request(self, request, reference_time, **kwargs):
+                return {
+                    "intent": "create_event",
+                    "title": "Dentist",
+                    "date": "2026-07-04",
+                    "start_time": "15:00",
+                    "duration_minutes": 60,
+                    "metadata": {"owner": "unknown"},
+                    "missing_fields": [],
+                }
+
+            def create_event_from_request(
+                self,
+                request,
+                reference_time=None,
+                require_confirmation=False,
+                semantic_intent=None,
+            ):
+                self.semantic_intent = semantic_intent
+                self.calls.append(("create", request, reference_time))
+                self.undo_stack.append({"action": "create"})
+
+        calendar = SemanticCalendarClaw()
+        claw = N4OSClaw(calendar_claw=calendar)
+
+        with redirect_stdout(StringIO()):
+            claw.handle_request(
+                "add event dentist tomorrow at 3 PM",
+                reference_time=REFERENCE_TIME,
+                default_owner="dad",
+            )
+
+        self.assertEqual(calendar.semantic_intent["metadata"]["owner"], "dad")
+
+    def test_openai_refinement_sends_original_image_with_semantic_request(self):
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(json.loads(request.data))
+            return FakeOpenAIResponse(
+                _openai_payload(
+                    {
+                        "route": "tasks",
+                        "action": "create_task",
+                        "confidence": 0.97,
+                    }
+                )
+            )
+
+        interpreter = OpenAIN4OSIntentInterpreter(api_key="test-key", urlopen=fake_urlopen)
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "tasks.jpg"
+            image_path.write_bytes(b"not-a-real-jpeg-but-valid-test-bytes")
+            frame = interpreter.interpret(
+                "add the checklist in this photo",
+                context={"semantic_image_path": str(image_path), "input_modality": "telegram_photo"},
+            )
+
+        self.assertEqual(frame["route"], "tasks")
+        content = calls[0]["input"][1]["content"]
+        self.assertEqual(content[0]["type"], "input_text")
+        self.assertEqual(content[1]["type"], "input_image")
+        self.assertTrue(content[1]["image_url"].startswith("data:image/jpeg;base64,"))
 
 
 if __name__ == "__main__":

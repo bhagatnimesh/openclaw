@@ -104,3 +104,8 @@ Inputs:
 - [[School Transition]]
 - [[playbooks/Parenting|Parenting]]
 - [[goals/2026|2026 Goals]]
+
+## School Knowledge
+
+- [[school/Nysha/2026-2027/Room 13|2026-2027 Room 13 school guide]]
+

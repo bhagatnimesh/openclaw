@@ -36,7 +36,11 @@ def _strip_capture_prefix(value: str) -> str:
 def _strip_homework_prefix(value: str) -> str:
     text = _strip_capture_prefix(value)
     return re.sub(
-        r"^\s*(?:submitted\s+homework|homework(?:\s+status)?|assignment)\b\s*[:\-]?\s*",
+        r"^\s*/?(?:"
+        r"(?:submitted|turned\s+in|done|completed)\s+homework|"
+        r"homework(?:\s+(?:status|complete|completed|done|submit|submitted|turned\s+in))?|"
+        r"assignment"
+        r")\b\s*[:\-]?\s*",
         "",
         text,
         flags=re.IGNORECASE,
@@ -345,6 +349,12 @@ def _ocr_text(text: str) -> str | None:
 def _is_submission_request(text: str) -> bool:
     return bool(
         re.search(
+            r"^\s*/?homework(?:@[A-Za-z0-9_]+)?\s+"
+            r"(?:complete|completed|done|submit|submitted|turned\s+in)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        or re.search(
             r"^\s*/?capture(?:@[A-Za-z0-9_]+)?\s+(?:submitted|turned\s+in|done|completed)\s+homework\b",
             text,
             flags=re.IGNORECASE,
@@ -365,6 +375,12 @@ def _is_submission_request(text: str) -> bool:
 def is_homework_capture(text: str) -> bool:
     lowered = text.lower()
     if re.search(r"^\s*/?capture(?:@[A-Za-z0-9_]+)?\s+(?:submitted\s+)?homework\b", lowered):
+        return True
+    if re.search(
+        r"^\s*/?homework(?:@[a-z0-9_]+)?\s+"
+        r"(?:complete|completed|done|submit|submitted|turned\s+in)\b",
+        lowered,
+    ):
         return True
     return bool(
         "image text:" in lowered

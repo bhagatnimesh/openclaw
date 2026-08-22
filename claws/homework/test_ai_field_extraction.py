@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from claws.homework.ai_field_extraction import (
     DEFAULT_TIMEZONE,
     HomeworkAIFieldExtractor,
+    merge_ai_homework_fields,
     validate_homework_ai_fields,
 )
 
@@ -29,6 +30,26 @@ class FakeOpenAIResponse:
 
 
 class HomeworkAIFieldExtractionTest(unittest.TestCase):
+    def test_ai_cannot_turn_explicit_submission_into_new_assignment(self):
+        refined = merge_ai_homework_fields(
+            {
+                "intent": "capture_submission",
+                "status": "submitted",
+                "child": "Nysha",
+                "subject": "Art",
+            },
+            {
+                "action": "capture_assignment",
+                "confidence": 0.94,
+                "slots": {"status": "assigned", "title": "Spring season"},
+            },
+            "/homework complete art class Nysha",
+        )
+
+        self.assertEqual(refined["intent"], "capture_submission")
+        self.assertEqual(refined["status"], "submitted")
+        self.assertEqual(refined["title"], "Spring season")
+
     def test_validate_accepts_homework_schema_valid_fields(self):
         frame = validate_homework_ai_fields(
             {

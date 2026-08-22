@@ -4,8 +4,11 @@ from pathlib import Path
 import tempfile
 import json
 from n4os_advice import (
+    _build_context,
     _task_matches_target,
+    format_n4os_knowledge_preview,
     format_n4os_advice,
+    generate_n4os_advice,
     is_n4os_advice_message,
 )
 import unittest
@@ -13,6 +16,28 @@ from unittest.mock import patch
 
 
 class N4OSAdviceTest(unittest.TestCase):
+    def test_knowledge_preview_names_every_loaded_source_without_paths(self):
+        preview = format_n4os_knowledge_preview(
+            {
+                "files": [
+                    {"path": "n4os/SOUL.md"},
+                    {"path": "n4os/IDENTITY.md"},
+                    {"path": "n4os/PRIORITIES.md"},
+                    {"path": "n4os/PERSONAL_MODEL.md"},
+                    {"path": "n4os/playbooks/Parenting.md"},
+                ],
+                "observations": ["signal"],
+                "journal": [],
+                "trajectories": [],
+            },
+            history_turns=1,
+        )
+
+        self.assertIn("Sources: SOUL, Identity, Priorities, Personal Model, Parenting", preview)
+        self.assertIn("1 observation", preview)
+        self.assertIn("Chat history: 1 turn", preview)
+        self.assertNotIn("n4os/", preview)
+
     def test_detects_advice_triggers(self):
         self.assertTrue(is_n4os_advice_message("/ask How should we approach reading?"))
         self.assertTrue(is_n4os_advice_message("/n4os How should we approach reading?"))
@@ -110,10 +135,26 @@ class N4OSAdviceTest(unittest.TestCase):
             def read(self):
                 return json.dumps(
                     {
-                        "output_text": (
-                            "**Decision:** try a small school script.\n\n"
-                            "**Next action:** practice one hello."
-                        )
+                        "output_text": json.dumps(
+                            {
+                                "reasoning_summary": "Used recent reading signals.",
+                                "answer": (
+                                    "**Decision:** try a small school script.\n\n"
+                                    "**Next action:** practice one hello."
+                                ),
+                            }
+                        ),
+                        "output": [
+                            {
+                                "type": "reasoning",
+                                "summary": [
+                                    {
+                                        "type": "summary_text",
+                                        "text": "Prioritized the recent family signals.",
+                                    }
+                                ],
+                            }
+                        ],
                     }
                 ).encode("utf-8")
 
@@ -144,6 +185,19 @@ class N4OSAdviceTest(unittest.TestCase):
         self.assertIn("n4os/SOUL.md", memory_paths)
         self.assertIn("n4os/MISSION.md", memory_paths)
         self.assertIn("n4os/VISION.md", memory_paths)
+        self.assertEqual(seen_body["payload"]["reasoning"], {"summary": "concise"})
+        self.assertEqual(
+            seen_body["payload"]["text"]["format"]["type"],
+            "json_schema",
+        )
+
+        result = generate_n4os_advice(
+            "/ask How should we approach Nysha's reading?",
+            api_key="test-key",
+            urlopen=fake_urlopen,
+        )
+        self.assertEqual(result.reasoning_summary, "Prioritized the recent family signals.")
+        self.assertTrue(result.knowledge_preview.startswith("Knowledge selected"))
 
     def test_fallback_advice_uses_recent_journal_signals(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -214,7 +268,7 @@ class N4OSAdviceTest(unittest.TestCase):
             reply = format_n4os_advice(
                 "/ask tell me about week ahead",
                 api_key="",
-        )
+            )
 
         self.assertIn("N4OS week ahead", reply)
         self.assertIn("This looks like a protect-attention week", reply)
@@ -293,6 +347,80 @@ class N4OSAdviceTest(unittest.TestCase):
                 "Nysha",
             )
         )
+
+    def test_nysha_school_question_loads_imported_school_pack(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            school_root = n4os_root / "school" / "Nysha" / "2026-2027"
+            school_root.mkdir(parents=True)
+            for name in ("School Knowledge.md", "Room 13.md"):
+                (school_root / name).write_text(f"# {name}\nsource-backed school context\n", encoding="utf-8")
+
+            context = _build_context("when does Nysha have spring break", n4os_root)
+
+        loaded = [item["path"] for item in context["files"]]
+        self.assertIn("n4os/school/Nysha/2026-2027/School Knowledge.md", loaded)
+        self.assertIn("n4os/school/Nysha/2026-2027/Room 13.md", loaded)
+
+    def test_nysha_school_conversation_question_loads_saved_prompts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            school_root = n4os_root / "school" / "Nysha" / "2026-2027"
+            school_root.mkdir(parents=True)
+            for name in ("School Knowledge.md", "Room 13.md", "Conversation Starters.md"):
+                (school_root / name).write_text(f"# {name}\nsource-backed school context\n", encoding="utf-8")
+
+            context = _build_context("what can I ask Nysha about school today", n4os_root)
+
+        loaded = [item["path"] for item in context["files"]]
+        self.assertIn("n4os/school/Nysha/2026-2027/Conversation Starters.md", loaded)
+
+    def test_nysha_book_question_adds_reading_garden_context(self):
+        reading_garden = {
+            "available": True,
+            "current_book": "Pete the Cat",
+            "book_collection": [{"title": "Pete the Cat", "status": "Reading", "last_read": "2026-08-11"}],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "n4os_advice._reading_garden_context",
+            return_value=reading_garden,
+        ):
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir(parents=True)
+
+            context = _build_context("what books is Nysha reading", n4os_root)
+
+        self.assertEqual(context["reading_garden"], reading_garden)
+
+    def test_book_lookup_fallback_answers_from_reading_garden(self):
+        reading_garden = {
+            "available": True,
+            "current_book": "Pete the Cat: Pete at the Beach",
+            "book_collection": [
+                {
+                    "title": "Pete the Cat: Pete at the Beach",
+                    "status": "Reading",
+                    "last_read": "2026-08-11",
+                },
+                {
+                    "title": "HELLO KITTY Graduation Day",
+                    "status": "Reading",
+                    "last_read": "2026-08-09",
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "n4os_advice._reading_garden_context",
+            return_value=reading_garden,
+        ):
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir(parents=True)
+
+            reply = format_n4os_advice("/ask what books is Nysha reading", n4os_root=n4os_root)
+
+        self.assertIn("Pete the Cat: Pete at the Beach", reply)
+        self.assertIn("HELLO KITTY Graduation Day", reply)
+        self.assertIn("Used: Reading Garden, Nysha", reply)
 
 
 if __name__ == "__main__":
