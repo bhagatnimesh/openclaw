@@ -1149,6 +1149,8 @@ class FamilyTasksClaw:
         name = str(intent.get("task_list_name") or "").strip()
         if not hint and not name:
             return DEFAULT_TASK_LIST_ID, None
+        if hint == DEFAULT_TASK_LIST_ID and not name:
+            return DEFAULT_TASK_LIST_ID, None
         response = self.tools.list_task_lists()
         if response["status"] != "ok":
             return DEFAULT_TASK_LIST_ID, response["message"]

@@ -45,6 +45,7 @@ from telegram_bot import (
     _build_help_catalog,
     _apply_capture_correction,
     _conversation_key,
+    _telegram_how_to_reply,
 )
 from claws.n4os.claw import N4OSClaw
 from claws.n4os.second_brain_importer import SecondBrainImportUserError
@@ -309,8 +310,10 @@ class FakeHomeworkClaw:
     def __init__(self, status: str = "ok") -> None:
         self.status = status
         self.calls: list[tuple[str, str | None, str | None, str | None]] = []
+        self.parent_notes: list[tuple[str, str]] = []
         self.last_result: dict[str, Any] | None = None
         self.pending_action: dict[str, Any] | None = None
+        self.tools = self
 
     def capture_from_request(self, request: str, **kwargs):
         self.calls.append(
@@ -323,6 +326,10 @@ class FakeHomeworkClaw:
         )
         self.last_result = {"status": self.status}
         return "Captured homework for Nysha: All About Me - assigned, due 2026-08-21."
+
+    def add_parent_note(self, homework_item_id: str, note: str) -> dict[str, Any]:
+        self.parent_notes.append((homework_item_id, note))
+        return {"status": "ok", "message": "Added that parent note to the learning record.", "data": {}}
 
 
 class FakeSchoolNewsletterImporter:
@@ -670,6 +677,64 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
                 VOICE_TRANSCRIPTION_STARTED_MESSAGE,
                 VOICE_TRANSCRIPTION_RESULT_MESSAGE.format(text=transcript),
                 "Current plan: Keep the next interaction short and positive.",
+            ],
+        )
+
+    async def test_voice_action_with_incidental_help_text_reaches_router(self):
+        router = FakeClaw()
+        transcript = "add task ask the teacher about homework help sessions tomorrow"
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            router,
+            logger=QuietLogger(),
+            audio_transcriber=FakeAudioTranscriber(transcript),
+        )
+        message = FakeMessage(voice=FakeVoice())
+
+        await bot.handle_message(FakeUpdate(12345, message), FakeContext())
+
+        self.assertEqual(router.requests, [transcript])
+        self.assertEqual(
+            message.replies,
+            [
+                VOICE_TRANSCRIPTION_STARTED_MESSAGE,
+                VOICE_TRANSCRIPTION_RESULT_MESSAGE.format(text=transcript),
+                f"router replied to: {transcript}",
+            ],
+        )
+
+    async def test_voice_reply_to_homework_parent_note_prompt_adds_parent_note(self):
+        router = FakeClaw()
+        homework = FakeHomeworkClaw()
+        transcript = (
+            "Nysha did this homework herself. Word problems are fine once solved, "
+            "but she needs practice describing the equation."
+        )
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            router,
+            logger=QuietLogger(),
+            audio_transcriber=FakeAudioTranscriber(transcript),
+            homework_claw=homework,
+        )
+        parent_prompt = FakeMessage(
+            "Optional: reply here with a parent note.",
+            message_id=991,
+        )
+        bot._learning_note_reply_targets[parent_prompt.message_id] = "homework-1"
+        message = FakeMessage(voice=FakeVoice(), reply_to_message=parent_prompt)
+
+        await bot.handle_message(FakeUpdate(12345, message), FakeContext())
+
+        self.assertEqual(homework.parent_notes, [("homework-1", transcript)])
+        self.assertEqual(homework.calls, [])
+        self.assertEqual(router.requests, [])
+        self.assertEqual(
+            message.replies,
+            [
+                VOICE_TRANSCRIPTION_STARTED_MESSAGE,
+                VOICE_TRANSCRIPTION_RESULT_MESSAGE.format(text=transcript),
+                "Added that parent note to the learning record.",
             ],
         )
 
@@ -3661,6 +3726,51 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
             "Source: Telegram.",
         )
 
+    async def test_broad_memory_lookup_returns_structured_first_then_file_matches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            observations = n4os_root / "family" / "observations"
+            observations.mkdir(parents=True)
+            (observations / "2026-08.md").write_text(
+                "\n".join(
+                    [
+                        "# Observations",
+                        "",
+                        "## 2026-08-23",
+                        "",
+                        "### Family",
+                        "- Observation: learning code came up during puzzle time",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            claw = FakeClaw()
+            bot = N4OSTelegramBot(
+                TelegramConfig(token="token", allowed_user_id=12345),
+                claw,
+                logger=QuietLogger(),
+                n4os_root=n4os_root,
+            )
+
+            await bot.handle_message(
+                FakeUpdate(12345, FakeMessage("/remember learning code 0816")),
+                None,
+            )
+            lookup = FakeMessage("find memory everywhere learning code")
+
+            await bot.handle_message(FakeUpdate(12345, lookup), None)
+
+        self.assertEqual(claw.requests, [])
+        self.assertEqual(len(lookup.replies), 1)
+        reply = lookup.replies[0]
+        self.assertIn("Remembered note: learning code 0816", reply)
+        self.assertIn("Broader N4OS memory matches:", reply)
+        self.assertLess(
+            reply.index("Remembered note: learning code 0816"),
+            reply.index("Broader N4OS memory matches:"),
+        )
+
     async def test_explicit_structured_memory_lookup_miss_does_not_fall_through_to_router(self):
         claw = FakeClaw()
         bot = N4OSTelegramBot(
@@ -4899,6 +5009,8 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("add home board item", HELP_MESSAGE)
         self.assertIn("how do I add a memory?", HELP_MESSAGE)
         self.assertIn("how do I use shopping?", HELP_MESSAGE)
+        self.assertIn("how do I update Nysha's school calendar from a photo?", HELP_MESSAGE)
+        self.assertIn("find memory everywhere learning through play", HELP_MESSAGE)
         self.assertLessEqual(len(HELP_MESSAGE.splitlines()), 16)
         self.assertNotIn("**", HELP_MESSAGE)
         self.assertNotIn("###", HELP_MESSAGE)
@@ -5015,6 +5127,56 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("calendar, class, appointment, or schedule tables", prompt)
         self.assertIn("one row per visible scheduled entry", prompt)
 
+    def test_openai_image_text_extractor_extracts_structured_weekly_schedule(self):
+        captured: dict[str, Any] = {}
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "output_text": json.dumps(
+                            {
+                                "school_year": "2026-27",
+                                "complete": True,
+                                "rows": [
+                                    {
+                                        "weekday": "Wednesday",
+                                        "start_time": "14:30",
+                                        "end_time": "14:45",
+                                        "title": "Free Time",
+                                        "confidence": 0.98,
+                                    }
+                                ],
+                            }
+                        )
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request: Any, timeout: int) -> FakeResponse:
+            del timeout
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as image:
+            image.write(b"calendar image")
+            image.flush()
+            extractor = OpenAIImageTextExtractor(
+                api_key="test-key",
+                model="test-image-model",
+                urlopen=fake_urlopen,
+            )
+            result = extractor.extract_weekly_schedule(Path(image.name))
+
+        self.assertEqual(result["school_year"], "2026-27")
+        self.assertEqual(result["rows"][0]["title"], "Free Time")
+        self.assertEqual(captured["payload"]["text"]["format"]["name"], "n4os_weekly_school_schedule")
+
     async def test_help_command_with_library_topic_gets_library_help(self):
         bot = N4OSTelegramBot(
             TelegramConfig(token="token", allowed_user_id=12345),
@@ -5052,6 +5214,9 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("See:", HOW_TO_HELP["event"])
         self.assertIn("Move dinner with Rahul", HOW_TO_HELP["event"])
         self.assertIn("give me today's briefing", HOW_TO_HELP["event"])
+        self.assertIn("Update Nysha school calendar from this image", HOW_TO_HELP["event"])
+        self.assertIn("Reply yes to apply", HOW_TO_HELP["event"])
+        self.assertIn("Unclear or clipped rows", HOW_TO_HELP["event"])
 
     async def test_help_command_with_task_topic_gets_task_help(self):
         bot = N4OSTelegramBot(
@@ -5104,6 +5269,33 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(homework.calls, [])
         self.assertEqual(claw.requests, [])
 
+    async def test_explicit_commands_with_incidental_homework_help_text_reach_router(self):
+        requests = (
+            "/calendar add event\n"
+            "Parent-Teacher Meeting Tuesday, August 25 3:20 PM - 3:35 PM. "
+            "We will cover homework help sessions.",
+            "/task add ask the teacher about homework help sessions tomorrow",
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                claw = FakeClaw()
+                homework = FakeHomeworkClaw()
+                bot = N4OSTelegramBot(
+                    TelegramConfig(token="token", allowed_user_id=12345),
+                    claw,
+                    logger=QuietLogger(),
+                    homework_claw=homework,
+                )
+                message = FakeMessage(request)
+
+                await bot.handle_message(FakeUpdate(12345, message), None)
+
+                self.assertEqual(len(claw.requests), 1)
+                routed_request = claw.requests[0]
+                self.assertIn("homework help sessions", routed_request)
+                self.assertEqual(homework.calls, [])
+                self.assertEqual(message.replies, [f"router replied to: {routed_request}"])
+
     async def test_remember_slash_help_message_gets_remember_help_without_memory_write(self):
         claw = FakeClaw()
         bot = N4OSTelegramBot(
@@ -5117,6 +5309,7 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(message.replies, [HOW_TO_HELP["remember"]])
         self.assertIn("/remember Nysha school gate code", HOW_TO_HELP["remember"])
+        self.assertIn("find memory everywhere learning through play", HOW_TO_HELP["remember"])
         self.assertIn("data/n4os.db", HOW_TO_HELP["remember"])
         self.assertEqual(claw.requests, [])
 
@@ -5136,6 +5329,20 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("n4os/learnings/Quick Notes.md", HOW_TO_HELP["note"])
         self.assertIn("n4os/learnings/YYYY-MM-DD-<title>.md", HOW_TO_HELP["note"])
         self.assertIn("n4os/learnings/Inbox.md", HOW_TO_HELP["note"])
+        self.assertEqual(claw.requests, [])
+
+    async def test_legacy_mem_slash_help_gets_capture_help_without_capture(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/mem help")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [HOW_TO_HELP["capture"]])
         self.assertEqual(claw.requests, [])
 
     async def test_task_slash_help_message_mentions_noah_assistant_help(self):
@@ -5167,6 +5374,30 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies, [HOW_TO_HELP["task"]])
         self.assertIn("Done: complete task call FUSD", HOW_TO_HELP["task"])
         self.assertEqual(claw.requests, [])
+
+    def test_action_payloads_starting_with_question_words_are_not_help(self):
+        for request in (
+            "/note how to restart the dashboard",
+            "/capture how to calm down before school",
+            "/task how do I follow up with the teacher",
+        ):
+            with self.subTest(request=request):
+                self.assertIsNone(_telegram_how_to_reply(request))
+
+    def test_help_only_aliases_are_not_treated_as_action_commands(self):
+        for request in (
+            "/notes how to save this",
+            "/school-newsletter how do I import this",
+        ):
+            with self.subTest(request=request):
+                self.assertIsNotNone(_telegram_how_to_reply(request))
+
+    def test_routed_reading_and_experiment_aliases_keep_slash_help(self):
+        self.assertEqual(_telegram_how_to_reply("/reading help"), HOW_TO_HELP["library"])
+        self.assertEqual(
+            _telegram_how_to_reply("/experiment help"),
+            HOW_TO_HELP["science_lab"],
+        )
 
     async def test_school_newsletter_slash_help_message_gets_import_help(self):
         bot = N4OSTelegramBot(

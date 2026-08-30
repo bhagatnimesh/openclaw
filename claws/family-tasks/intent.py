@@ -130,6 +130,10 @@ WEEKDAYS = {
     "saturday": 5,
     "sunday": 6,
 }
+WEEKDAY_PATTERN = "|".join(
+    re.escape(value)
+    for value in sorted(WEEKDAYS, key=len, reverse=True)
+)
 MONTHS = {}
 for month_names in (calendar.month_name, calendar.month_abbr):
     MONTHS.update(
@@ -893,6 +897,30 @@ def _extract_relative_due_date(user_text: str, reference: datetime) -> tuple[str
     return None, ""
 
 
+def _extract_counted_weekday_due_date(
+    user_text: str,
+    reference: datetime,
+) -> tuple[str | None, str]:
+    match = re.search(
+        rf"\b(?:after|in)\s+"
+        rf"(?P<count>\d{{1,2}}|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+        rf"\s+(?P<weekday>{WEEKDAY_PATTERN})(?:s|'s)?\b",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None, ""
+    count = _relative_date_count(match.group("count"))
+    if count is None:
+        return None, ""
+    weekday = WEEKDAYS[match.group("weekday").lower()]
+    days_until = (weekday - reference.weekday()) % 7
+    if days_until == 0:
+        days_until = 7
+    days = days_until + ((count - 1) * 7)
+    return (reference + timedelta(days=days)).date().isoformat(), match.group(0)
+
+
 def _contains_any_word(user_text: str, words: tuple[str, ...]) -> bool:
     return any(re.search(rf"\b{re.escape(word)}\b", user_text) for word in words)
 
@@ -1026,6 +1054,13 @@ def _extract_due_date(user_text: str, reference: datetime) -> tuple[str | None, 
     relative_due, relative_anchor = _extract_relative_due_date(user_text, reference)
     if relative_due is not None:
         return relative_due, relative_anchor
+
+    counted_weekday_due, counted_weekday_anchor = _extract_counted_weekday_due_date(
+        user_text,
+        reference,
+    )
+    if counted_weekday_due is not None:
+        return counted_weekday_due, counted_weekday_anchor
 
     for name, weekday in WEEKDAYS.items():
         if (
@@ -1402,6 +1437,14 @@ def _strip_task_annotations(title: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(
+        rf"\b(?:time\s*:?\s*)?(?:after|in)\s+"
+        rf"(?:\d{{1,2}}|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+        rf"\s+(?:{WEEKDAY_PATTERN})(?:s|'s)?\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\bcall\s+up\b", "call", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(
         r"\s+to\s+check\s+how\s+to\s+handle\s+with\s+(.+)$",
@@ -1703,12 +1746,22 @@ def score_task_command_candidates(user_text: str, now: datetime | None = None) -
 
     as_task_body = _as_task_create_body(target_text) or _as_task_create_body(user_text)
     has_create_request = CREATE_TASK_REQUEST_RE.search(lowered) is not None
+    has_prefixed_create_action = has_prefix and re.search(
+        r"^\s*(?:add|create|capture|remember)\b",
+        lowered,
+    ) is not None
     has_bare_task_start = CREATE_TASK_START_RE.search(lowered) is not None
     has_reminder = re.search(r"^\s*remind\s+me\s+to\b", lowered) is not None
-    if as_task_body is not None or has_create_request or has_reminder or (
-        has_bare_task_start
-        and not _has_explicit_clock_time(target_text)
-        and not TASK_READ_ACTION_RE.match(lowered)
+    if (
+        as_task_body is not None
+        or has_create_request
+        or has_prefixed_create_action
+        or has_reminder
+        or (
+            has_bare_task_start
+            and not _has_explicit_clock_time(target_text)
+            and not TASK_READ_ACTION_RE.match(lowered)
+        )
     ):
         add(
             "create_task",

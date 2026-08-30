@@ -47,6 +47,31 @@ Stable class guide imported for Nysha. Use this as context for school expectatio
 - * Flexibility is key! The daily schedule may change to accommodate assemblies, online field trips, etc.
 - Wear tennis shoes for PE and recess time!
 
+## After-School Weekly Schedule
+
+- Source: 1st/2nd Grade Weekly Schedule 2026-27 image, captured 2026-08-23.
+- Calendar: Nysha School Calendar
+- Monday:
+  - 3:30-4:30 PM: Homework
+  - 4:30-5:00 PM: Circle Time / Resilience Lab
+  - 5:00-6:00 PM: English Language Art
+- Tuesday:
+  - 3:30-4:30 PM: Homework
+  - 4:30-5:00 PM: Journal
+  - 5:00-6:00 PM: Real Life Math
+- Wednesday:
+  - 2:30-2:45 PM: Free Time
+  - 2:45-4:30 PM: Homework
+  - 4:30-6:00 PM: STEM / Culinary Arts
+- Thursday:
+  - 3:30-4:30 PM: Homework
+  - 4:30-5:00 PM: Math Drill
+  - 5:00-6:00 PM: Art / Music & Theater
+- Friday:
+  - 3:30-4:30 PM: Health & Habit
+  - 4:30-5:00 PM: 3D Building & Engineering Workshop
+  - 5:00-6:00 PM: PE
+
 ## How N4OS Should Use This
 
 - Answer what Nysha is likely learning or practicing at school.

@@ -45,7 +45,7 @@ else:
 from claws.n4os.claw import N4OSClaw
 from claws.n4os.routing_contracts import ROUTE_SPECS
 from claws.homework import HomeworkClaw
-from claws.homework.intent import has_homework_terms, is_homework_capture
+from claws.homework.intent import extract_intent, has_homework_terms, is_homework_capture, is_learning_review
 from claws.school_coach import CoachProvenance, SchoolCoachClaw
 from claws.school_coach.claw import is_school_coach_message
 from claws.n4os.input_normalizer import improve_entered_text
@@ -74,6 +74,10 @@ from n4os_memory_status import (
     format_memory_status,
     is_memory_status_message,
     parse_memory_status_target,
+)
+from n4os_memory_search import (
+    format_broad_memory_search_query,
+    is_broad_memory_search_query,
 )
 from n4os_structured_memory import (
     MemoryItem,
@@ -151,7 +155,7 @@ UNAUTHORIZED_MESSAGE = "Unauthorized."
 HELP_MESSAGE = (
     "N4OS Telegram help\n\n"
     "You can speak naturally. Use these when you want precision:\n"
-    "1. Remember: /remember Nysha school gate code is 4812; /capture Nysha was nervous about school\n"
+    "1. Remember/search: /remember Nysha school gate code is 4812; find memory everywhere learning through play; /capture Nysha was nervous about school\n"
     "2. Ask, chat, or research: /ask How should I approach Nysha's reading?; /chat Let's think through school; /research compare current options\n"
     "3. Review/status: /review week, /status Nysha, /status reading, /goals\n"
     "4. Calendar/tasks/homework: /event create dinner with Rahul next Tuesday at 7 PM; add task call FUSD tomorrow morning; /homework help\n"
@@ -162,7 +166,7 @@ HELP_MESSAGE = (
     "9. Imports: /import second brain <link> Instructions: use this as reusable N4OS context; /import school newsletter for Nysha <Google Slides link>\n"
     "10. Backlog/home: Discussion: Should we attend the birthday?; Planning: Camping trip September 12; Decision: Choose Nysha's school next year; add home board item buy milk\n"
     "11. Quick notes: /note quick Patrick Collison: learning still matters; school coach: say 'school coach' or send /school_coach\n\n"
-    "More help: /remember help, /task help, /shop help, /help school coach, or ask how do I add a memory? how do I use shopping?"
+    "More help: /remember help, /task help, /shop help, /help event, /help school coach, or ask how do I add a memory? how do I use shopping? how do I update Nysha's school calendar from a photo?"
 )
 ERROR_MESSAGE = "Sorry, N4OS hit an error while handling that."
 UNSUPPORTED_MESSAGE = "Please send a text or voice message."
@@ -177,6 +181,17 @@ VOICE_TRANSCRIPTION_STARTED_MESSAGE = "Got it, transcribing that voice message."
 VOICE_TRANSCRIPTION_RESULT_MESSAGE = "Transcribed: {text}"
 VOICE_TRANSCRIPTION_EMPTY_MESSAGE = "I could not hear any speech in that voice message."
 VOICE_TRANSCRIPTION_FAILED_MESSAGE = "Sorry, I could not transcribe that voice message."
+
+
+def _is_nysha_schedule_photo_request(text: str, has_image: bool) -> bool:
+    if not has_image:
+        return False
+    lowered = text.lower()
+    has_nysha = "nysha" in lowered or "1st/2nd grade" in lowered or "1st grade" in lowered
+    has_schedule = any(term in lowered for term in ("school calendar", "weekly schedule", "timetable", "school schedule"))
+    return has_nysha and has_schedule and any(
+        term in lowered for term in ("update", "replace", "from this image", "from this photo")
+    )
 VOICE_TRANSCRIPTION_TIMEOUT_MESSAGE = (
     "Sorry, voice transcription took too long. Please try a shorter voice message."
 )
@@ -242,9 +257,9 @@ HOW_TO_HELP = {
         "- Health/safety: /remember Navya is allergic to cashews\n"
         "- Family logistics: /remember Niyati has the next dinner pickup\n\n"
         "Find and maintain:\n"
-        "- Recent: /remember recent\n"
-        "- Recent: /remember last 7 days\n"
+        "- Browse by time: /remember recent, /remember last 7 days, or /remember last 6 months\n"
         "- Look up: What do you remember about Nysha school gate code?\n"
+        "- Search broader N4OS memory: find memory everywhere learning through play\n"
         "- Update: update remembered note Nysha school gate code to 9999\n"
         "- Forget: forget remembered note Nysha school gate code\n"
         "- Undo last memory change: undo\n\n"
@@ -270,7 +285,12 @@ HOW_TO_HELP = {
         "Move: Move dinner with Rahul to Saturday at 7\n"
         "Cancel: Cancel dinner with Rahul\n"
         "See: show tomorrow's calendar\n"
-        "See: give me today's briefing"
+        "See: give me today's briefing\n\n"
+        "Update Nysha's weekly school schedule from a photo:\n"
+        "Send a clear timetable photo with the caption: Update Nysha school calendar from this image.\n"
+        "N4OS reads the weekday, time, and activity rows, then shows a preview of additions, changes, and removals.\n"
+        "Reply yes to apply the preview, cancel to discard it, or send a correction such as: Wednesday homework ends at 4:30 PM.\n"
+        "Unclear or clipped rows require a correction instead of being guessed. Unrelated calendar events are preserved."
     ),
     "task": (
         "Tasks track open loops and reminders.\n\n"
@@ -288,12 +308,16 @@ HOW_TO_HELP = {
         "Homework captures assignments, due dates, worksheet photos, and submissions.\n\n"
         "Use cases:\n"
         "- Assignment: /capture homework Nysha math due Friday\n"
+        "- Lesson: /lesson Nysha RSM Math lesson 01\n"
+        "- Album: send all worksheet pages together with a /homework or /lesson caption\n"
         "- Photo/OCR: send a homework photo with caption /capture homework Nysha\n"
         "- Complete with photo: /homework complete art class Nysha\n"
         "- Submission: /capture submitted homework Nysha All About Me\n"
         "- Status: homework status\n"
+        "- Learning review: /learning review Nysha math\n"
         "- Cancel a pending duplicate prompt: cancel\n\n"
-        "Where it goes: n4os/homework/*.md plus homework records in the local homework SQLite store."
+        "After capture, reply to the optional parent-note prompt with what was easy, hard, or helpful. "
+        "Where it goes: n4os/homework/*.md plus learning records in the local homework SQLite store."
     ),
     "school_newsletter": (
         "School newsletter imports pull useful school dates and notes from a newsletter link.\n\n"
@@ -678,6 +702,91 @@ class OpenAIImageTextExtractor:
         with self.urlopen(request, timeout=20) as response:
             response_payload = json.loads(response.read().decode("utf-8"))
         return _extract_response_text(response_payload)
+
+    def extract_weekly_schedule(self, image_path: Path) -> dict[str, Any]:
+        """Extract a timetable as rows so calendar reconciliation stays deterministic."""
+        mime_type = mimetypes.guess_type(str(image_path))[0] or "image/jpeg"
+        image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "school_year": {"type": "string"},
+                "complete": {"type": "boolean"},
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "weekday": {"type": "string"},
+                            "start_time": {"type": "string"},
+                            "end_time": {"type": "string"},
+                            "title": {"type": "string"},
+                            "confidence": {"type": "number"},
+                        },
+                        "required": [
+                            "weekday",
+                            "start_time",
+                            "end_time",
+                            "title",
+                            "confidence",
+                        ],
+                    },
+                },
+            },
+            "required": ["school_year", "complete", "rows"],
+        }
+        payload = {
+            "model": self.model,
+            "store": False,
+            "max_output_tokens": 1200,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "n4os_weekly_school_schedule",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Read this weekly school timetable. Set complete to false if any weekday column "
+                                "or time row is cropped, clipped, or unreadable. Return one row for every visible non-empty "
+                                "weekday/time cell. Preserve merged cells as one row with their full time span. "
+                                "Use 24-hour HH:MM times, the full activity title, and a confidence from 0 to 1. "
+                                "Do not invent text or rows."
+                            ),
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:{mime_type};base64,{image_data}",
+                            "detail": "high",
+                        },
+                    ],
+                }
+            ],
+        }
+        request = urllib.request.Request(
+            OPENAI_RESPONSES_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with self.urlopen(request, timeout=30) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+        extracted = json.loads(_extract_response_text(response_payload))
+        if not isinstance(extracted, dict):
+            raise ValueError("Weekly schedule extraction returned an invalid object")
+        return extracted
 
 
 HELP_CONVERSATION_CONTROLS: tuple[dict[str, Any], ...] = (
@@ -1064,6 +1173,7 @@ HELP_TOPIC_ALIASES = {
     "decision": "decision",
     "decisions": "decision",
     "event": "event",
+    "experiment": "science_lab",
     "experiments": "science_lab",
     "goals": "goals",
     "home": "home_board",
@@ -1072,12 +1182,14 @@ HELP_TOPIC_ALIASES = {
     "homework": "homework",
     "import": "second_brain_import",
     "library": "library",
+    "mem": "capture",
     "mem-inbox": "note",
     "memory": "remember",
     "memory-status": "memory_status",
     "note": "note",
     "notes": "note",
     "n4os": "n4os_advice",
+    "reading": "library",
     "remember": "remember",
     "review": "review",
     "research": "n4os_research",
@@ -1145,10 +1257,17 @@ def _telegram_how_to_reply(text: str, help_answerer: Any | None = None) -> str |
         return slash_help
 
     lowered = text.lower().strip()
-    if re.match(
-        r"^/(?:task|tasks|todo|todos)(?:@[a-z0-9_]+)?(?:\s+|:\s*)\S",
-        lowered,
-    ):
+    explicit_command = re.match(r"^/(?P<command>[a-z][a-z0-9_-]*)", lowered)
+    command = explicit_command.group("command") if explicit_command is not None else None
+    is_routed_slash_command = any(
+        command in spec.command_aliases for spec in ROUTE_SPECS
+    )
+    is_action_request = (
+        is_routed_slash_command
+        or command == "homework"
+        or _is_active_chat_bypass_message(text)
+    )
+    if is_action_request:
         return None
     if not any(cue in lowered for cue in ("how do i", "how to", "can i", "what command", "commands", "help")):
         return None
@@ -1807,6 +1926,9 @@ class N4OSTelegramBot:
         self.chat_sessions = chat_sessions or N4OSChatSessionStore()
         self.n4os_root = n4os_root or ROOT / "n4os"
         self.homework_claw = homework_claw
+        self._learning_note_reply_targets: dict[int, str] = {}
+        self._homework_album_buffers: dict[tuple[str, str], list[tuple[Any, str, TelegramImageInput]]] = {}
+        self._homework_album_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self.school_coach_claw = school_coach_claw
         self.school_newsletter_importer = school_newsletter_importer or SchoolNewsletterImporter(
             n4os_root=self.n4os_root,
@@ -1819,6 +1941,88 @@ class N4OSTelegramBot:
         if self.homework_claw is None:
             self.homework_claw = HomeworkClaw.default()
         return self.homework_claw
+
+    async def _try_add_homework_parent_note(
+        self,
+        message: Any,
+        text: str,
+        *,
+        has_image: bool,
+    ) -> bool:
+        parent_note_target = self._learning_note_reply_targets.get(_reply_to_message_id(message) or -1)
+        if not parent_note_target or not text or has_image:
+            return False
+        add_note = getattr(self._homework_claw().tools, "add_parent_note", None)
+        if not callable(add_note):
+            return False
+        result = add_note(parent_note_target, text)
+        if result.get("status") != "ok":
+            return False
+        await message.reply_text(result["message"])
+        return True
+
+    async def _flush_homework_album(self, key: tuple[str, str]) -> None:
+        await asyncio.sleep(0.8)
+        entries = self._homework_album_buffers.pop(key, [])
+        self._homework_album_tasks.pop(key, None)
+        if not entries:
+            return
+        message, caption, _ = entries[0]
+        staged: list[tuple[Path, Path]] = []
+        assets: list[dict[str, Any]] = []
+        try:
+            for _, _, image in entries:
+                photo_url, stored_file = _stage_homework_photo(image.path)
+                staged.append((image.path, stored_file))
+                assets.append({
+                    "path": photo_url,
+                    "ocr_text": image.text or None,
+                    "photo_sha256": hashlib.sha256(image.path.read_bytes()).hexdigest(),
+                    "content_fingerprint": None,
+                })
+            ocr_text = "\n\n".join(f"Page {index}:\n{asset['ocr_text']}" for index, asset in enumerate(assets, start=1) if asset["ocr_text"])
+            request = _combine_text_and_image_text(caption, ocr_text) if ocr_text else caption
+            reply = self._homework_claw().capture_from_request(
+                request,
+                source="telegram_photo",
+                photo_assets=assets,
+            )
+            result = self._homework_claw().last_result or {}
+            if result.get("status") in {"ok", "needs_information"}:
+                for source_file, stored_file in staged:
+                    _commit_homework_photo(source_file, stored_file)
+            else:
+                for source_file, _ in staged:
+                    _remove_path(source_file)
+            await message.reply_text(reply)
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            item = data.get("item") if isinstance(data.get("item"), dict) else None
+            if result.get("status") == "ok" and item and item.get("id"):
+                prompt = await message.reply_text(
+                    "Optional: reply here with a parent note—what felt easy or hard, what helped, confidence, enjoyment, or time spent."
+                )
+                prompt_id = _message_id(prompt)
+                if prompt_id is not None:
+                    self._learning_note_reply_targets[prompt_id] = str(item["id"])
+        except Exception:
+            for source_file, _ in staged:
+                _remove_path(source_file)
+            self.logger.exception("error while capturing homework album")
+            await message.reply_text(ERROR_MESSAGE)
+
+    def _queue_homework_album(
+        self,
+        *,
+        session_key: str,
+        media_group_id: str,
+        message: Any,
+        caption: str,
+        image: TelegramImageInput,
+    ) -> None:
+        key = (session_key, media_group_id)
+        self._homework_album_buffers.setdefault(key, []).append((message, caption, image))
+        if key not in self._homework_album_tasks:
+            self._homework_album_tasks[key] = asyncio.create_task(self._flush_homework_album(key))
 
     def _school_coach_claw(self) -> SchoolCoachClaw:
         if self.school_coach_claw is None:
@@ -2140,7 +2344,12 @@ class N4OSTelegramBot:
             return UNAUTHORIZED_MESSAGE
         return None
 
-    async def _extract_image_text(self, message: Any) -> TelegramImageInput | None:
+    async def _extract_image_text(
+        self,
+        message: Any,
+        *,
+        extract_text: bool = True,
+    ) -> TelegramImageInput | None:
         photo = _largest_photo(message)
         if photo is None:
             return None
@@ -2155,11 +2364,15 @@ class N4OSTelegramBot:
 
         with tempfile.NamedTemporaryFile(prefix="n4os-telegram-image-", suffix=suffix, delete=False) as temp:
             image_path = Path(temp.name)
-        telegram_file = await photo.get_file()
-        await telegram_file.download_to_drive(image_path)
-        image_text = ""
-        if self.image_text_extractor is not None:
-            image_text = self.image_text_extractor.extract_text(image_path).strip()
+        try:
+            telegram_file = await photo.get_file()
+            await telegram_file.download_to_drive(image_path)
+            image_text = ""
+            if extract_text and self.image_text_extractor is not None:
+                image_text = self.image_text_extractor.extract_text(image_path).strip()
+        except Exception:
+            _remove_path(image_path)
+            raise
         return TelegramImageInput(text=image_text, path=image_path)
 
     async def handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2220,6 +2433,18 @@ class N4OSTelegramBot:
         session_key = _conversation_key(update, user_id)
         session = self.sessions.get(session_key)
 
+        if await self._try_add_homework_parent_note(message, text, has_image=has_image):
+            return
+
+        if is_learning_review(text):
+            intent = extract_intent(text)
+            response = self._homework_claw().tools.learning_review(
+                child=str(intent.get("child") or "Nysha"),
+                subject=intent.get("subject"),
+            )
+            await message.reply_text(response["message"])
+            return
+
         if not text and has_audio(message):
             await message.reply_text(VOICE_TRANSCRIPTION_STARTED_MESSAGE)
             transcription_started = time.perf_counter()
@@ -2258,12 +2483,23 @@ class N4OSTelegramBot:
                 len(text),
                 elapsed_ms,
             )
+            if await self._try_add_homework_parent_note(message, text, has_image=has_image):
+                return
 
+        schedule_photo_request = _is_nysha_schedule_photo_request(text, has_image)
         if has_image:
             try:
-                image_input = await self._extract_image_text(message)
+                image_input = await self._extract_image_text(
+                    message,
+                    extract_text=not schedule_photo_request,
+                )
             except Exception:
                 self.logger.exception("error while extracting Telegram image text")
+                if schedule_photo_request:
+                    await message.reply_text(
+                        "I could not read that timetable. Please send a clear image showing the full weekday and time columns."
+                    )
+                    return
                 image_input = None
             if image_input is not None:
                 message_source = "telegram_photo"
@@ -2275,6 +2511,24 @@ class N4OSTelegramBot:
             if image_input is not None:
                 _remove_path(image_input.path)
                 image_input = None
+
+        media_group_id = getattr(message, "media_group_id", None)
+        album_key = (session_key, str(media_group_id)) if media_group_id else None
+        if image_input is not None and album_key is not None and (
+            album_key in self._homework_album_buffers
+            or is_homework_capture(text)
+            or has_homework_terms(text)
+        ):
+            self._queue_homework_album(
+                session_key=session_key,
+                media_group_id=str(media_group_id),
+                message=message,
+                caption=str(getattr(message, "caption", None) or "").strip(),
+                image=image_input,
+            )
+            image_input = None
+            self.logger.info("queued homework album group=%s", media_group_id)
+            return
 
         if not text:
             cleanup_image_input()
@@ -2698,18 +2952,22 @@ class N4OSTelegramBot:
             _is_active_chat_bypass_message(text)
             or _is_high_confidence_action(session.claw, text)
         )
+        broad_memory_query = is_broad_memory_search_query(text)
         structured_memory_query = is_structured_memory_query(text)
         explicit_structured_memory_lookup = _looks_like_explicit_structured_memory_alias_lookup(text)
         natural_structured_memory_probe = looks_like_natural_structured_memory_query(text)
         if (
-            structured_memory_query
+            broad_memory_query
+            or structured_memory_query
             or explicit_structured_memory_lookup
             or natural_structured_memory_probe
             or not active_chat_continuation
             or _looks_like_structured_memory_probe(text)
         ):
             started = time.perf_counter()
-            if explicit_structured_memory_lookup:
+            if broad_memory_query:
+                structured_memory_query = True
+            elif explicit_structured_memory_lookup:
                 structured_memory_query = True
             if not structured_memory_query:
                 try:
@@ -2727,7 +2985,10 @@ class N4OSTelegramBot:
 
             if structured_memory_query:
                 try:
-                    reply = format_structured_memory_query(text, n4os_root=self.n4os_root)
+                    if broad_memory_query:
+                        reply = format_broad_memory_search_query(text, n4os_root=self.n4os_root)
+                    else:
+                        reply = format_structured_memory_query(text, n4os_root=self.n4os_root)
                 except Exception:
                     elapsed_ms = (time.perf_counter() - started) * 1000
                     self.logger.exception(
@@ -2785,6 +3046,40 @@ class N4OSTelegramBot:
             await message.reply_text("Captured N4OS tuning feedback with the related answer trace.")
             return
 
+        if schedule_photo_request and image_input is not None:
+            started = time.perf_counter()
+            calendar = None
+            try:
+                extractor = self.image_text_extractor
+                extract_schedule = getattr(extractor, "extract_weekly_schedule", None)
+                if not callable(extract_schedule):
+                    raise RuntimeError("Weekly timetable image extraction is unavailable.")
+                calendar = session.claw.calendar_claw or session.claw._calendar()
+                calendar.pending_action = None
+                extraction = extract_schedule(image_input.path)
+                reply = calendar.preview_weekly_schedule_sync(extraction)
+                session.claw.clear_pending_actions(keep_calendar=True)
+                self._homework_claw().pending_action = None
+            except Exception:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                self.logger.exception(
+                    "error extracting Nysha schedule image execution_ms=%.2f",
+                    elapsed_ms,
+                )
+                if calendar is not None:
+                    calendar.pending_action = None
+                cleanup_image_input()
+                await message.reply_text(
+                    "I could not read that timetable. Please send a clear image showing the full weekday and time columns."
+                )
+                return
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.logger.info("chosen route=calendar_schedule_image execution_ms=%.2f", elapsed_ms)
+            session.mode = "idle"
+            cleanup_image_input()
+            await reply_chat_chunks(reply)
+            return
+
         pending_capture_text = _pending_capture_request(session.claw, text)
         capture_text = pending_capture_text or text
         homework_pending = _has_homework_pending(self.homework_claw)
@@ -2839,6 +3134,14 @@ class N4OSTelegramBot:
                 setattr(session.claw, "pending_route_clarification", None)
             session.mode = "idle"
             await message.reply_text(reply)
+            item = last_data.get("item") if isinstance(last_data.get("item"), dict) else None
+            if last_result.get("status") == "ok" and item and item.get("id"):
+                prompt = await message.reply_text(
+                    "Optional: reply here with a parent note—what felt easy or hard, what helped, confidence, enjoyment, or time spent."
+                )
+                prompt_id = _message_id(prompt)
+                if prompt_id is not None:
+                    self._learning_note_reply_targets[prompt_id] = str(item["id"])
             return
 
         if pending_capture_text is None and _is_markdown_note_capture(text):

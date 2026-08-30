@@ -638,6 +638,20 @@ class N4OSClaw:
             ),
         )
 
+    def clear_pending_actions(self, *, keep_calendar: bool = False) -> None:
+        """Clear stale domain confirmations before a new explicit workflow starts."""
+        domains = (
+            self.tasks_claw,
+            self.shopping_claw,
+            self.home_board_claw,
+            self.decisions_claw,
+        )
+        if not keep_calendar:
+            domains = (self.calendar_claw, *domains)
+        for domain in domains:
+            _clear_pending_action(domain)
+        self.pending_route_clarification = None
+
     def _remember_route(
         self,
         request: str,

@@ -78,6 +78,25 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(intent["title"], "Call builder")
         self.assertEqual(intent["due"], "2026-07-22")
 
+    def test_counted_weekday_task_uses_nth_upcoming_weekday(self):
+        now = datetime(2026, 8, 23, 16, 53, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent(
+            "/task add sticker to the sienna license time: after 4 Saturdays",
+            now=now,
+        )
+
+        self.assertEqual(intent["title"], "Sticker to the sienna license")
+        self.assertEqual(intent["due"], "2026-09-19")
+
+    def test_counted_weekday_task_excludes_today(self):
+        now = datetime(2026, 8, 29, 9, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+
+        intent = extract_intent("Add task renew registration after one Saturday", now=now)
+
+        self.assertEqual(intent["title"], "Renew registration")
+        self.assertEqual(intent["due"], "2026-09-05")
+
     def test_refined_task_header_and_body_create_title_and_notes(self):
         now = datetime(2026, 7, 8, 10, 33, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 

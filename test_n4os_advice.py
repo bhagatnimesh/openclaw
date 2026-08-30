@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import json
+import sqlite3
 from n4os_advice import (
     _build_context,
     _task_matches_target,
@@ -226,6 +227,58 @@ class N4OSAdviceTest(unittest.TestCase):
         self.assertIn("Journal signals used", reply)
         self.assertIn("I felt scattered because I slept badly", reply)
 
+    def test_build_context_uses_related_terms_for_observation_recall(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            observations = n4os_root / "family" / "observations"
+            observations.mkdir(parents=True)
+            (observations / "2026-08.md").write_text(
+                "\n".join(
+                    [
+                        "# Observations",
+                        "",
+                        "## 2026-08-23",
+                        "",
+                        "### [[family/Nysha|Nysha]]",
+                        "- Observation: enjoys visual patterns and board games when they feel playful",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            context = _build_context("How should we use silly puzzles with Nysha?", n4os_root)
+
+        self.assertEqual(
+            context["observations"],
+            ["2026-08-23 Nysha: enjoys visual patterns and board games when they feel playful"],
+        )
+
+    def test_build_context_uses_related_terms_for_confidence_recall(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            observations = n4os_root / "family" / "observations"
+            observations.mkdir(parents=True)
+            (observations / "2026-08.md").write_text(
+                "\n".join(
+                    [
+                        "# Observations",
+                        "",
+                        "## 2026-08-23",
+                        "",
+                        "### [[family/Nysha|Nysha]]",
+                        "- Observation: speaks in a low voice around new adults",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            context = _build_context("How can Nysha build confidence with public speaking?", n4os_root)
+
+        self.assertEqual(
+            context["observations"],
+            ["2026-08-23 Nysha: speaks in a low voice around new adults"],
+        )
+
     def test_fallback_advice_uses_recent_trajectory_signals(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             n4os_root = Path(tmpdir) / "n4os"
@@ -391,6 +444,169 @@ class N4OSAdviceTest(unittest.TestCase):
             context = _build_context("what books is Nysha reading", n4os_root)
 
         self.assertEqual(context["reading_garden"], reading_garden)
+
+    def test_newsletter_question_loads_all_saved_nysha_newsletter_imports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            n4os_root = root / "n4os"
+            n4os_root.mkdir()
+            self._write_newsletter_import(
+                root / "data" / "n4os.db",
+                date="2026-08-14",
+                source_id="previous",
+                source_url="https://docs.google.com/presentation/d/previous/edit",
+                parsed={
+                    "books": [
+                        "Our Class is a Family",
+                        "Chrysanthemum by Kevin Henkes",
+                    ],
+                    "learning_context": ["Classroom community"],
+                },
+            )
+            self._write_newsletter_import(
+                root / "data" / "n4os.db",
+                date="2026-08-21",
+                source_id="current",
+                source_url="https://docs.google.com/presentation/d/current/edit",
+                parsed={
+                    "knowledge": {
+                        "resources": [
+                            {"kind": "book", "label": "Lilly's Purple Plastic Purse"},
+                            {"kind": "video", "label": "Zen Den"},
+                        ],
+                        "topics": ["Character and responsibility"],
+                    },
+                },
+            )
+
+            context = _build_context("what books were mentioned in Nysha imported newsletters?", n4os_root)
+
+        newsletters = context["school_newsletters"]
+        self.assertEqual([item["date"] for item in newsletters], ["2026-08-14", "2026-08-21"])
+        self.assertEqual(
+            newsletters[0]["books"],
+            ["Our Class is a Family", "Chrysanthemum by Kevin Henkes"],
+        )
+        self.assertEqual(newsletters[1]["books"], ["Lilly's Purple Plastic Purse"])
+
+    def test_book_lookup_fallback_answers_from_all_newsletter_imports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            n4os_root = root / "n4os"
+            n4os_root.mkdir()
+            self._write_newsletter_import(
+                root / "data" / "n4os.db",
+                date="2026-08-14",
+                source_id="previous",
+                source_url="https://docs.google.com/presentation/d/previous/edit",
+                parsed={"books": ["Our Class is a Family", "The Dot"]},
+            )
+            self._write_newsletter_import(
+                root / "data" / "n4os.db",
+                date="2026-08-21",
+                source_id="current",
+                source_url="https://docs.google.com/presentation/d/current/edit",
+                parsed={"knowledge": {"resources": [{"kind": "book", "label": "Penny and Her Marble"}]}},
+            )
+
+            reply = format_n4os_advice(
+                "/ask what books were mentioned in Nysha imported newsletters?",
+                n4os_root=n4os_root,
+                api_key="",
+            )
+
+        self.assertIn("2026-08-14:", reply)
+        self.assertIn("Our Class is a Family", reply)
+        self.assertIn("The Dot", reply)
+        self.assertIn("2026-08-21:", reply)
+        self.assertIn("Penny and Her Marble", reply)
+        self.assertIn("Used: School Newsletters", reply)
+
+    def test_school_newsletter_book_lookup_defaults_to_nysha_imports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            n4os_root = root / "n4os"
+            n4os_root.mkdir()
+            self._write_newsletter_import(
+                root / "data" / "n4os.db",
+                date="2026-08-14",
+                source_id="previous",
+                source_url="https://docs.google.com/presentation/d/previous/edit",
+                parsed={"books": ["Our Class is a Family"]},
+            )
+
+            reply = format_n4os_advice(
+                "/ask which books are covered in school newsletter",
+                n4os_root=n4os_root,
+                api_key="",
+            )
+
+        self.assertIn("Our Class is a Family", reply)
+        self.assertIn("2026-08-14:", reply)
+
+    def _write_newsletter_import(
+        self,
+        db_path: Path,
+        *,
+        date: str,
+        source_id: str,
+        source_url: str,
+        parsed: dict,
+    ) -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS school_newsletter_imports (
+                    id TEXT PRIMARY KEY,
+                    child TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    teacher TEXT,
+                    newsletter_date TEXT NOT NULL,
+                    content_fingerprint TEXT NOT NULL,
+                    parsed_json TEXT NOT NULL,
+                    saved_json TEXT,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(child, source_type, source_id, content_fingerprint)
+                )
+                """
+            )
+            payload = {"child": "Nysha", "title": "Room 13 Newsletter", "newsletter_date": date, **parsed}
+            connection.execute(
+                """
+                INSERT INTO school_newsletter_imports (
+                    id, child, source_type, source_id, source_url, title, teacher,
+                    newsletter_date, content_fingerprint, parsed_json, saved_json,
+                    status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    "Nysha",
+                    "google_slides",
+                    source_id,
+                    source_url,
+                    "Room 13 Newsletter",
+                    "Mrs. Thompson",
+                    date,
+                    source_id,
+                    json.dumps(payload, sort_keys=True),
+                    "{}",
+                    "saved",
+                    f"{date}T12:00:00",
+                    f"{date}T12:00:00",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def test_book_lookup_fallback_answers_from_reading_garden(self):
         reading_garden = {

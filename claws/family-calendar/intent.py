@@ -1268,7 +1268,7 @@ def _time_range_match(user_text: str) -> re.Match[str] | None:
         r"(?:\btime\s*:\s*)?\b(?P<start_hour>\d{1,2})(?:(?::|\.|．)(?P<start_minute>\d{2}))?\s*"
         r"(?P<start_meridiem>am|pm|a\.m\.|p\.m\.)?\s*(?:-|–|to)\s*"
         r"(?P<end_hour>\d{1,2})(?:(?::|\.|．)(?P<end_minute>\d{2}))?\s*"
-        r"(?P<end_meridiem>am|pm|a\.m\.|p\.m\.)?\b",
+        r"(?P<end_meridiem>am|pm|a\.m\.|p\.m\.)?(?=\W|$)",
         user_text,
         flags=re.IGNORECASE,
     )
@@ -1414,6 +1414,7 @@ def _extract_recurrence(
     user_text: str,
     reference: datetime,
 ) -> dict[str, Any] | None:
+    user_text, _ = _split_event_instruction_and_notes(user_text)
     lowered = user_text.lower()
     recurring_context = any(
         re.search(pattern, lowered)
@@ -1965,21 +1966,58 @@ def _extract_metadata(user_text: str) -> dict[str, Any]:
     )
 
 
+def _split_event_instruction_and_notes(value: str) -> tuple[str, str | None]:
+    parts = re.split(
+        r"^\s*(?:notes?|description)\s*[:,]|"
+        r"(?<=[\n.;!?])\s*(?:notes?|description)\s*[:,]",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
+    return parts[0], parts[1] if len(parts) == 2 else None
+
+
+def _recurring_meeting_title_from_text(user_text: str) -> str | None:
+    title_evidence, _ = _split_event_instruction_and_notes(user_text)
+    match = re.search(
+        r"\b(?:we\s+)?invite\s+you\s+to\s+join\s+(?:us\s+)?(?:for\s+)?(?:our\s+)?"
+        r"(?P<frequency>daily|weekly|monthly|annual|yearly)\s+"
+        r"(?P<subject>[A-Za-z0-9][A-Za-z0-9&'’.-]*(?:\s+[A-Za-z0-9][A-Za-z0-9&'’.-]*){0,4})\s+"
+        r"meetings?\b",
+        title_evidence,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    subject = _clean_spaces(match.group("subject"))
+    frequency = match.group("frequency").lower()
+    return f"{subject} {frequency} meeting"
+
+
+def _explicit_title_from_text(user_text: str) -> str | None:
+    title_evidence, _ = _split_event_instruction_and_notes(user_text)
+    match = re.search(
+        r"\btitle\s*(?::|,)?\s*(?P<title>[^\n]+?)"
+        r"(?=\s*,\s*(?:when|date|time|on|at|every|starting)\b|\s*$)",
+        title_evidence,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    title = _strip_event_display_annotations(match.group("title"))
+    title = _clean_spaces(title.strip(" ."))
+    return title[:1].upper() + title[1:] if title else None
+
+
 def _title_from_text(user_text: str, location: str | None, purpose: str | None) -> str | None:
+    user_text, _ = _split_event_instruction_and_notes(user_text)
     pickup = _extract_pickup_parts(user_text)
     if pickup is not None:
         return pickup["title"]
 
-    explicit_title = re.search(
-        r"\btitle\s*:?\s*(?P<title>.+?)\s*$",
-        user_text,
-        flags=re.IGNORECASE,
-    )
-    if explicit_title is not None:
-        title = _strip_event_display_annotations(explicit_title.group("title"))
-        title = _clean_spaces(title.strip(" ."))
-        if title:
-            return title[:1].upper() + title[1:]
+    explicit_title = _explicit_title_from_text(user_text)
+    if explicit_title:
+        return explicit_title
 
     lowered = user_text.lower()
     if location and "flight" in lowered and any(
@@ -1999,6 +2037,10 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
 
         return f"{location}: {purpose}"
 
+    recurring_meeting_title = _recurring_meeting_title_from_text(user_text)
+    if recurring_meeting_title:
+        return recurring_meeting_title
+
     title = _strip_create_words(user_text)
     title = re.sub(
         r"^\s*(?:i\s+had|there\s+is|this\s+is)\s+(?:a\s+)?"
@@ -2007,6 +2049,7 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
         title,
         flags=re.IGNORECASE,
     )
+    title = re.sub(r"^\s*(?:calendar\s+)?event\s*(?:for|to)?\s+", "", title, flags=re.IGNORECASE)
     title = re.sub(
         r"\bevery\s+(?:day|weekday|weekdays|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
         " ",
@@ -2022,7 +2065,14 @@ def _title_from_text(user_text: str, location: str | None, purpose: str | None) 
     title = re.sub(
         r"(?:\btime\s*:\s*)?\b\d{1,2}(?:(?::|\.|．)\d{2})?\s*"
         r"(?:am|pm|a\.m\.|p\.m\.)?\s*(?:-|–|to)\s*"
-        r"\d{1,2}(?:(?::|\.|．)\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?\b",
+        r"\d{1,2}(?:(?::|\.|．)\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?(?=\W|$)",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"\b(?:am|pm|a\.m\.|p\.m\.)\s*(?:-|–|to)\s*"
+        r"\d{1,2}(?:(?::|\.|．)\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?(?=\W|$)",
         " ",
         title,
         flags=re.IGNORECASE,
@@ -2387,22 +2437,24 @@ def _delete_intent(user_text: str, reference: datetime) -> dict[str, Any]:
 
 
 def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
+    raw_instruction, labeled_notes = _split_event_instruction_and_notes(user_text)
     event_text, assistant_metadata, assistant_description = _extract_assistant_help(
-        user_text,
+        raw_instruction,
     )
     event_text = _request_without_image_text(event_text)
-    intent_text, attendees, missing_guest_contacts = _extract_guest_instruction(event_text or user_text)
-    intent_text = intent_text or event_text or user_text
-    recurrence = _extract_recurrence(intent_text, reference)
-    date, date_text = _extract_date(intent_text, reference)
+    instruction_text = event_text or raw_instruction
+    intent_text, attendees, missing_guest_contacts = _extract_guest_instruction(instruction_text)
+    instruction_text = intent_text or instruction_text
+    recurrence = _extract_recurrence(instruction_text, reference)
+    date, date_text = _extract_date(instruction_text, reference)
     has_explicit_date = date is not None and (
-        date_text.lower() not in WEEKDAYS or _has_explicit_next_weekday(intent_text)
+        date_text.lower() not in WEEKDAYS or _has_explicit_next_weekday(instruction_text)
     )
     if recurrence is not None and not has_explicit_date:
         date = recurrence["start_date"]
-    start_time = _extract_time(intent_text) or _extract_standalone_time(
-        intent_text,
-        intent_text,
+    start_time = _extract_time(instruction_text) or _extract_standalone_time(
+        instruction_text,
+        instruction_text,
     )
     if recurrence is not None and not has_explicit_date:
         date = _advance_recurring_date_after_reference(
@@ -2411,24 +2463,25 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
             recurrence,
             reference,
         )
-    all_day = _is_all_day_request(intent_text)
+    all_day = _is_all_day_request(instruction_text)
     if all_day:
         start_time = None
-    location = _extract_location(intent_text)
-    purpose = _extract_purpose(intent_text)
-    with_description = _extract_with_description(intent_text)
-    flight_description = _extract_flight_description(intent_text, location)
-    pickup = _extract_pickup_parts(intent_text)
+    location = _extract_location(instruction_text)
+    purpose = _extract_purpose(instruction_text)
+    with_description = _extract_with_description(instruction_text)
+    flight_description = _extract_flight_description(instruction_text, location)
+    pickup = _extract_pickup_parts(instruction_text)
     if pickup is not None and pickup["source"]:
         location = location or pickup["source"]
-    metadata = _extract_metadata(intent_text)
+    metadata = _extract_metadata(instruction_text)
     metadata.update(assistant_metadata)
     metadata = _normalize_metadata(metadata)
-    target_calendar = _extract_target_calendar(intent_text)
+    target_calendar = _extract_target_calendar(instruction_text)
     preparation_notes = metadata["preparation_notes"]
     pickup_notes = pickup["notes"] if pickup is not None else None
     description = (
-        flight_description
+        _clean_spaces(labeled_notes or "")
+        or flight_description
         or purpose
         or with_description
         or pickup_notes
@@ -2436,13 +2489,13 @@ def _create_intent(user_text: str, reference: datetime) -> dict[str, Any]:
         or None
     )
     description = _append_assistant_description(description, assistant_description)
-    title = _title_from_text(intent_text, location, purpose)
-    duration_minutes = _extract_duration_minutes(intent_text)
+    title = _title_from_text(instruction_text, location, purpose)
+    duration_minutes = _extract_duration_minutes(instruction_text)
     duration_was_explicit = (
-        _extract_time_range_duration_minutes(intent_text) is not None
+        _extract_time_range_duration_minutes(instruction_text) is not None
         or re.search(
             r"\bfor\s+\d+\s*(?:minutes?|mins?|hours?|hrs?)\b",
-            intent_text,
+            instruction_text,
             flags=re.IGNORECASE,
         )
         is not None
@@ -2582,7 +2635,7 @@ def _primary_calendar_action_from_text(value: str, fallback: str) -> str:
     lowered = value.lower()
     if _primary_guest_update_from_text(value) is not None:
         return "add_guests"
-    if _has_primary_create_command(lowered) and fallback in {"list_events", "family_briefing"}:
+    if _has_primary_create_command(lowered):
         return "create_event"
     if re.search(r"\b(?:briefing|brief|summary)\b", lowered):
         return "family_briefing"
@@ -2654,6 +2707,7 @@ def _weekday_names_for_primary_parse() -> dict[str, int]:
 def _monthly_ordinal_recurrence_from_text(
     value: str,
 ) -> tuple[str, int, str, int, str] | None:
+    value, _ = _split_event_instruction_and_notes(value)
     ordinal_pattern = "|".join(
         re.escape(name)
         for name in sorted(ORDINAL_WEEKDAY_POSITIONS, key=len, reverse=True)
@@ -2664,17 +2718,21 @@ def _monthly_ordinal_recurrence_from_text(
         for name in sorted(weekday_names, key=len, reverse=True)
     )
     match = re.search(
-        rf"\bevery\s+(?P<ordinal>{ordinal_pattern})\s+(?P<weekday>{weekday_pattern})\b",
+        rf"(?:\bevery\s+(?P<ordinal>{ordinal_pattern})\s+(?P<weekday>{weekday_pattern})\b|"
+        rf"\b(?P<month_ordinal>{ordinal_pattern})\s+"
+        rf"(?P<month_weekday>{weekday_pattern})\s+(?:of\s+)?(?:every|each)\s+month\b)",
         value,
         flags=re.IGNORECASE,
     )
     if match is None:
         return None
 
-    weekday = weekday_names[match.group("weekday").lower()]
+    matched_weekday = match.group("weekday") or match.group("month_weekday")
+    matched_ordinal = match.group("ordinal") or match.group("month_ordinal")
+    weekday = weekday_names[matched_weekday.lower()]
     weekday_name = next(name for name, day in WEEKDAYS.items() if day == weekday)
     weekday_code = WEEKDAY_RRULE_CODES[weekday_name]
-    ordinal_text = match.group("ordinal").lower()
+    ordinal_text = matched_ordinal.lower()
     return (
         weekday_name,
         weekday,
@@ -2731,6 +2789,7 @@ def _has_explicit_next_weekday(value: str) -> bool:
 
 
 def _recurrence_from_primary_text(value: str) -> list[str]:
+    value, _ = _split_event_instruction_and_notes(value)
     lowered = value.lower()
     if "every" not in lowered:
         return []
@@ -2861,7 +2920,8 @@ def _repair_primary_ai_calendar_intent(
     request: str,
     reference: datetime,
 ) -> None:
-    body = _calendar_command_body(request)
+    full_body = _calendar_command_body(request)
+    body, labeled_notes = _split_event_instruction_and_notes(full_body)
     action = _primary_calendar_action_from_text(body, str(intent.get("intent") or "create_event"))
     intent["intent"] = action
 
@@ -2917,14 +2977,32 @@ def _repair_primary_ai_calendar_intent(
     current_description = _clean_spaces(str(intent.get("description") or ""))
     if current_description:
         intent["description"] = _strip_description_label(current_description)
+    elif labeled_notes:
+        intent["description"] = _clean_spaces(labeled_notes)
     else:
-        description = _description_from_primary_text(body)
+        description = _description_from_primary_text(full_body)
         if description:
             intent["description"] = description
 
     title = _primary_title_from_text(body)
     current_title = _clean_spaces(str(intent.get("title") or ""))
-    if title and (
+    explicit_title = _explicit_title_from_text(body)
+    recurring_meeting_title = _recurring_meeting_title_from_text(body)
+    if explicit_title:
+        intent["title"] = explicit_title
+        intent["missing_fields"] = [
+            field
+            for field in intent.get("missing_fields") or []
+            if str(field) not in {"event", "title"}
+        ]
+    elif recurring_meeting_title:
+        intent["title"] = recurring_meeting_title
+        intent["missing_fields"] = [
+            field
+            for field in intent.get("missing_fields") or []
+            if str(field) not in {"event", "title"}
+        ]
+    elif title and (
         not current_title
         or "event" in {str(field) for field in intent.get("missing_fields") or []}
         or _should_replace_primary_title(current_title, title)
@@ -2947,6 +3025,10 @@ def merge_ai_calendar_fields(
 ) -> dict[str, Any]:
     reference = _default_now(now)
     refined = dict(intent)
+    deterministic_title = refined.get("title")
+    deterministic_description = refined.get("description")
+    deterministic_recurrence = refined.get("recurrence")
+    deterministic_recurrence_label = refined.get("recurrence_label")
     slots = ai_fields.get("slots") if isinstance(ai_fields.get("slots"), dict) else {}
     current_action = str(refined.get("intent") or "create_event")
     action = str(ai_fields.get("action") or current_action)
@@ -3055,6 +3137,14 @@ def merge_ai_calendar_fields(
             _request_without_image_text(request),
             reference,
         )
+        _, notes = _split_event_instruction_and_notes(
+            _calendar_command_body(_request_without_image_text(request)),
+        )
+        if notes is not None:
+            refined["title"] = deterministic_title
+            refined["description"] = deterministic_description
+            refined["recurrence"] = deterministic_recurrence
+            refined["recurrence_label"] = deterministic_recurrence_label
 
     refined["ai_field_extraction"] = {
         "confidence": ai_fields.get("confidence"),
@@ -3080,18 +3170,22 @@ def extract_intent(user_text: str, now: datetime | None = None) -> dict[str, Any
     reference = _default_now(now)
     intent_text, _, _ = _extract_assistant_help(user_text)
     routing_text = intent_text or user_text
-    guest_only = _guest_only_intent(routing_text)
+    routing_instruction, _ = _split_event_instruction_and_notes(routing_text)
+    command_body = _calendar_command_body(routing_instruction)
+    guest_only = _guest_only_intent(routing_instruction)
     if guest_only is not None:
         return guest_only
-    if _is_update_request(routing_text):
-        return _update_intent(routing_text, reference)
-    if _is_delete_request(routing_text):
-        return _delete_intent(routing_text, reference)
-    if _is_preparation_request(routing_text):
-        return _preparation_intent(routing_text, reference)
-    if _is_briefing_request(routing_text):
-        return _briefing_intent(routing_text, reference)
-    if _is_list_request(routing_text):
-        return _list_intent(routing_text, reference)
+    if _is_update_request(routing_instruction):
+        return _update_intent(routing_instruction, reference)
+    if _is_delete_request(routing_instruction):
+        return _delete_intent(routing_instruction, reference)
+    if _has_primary_create_command(command_body):
+        return _create_intent(user_text, reference)
+    if _is_preparation_request(routing_instruction):
+        return _preparation_intent(routing_instruction, reference)
+    if _is_briefing_request(routing_instruction):
+        return _briefing_intent(routing_instruction, reference)
+    if _is_list_request(routing_instruction):
+        return _list_intent(routing_instruction, reference)
 
     return _create_intent(user_text, reference)

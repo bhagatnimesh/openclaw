@@ -25,7 +25,7 @@ These slash aliases route directly into a domain claw.
 | Domain | Slash aliases | Supported actions |
 | --- | --- | --- |
 | Capture | `/capture`, `/note`, `/mem`, `/mem-inbox` | Capture family observations, journal notes, and Markdown learning notes. |
-| Calendar | `/calendar`, `/calender`, `/calnedar`, `/event`, `/schedule` | Create, list, move/update, delete/cancel events, add guests, family briefings, preparation checklists. |
+| Calendar | `/calendar`, `/calender`, `/calnedar`, `/event`, `/schedule` | Create, list, move/update, delete/cancel events, add guests, family briefings, preparation checklists, and Nysha timetable photo updates. |
 | Tasks | `/task`, `/tasks`, `/todo`, `/todos` | Create, recommend/list, update, complete, delete tasks, run Noah assistant help. |
 | Shopping | `/cart`, `/shop`, `/shopping` | List lists/items, add, check off, uncheck, delete, move, or clear shopping items. |
 | Home Board | `/home`, `/homeboard`, `/home-board` | Add/list home board items, bulk add items, mark items done. |
@@ -63,8 +63,9 @@ These slash aliases route directly into a domain claw.
 | `/note learning <text>` | Save a longer learning note. |
 | `/note inbox <text>` | Save a Markdown inbox note. |
 | `/remember <fact>` | Store a structured memory fact. |
-| `/remember recent`, `/remember last 7 days` | Inspect recent structured memory. |
+| `/remember recent`, `/remember last 7 days`, `/remember last 6 months` | Inspect structured memory from a recent or custom window. |
 | `What do you remember about <topic>?` | Query structured memory. |
+| `find memory everywhere <topic>` | Search structured memory plus selected N4OS family, journal, trajectory, playbook, and top-level memory files. |
 | `update remembered note <topic> to <value>` | Update a structured memory item. |
 | `forget remembered note <topic>` | Delete a structured memory item. |
 | `fix last capture: <correction>` | Correct the most recent single saved capture. |
@@ -86,7 +87,7 @@ These are supported without slash commands when the intent is clear.
 
 | Domain | Examples |
 | --- | --- |
-| Calendar | `add event dentist tomorrow at 4 PM`, `move dinner to Saturday`, `show tomorrow's calendar`, `give me today's briefing` |
+| Calendar | `add event dentist tomorrow at 4 PM`, `move dinner to Saturday`, `show tomorrow's calendar`, `give me today's briefing`, `Update Nysha school calendar from this image` |
 | Tasks | `add task call FUSD tomorrow morning`, `complete task call FUSD`, `delete task call FUSD`, `show urgent tasks due this week` |
 | Homework | `homework status`, send a homework photo with a homework caption, `cancel` for pending duplicate prompts |
 | Shopping | `add milk to Costco`, `Indian grocery done`, `what's on my Whole Foods list?` |
@@ -107,6 +108,12 @@ and treats OCR or transcription as imperfect evidence.
   Google Tasks list. Names must match one available destination uniquely.
 - Recurring calendar phrases such as `every Thursday` become Google Calendar
   recurrence rules. Multiple explicit dates are previewed as one batch.
+- To update Nysha's weekly school schedule, send a clear timetable photo with
+  the caption `Update Nysha school calendar from this image.` N4OS previews the
+  parsed additions, changes, and removals before writing them. Reply `yes` to
+  apply, `cancel` to discard, or send a correction for an unclear row.
+- Unclear or clipped timetable rows require correction rather than a guess.
+  Unrelated calendar events are preserved.
 - Clear, single typed creates may be saved immediately. Voice, photo, bulk,
   destructive, or otherwise uncertain writes show a preview or confirmation
   first. Reply `yes`, `no`, or give a correction such as `Monday instead`.

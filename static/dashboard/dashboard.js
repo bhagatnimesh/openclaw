@@ -2063,6 +2063,28 @@
     }
 
     var childNode = byId("homework-child-groups");
+    var learning = data.learning || {};
+    setText(
+      "learning-observation-count",
+      Number(learning.observation_count || 0) + " observations",
+    );
+    var learningNode = byId("learning-recent-items");
+    if (learningNode) {
+      var records = learning.recent || [];
+      learningNode.innerHTML = records.length
+        ? records.map(function (item) {
+            return '<div class="homework-item is-pending"><div class="homework-item-main"><strong>' +
+              escapeHtml(item.title || "Learning record") +
+              '</strong><div class="pending-task-badges">' +
+              taskBadge(item.child, "green") +
+              taskBadge(item.record_type || "homework", "") +
+              taskBadge(item.class_name || "Unsorted", "") +
+              '</div>' +
+              (item.parent_notes ? '<p>' + escapeHtml(item.parent_notes) + '</p>' : '') +
+              '</div></div>';
+          }).join("")
+        : empty("No learning records captured yet.");
+    }
     if (!childNode) return;
     childNode.innerHTML = children
       .map(function (child) {

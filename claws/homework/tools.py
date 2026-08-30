@@ -118,6 +118,15 @@ class HomeworkProvider(Protocol):
     def list_events(self, homework_item_id: str) -> list[dict[str, Any]]:
         ...
 
+    def append_parent_note(self, **kwargs: Any) -> dict[str, Any] | None:
+        ...
+
+    def replace_learning_observations(self, **kwargs: Any) -> None:
+        ...
+
+    def list_learning_observations(self, homework_item_id: str | None = None, **kwargs: Any) -> list[dict[str, Any]]:
+        ...
+
 
 class CalendarToolsLike(Protocol):
     def create_calendar_event(
@@ -219,7 +228,33 @@ def build_homework_metadata(intent: dict[str, Any], *, content_fingerprint: str 
         ),
         "materials_required": _materials_required(visible_text),
         "analysis_notes": _analysis_notes(intent, expected_minutes),
+        "record_type": str(intent.get("record_type") or "homework"),
     }
+
+
+def learning_observations(intent: dict[str, Any], metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep immediate insights small and tied to visible work or a parent note."""
+    evidence = []
+    if intent.get("ocr_text"):
+        evidence.append("worksheet text")
+    if intent.get("notes"):
+        evidence.append("parent caption")
+    observations = []
+    for tag in metadata.get("skill_tags") or []:
+        observations.append({
+            "category": "skill_practice",
+            "statement": f"This record practices {str(tag).replace('_', ' ')}.",
+            "evidence": evidence,
+            "confidence": 0.8,
+        })
+    if metadata.get("task_type"):
+        observations.append({
+            "category": "task_type",
+            "statement": f"The work includes {metadata['task_type']} questions.",
+            "evidence": evidence,
+            "confidence": 0.8,
+        })
+    return observations[:3]
 
 
 def _metadata_from_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -872,6 +907,7 @@ class HomeworkTools:
         photo_sha256: str | None = None,
         skip_duplicate_check: bool = False,
         metadata_overrides: dict[str, Any] | None = None,
+        photo_assets: list[dict[str, Any]] | None = None,
     ) -> ToolResponse:
         try:
             intent = self._extract_intent_from_request(request, now=now, source=source, photo_path=photo_path)
@@ -978,6 +1014,15 @@ class HomeworkTools:
                 photo_path=photo_path,
                 ocr_text=_clean_optional_text(intent.get("ocr_text")),
                 photo_sha256=photo_sha256,
+                record_type=str(intent.get("record_type") or "homework"),
+                class_name=_clean_optional_text(intent.get("class_name")) or _clean_optional_text(intent.get("subject")),
+                lesson_identifier=_clean_optional_text(intent.get("lesson_identifier")),
+                parent_notes=_clean_optional_text(intent.get("notes")),
+                photo_assets=photo_assets,
+            )
+            self.provider.replace_learning_observations(
+                homework_item_id=str(item["id"]),
+                observations=learning_observations(intent, metadata),
             )
             _write_markdown(self.provider, child=str(item["child"]), homework_root=self.homework_root)
             if not _clean_optional_text(item.get("due_date")):
@@ -999,7 +1044,8 @@ class HomeworkTools:
                 "message": f"Homework storage failed: {error}",
                 "data": {"error_type": error.__class__.__name__},
             }
-        message = f"Captured homework for {item['child']}: {_title_line(item)}."
+        label = "lesson" if item.get("record_type") == "lesson" else "homework"
+        message = f"Captured {label} for {item['child']}: {_title_line(item)}."
         if calendar_result is not None:
             if calendar_result.get("status") == "ok":
                 message += " Added due-date reminder to the school calendar."
@@ -1010,6 +1056,35 @@ class HomeworkTools:
             "message": message,
             "data": {"item": item, "calendar": calendar_result},
         }
+
+    def add_parent_note(self, homework_item_id: str, note: str) -> ToolResponse:
+        item = self.provider.append_parent_note(homework_item_id=homework_item_id, note=note)
+        if item is None:
+            return {"status": "error", "message": "I could not add that parent note.", "data": {}}
+        metadata = _metadata_from_item(item)
+        intent = {"notes": note, "ocr_text": "", "record_type": item.get("record_type")}
+        self.provider.replace_learning_observations(
+            homework_item_id=str(item["id"]), observations=learning_observations(intent, metadata)
+        )
+        _write_markdown(self.provider, child=str(item["child"]), homework_root=self.homework_root)
+        return {"status": "ok", "message": "Added that parent note to the learning record.", "data": {"item": item}}
+
+    def learning_review(self, *, child: str = DEFAULT_CHILD, subject: str | None = None) -> ToolResponse:
+        items = self.provider.list_items(child=child, limit=100)
+        if subject:
+            items = [item for item in items if str(item.get("subject") or "").lower() == subject.lower()]
+        observations = self.provider.list_learning_observations(child=child)
+        active = [item for item in observations if item.get("status") == "active"]
+        if not items:
+            return {"status": "ok", "message": f"No learning records found for {child}.", "data": {"items": [], "observations": []}}
+        topics = sorted({str(item.get("category")) for item in active})
+        message = f"Learning review for {child}: {len(items)} records"
+        if subject:
+            message += f" in {subject}"
+        if topics:
+            message += ". Evidence so far: " + ", ".join(topics) + "."
+        message += " Ask for coaching ideas or sample questions when you want a focused next step."
+        return {"status": "ok", "message": message, "data": {"items": items, "observations": active}}
 
     def capture_submission(
         self,

@@ -3,7 +3,8 @@ from __future__ import annotations
 from calendar import monthrange
 from dataclasses import dataclass, field
 from copy import deepcopy
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone as datetime_timezone
+import logging
 import re
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -18,6 +19,7 @@ from intent import (
     _parse_image_schedule_rows,
     _request_without_image_text,
     _select_image_schedule_rows,
+    _split_event_instruction_and_notes,
     _advance_recurring_date_after_reference,
     _strip_calendar_target_phrase,
     extract_intent,
@@ -54,6 +56,15 @@ RRULE_WEEKDAY_LABELS = {
     "SA": "Saturday",
     "SU": "Sunday",
 }
+SCHEDULE_WEEKDAYS = {
+    "monday": (0, "MO"),
+    "tuesday": (1, "TU"),
+    "wednesday": (2, "WE"),
+    "thursday": (3, "TH"),
+    "friday": (4, "FR"),
+}
+NYSHA_SCHEDULE_ID = "nysha_weekly_school_schedule"
+SCHEDULE_CONFIDENCE_THRESHOLD = 0.8
 
 BUSY_DAY_EVENT_COUNT = 3
 MAX_BRIEFING_CLARIFICATIONS = 5
@@ -105,6 +116,160 @@ IMAGE_BULK_DATE_CUE_RE = re.compile(
     r"(?:image|photo|picture|screenshot))\b",
     re.IGNORECASE,
 )
+logger = logging.getLogger(__name__)
+
+
+def _normalize_schedule_time(value: Any) -> str | None:
+    text = str(value or "").strip().lower().replace(".", ":")
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if match is None:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "00")
+    meridiem = match.group(3)
+    if minute > 59:
+        return None
+    if meridiem:
+        if hour < 1 or hour > 12:
+            return None
+        hour = hour % 12 + (12 if meridiem == "pm" else 0)
+    elif hour > 23:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _normalize_weekly_schedule_rows(extraction: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = extraction.get("rows")
+    if not isinstance(rows, list):
+        return []
+    normalized = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        weekday = str(raw.get("weekday") or "").strip().lower()
+        weekday = next((name for name in SCHEDULE_WEEKDAYS if weekday.startswith(name[:3])), "")
+        start_time = _normalize_schedule_time(raw.get("start_time"))
+        end_time = _normalize_schedule_time(raw.get("end_time"))
+        title = " ".join(str(raw.get("title") or "").split())
+        try:
+            confidence = max(0.0, min(float(raw.get("confidence", 0)), 1.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if not weekday or not start_time or not end_time or not title:
+            continue
+        if start_time >= end_time:
+            continue
+        normalized.append(
+            {
+                "weekday": weekday,
+                "start_time": start_time,
+                "end_time": end_time,
+                "title": title,
+                "confidence": round(confidence, 2),
+            }
+        )
+    return sorted(normalized, key=lambda row: (SCHEDULE_WEEKDAYS[row["weekday"]][0], row["start_time"]))
+
+
+def _school_year_bounds(value: Any, reference_time: datetime | None) -> tuple[date, date]:
+    text = str(value or "")
+    match = re.search(r"(20\d{2})\s*[-/]\s*(\d{2,4})", text)
+    if match:
+        start_year = int(match.group(1))
+        end_year = int(match.group(2))
+        if end_year < 100:
+            end_year += (start_year // 100) * 100
+        return date(start_year, 8, 1), date(end_year, 6, 30)
+    reference = reference_time or datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+    year = reference.year if reference.month >= 8 else reference.year - 1
+    return date(year, 8, 1), date(year + 1, 6, 30)
+
+
+def _match_schedule_event(
+    events: list[dict[str, Any]],
+    item: dict[str, Any],
+    used_ids: set[str],
+) -> dict[str, Any] | None:
+    candidates = [
+        event
+        for event in events
+        if event.get("id") not in used_ids
+        and read_metadata_from_event(event)[1].get("schedule_id") == NYSHA_SCHEDULE_ID
+    ]
+    exact = [event for event in candidates if read_metadata_from_event(event)[1].get("schedule_key") == item["schedule_key"]]
+    if exact:
+        return exact[0]
+    identity_matches = [
+        event
+        for event in candidates
+        if read_metadata_from_event(event)[1].get("schedule_identity") == item["schedule_identity"]
+    ]
+    if identity_matches:
+        return identity_matches[0]
+    title_matches = []
+    for event in candidates:
+        start = _parse_event_time(event.get("start", {}).get("dateTime"))
+        if start is None or start.weekday() != SCHEDULE_WEEKDAYS[item["weekday"]][0]:
+            continue
+        if _normalize_match_text(event.get("summary")) == _normalize_match_text(item["title"]):
+            title_matches.append(event)
+    if len(title_matches) == 1:
+        return title_matches[0]
+    return None
+
+
+def _schedule_event_differs(event: dict[str, Any], item: dict[str, Any]) -> bool:
+    start = event.get("start", {}).get("dateTime")
+    end = event.get("end", {}).get("dateTime")
+    metadata = read_metadata_from_event(event)[1]
+    return (
+        event.get("summary") != item["title"]
+        or not start
+        or not end
+        or _parse_event_time(start).strftime("%H:%M") != item["start_time"]
+        or _parse_event_time(end).strftime("%H:%M") != item["end_time"]
+        or metadata.get("schedule_id") != NYSHA_SCHEDULE_ID
+        or metadata.get("schedule_key") != item["schedule_key"]
+        or event.get("recurrence") != item["recurrence"]
+    )
+
+
+def _existing_schedule_times(
+    event: dict[str, Any],
+    item: dict[str, Any],
+) -> tuple[str, str]:
+    original_start = _parse_event_time(event.get("start", {}).get("dateTime"))
+    if original_start is None:
+        return item["start"], item["end"]
+    timezone = ZoneInfo(DEFAULT_TIMEZONE)
+    original_date = original_start.astimezone(timezone).date()
+    start = datetime.fromisoformat(f"{original_date.isoformat()}T{item['start_time']}").replace(
+        tzinfo=timezone,
+    )
+    end = datetime.fromisoformat(f"{original_date.isoformat()}T{item['end_time']}").replace(
+        tzinfo=timezone,
+    )
+    return start.isoformat(), end.isoformat()
+
+
+def _format_weekly_schedule_preview(payload: dict[str, Any]) -> str:
+    changes = payload.get("changes", [])
+    removals = payload.get("removals", [])
+    lines = [
+        f"I found Nysha's weekly schedule for {payload['school_year']}.",
+        f"Changes: {len(changes)}; obsolete managed events to remove: {len(removals)}.",
+    ]
+    for change in changes[:20]:
+        item = change["item"]
+        action = "Add" if change["action"] == "add" else "Change"
+        lines.append(
+            f"{action}: {item['weekday'].title()} {item['start_time']}–{item['end_time']} {item['title']}"
+        )
+    if removals:
+        for event in removals[:10]:
+            lines.append(f"Remove: {event.get('summary', 'Untitled event')}")
+    lines.append("Reply yes to apply, cancel to discard, or send a correction.")
+    return "\n".join(lines)
 
 
 def _parse_event_time(value: str | None) -> datetime | None:
@@ -841,12 +1006,12 @@ def _format_inferred_schedule_confirmation(intent: dict[str, Any]) -> str:
     recurrence_label = intent.get("recurrence_label")
     recurrence_part = f" {recurrence_label}" if recurrence_label else ""
     if intent.get("all_day"):
-        return f"I found {title}{recurrence_part} starting {date_label} all day. Add it?"
+        return f"I drafted {title}{recurrence_part} starting {date_label} all day. Add it?"
 
     start_time = datetime.fromisoformat(f"{intent['date']}T{intent['start_time']}:00")
     start_time = start_time.replace(tzinfo=ZoneInfo(timezone))
     time_label = start_time.strftime("%-I:%M %p")
-    return f"I found {title}{recurrence_part} starting {date_label} at {time_label}. Add it?"
+    return f"I drafted {title}{recurrence_part} starting {date_label} at {time_label}. Add it?"
 
 
 def _merge_create_intent(
@@ -1356,8 +1521,8 @@ def _format_inferred_bulk_schedule_confirmation(intent: dict[str, Any]) -> str:
             end = start + timedelta(minutes=int(first.get("duration_minutes") or 60))
             time_label = f"{start.strftime('%-I:%M %p')}–{end.strftime('%-I:%M %p')}"
     if len(dates) == 1:
-        return f"I found 1 date for {title}, {date_label}, {time_label}. Add this event?"
-    return f"I found {len(dates)} dates for {title}, {date_label}, {time_label}. Add all {len(dates)} events?"
+        return f"I drafted 1 date for {title}, {date_label}, {time_label}. Add this event?"
+    return f"I drafted {len(dates)} dates for {title}, {date_label}, {time_label}. Add all {len(dates)} events?"
 
 
 def _extract_preparation_followup(request: str) -> str | None:
@@ -1744,6 +1909,218 @@ class FamilyCalendarClaw:
             "undo_calendar_action": self.undo_last_action,
         }
 
+    def preview_weekly_schedule_sync(
+        self,
+        extraction: dict[str, Any],
+        reference_time: datetime | None = None,
+        calendar_name: str = "Nysha school calendar",
+    ) -> str:
+        rows = _normalize_weekly_schedule_rows(extraction)
+        if not rows:
+            return "I could not find any complete weekly schedule rows in that image."
+        if extraction.get("complete") is not True:
+            return "I need a clear, complete Monday-Friday timetable before updating the calendar."
+        missing_weekdays = sorted(set(SCHEDULE_WEEKDAYS) - {row["weekday"] for row in rows})
+        if missing_weekdays:
+            labels = ", ".join(day.title() for day in missing_weekdays)
+            return f"I need the full Monday-Friday timetable before updating the calendar. Missing: {labels}."
+        uncertain = [row for row in rows if row["confidence"] < SCHEDULE_CONFIDENCE_THRESHOLD]
+        if uncertain:
+            labels = ", ".join(f"{row['weekday'].title()} {row['title']}" for row in uncertain[:3])
+            return f"I could not read these schedule rows confidently: {labels}. Please send a clearer image or correction."
+
+        payload = self._build_weekly_schedule_sync_payload(
+            rows,
+            extraction.get("school_year"),
+            reference_time,
+            calendar_name,
+        )
+        self.pending_action = PendingAction(action="confirm_schedule_sync", payload=payload)
+        message = _format_weekly_schedule_preview(payload)
+        print(message)
+        return message
+
+    def _build_weekly_schedule_sync_payload(
+        self,
+        rows: list[dict[str, Any]],
+        school_year: Any,
+        reference_time: datetime | None,
+        calendar_name: str,
+    ) -> dict[str, Any]:
+        start_date, end_date = _school_year_bounds(school_year, reference_time)
+        reference = reference_time or datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        effective_start = max(start_date, reference.date())
+        timezone = DEFAULT_TIMEZONE
+        desired = []
+        weekday_positions: dict[str, int] = {}
+        for row in rows:
+            weekday, weekday_code = SCHEDULE_WEEKDAYS[row["weekday"]]
+            row_position = weekday_positions.get(row["weekday"], 0)
+            weekday_positions[row["weekday"]] = row_position + 1
+            first_date = effective_start + timedelta(days=(weekday - effective_start.weekday()) % 7)
+            start = datetime.fromisoformat(f"{first_date.isoformat()}T{row['start_time']}").replace(
+                tzinfo=ZoneInfo(timezone),
+            )
+            end = datetime.fromisoformat(f"{first_date.isoformat()}T{row['end_time']}").replace(
+                tzinfo=ZoneInfo(timezone),
+            )
+            until = datetime.combine(end_date, datetime.max.time(), tzinfo=ZoneInfo(timezone)).astimezone(
+                datetime_timezone.utc,
+            )
+            desired.append(
+                {
+                    **row,
+                    "weekday_code": weekday_code,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "recurrence": [
+                        f"RRULE:FREQ=WEEKLY;UNTIL={until.strftime('%Y%m%dT%H%M%SZ')};BYDAY={weekday_code}"
+                    ],
+                    "schedule_key": f"{row['weekday']}:{row['start_time']}:{row['end_time']}",
+                    "schedule_identity": f"{row['weekday']}:{row_position}",
+                    "metadata": {
+                        "schedule_id": NYSHA_SCHEDULE_ID,
+                        "schedule_key": f"{row['weekday']}:{row['start_time']}:{row['end_time']}",
+                        "schedule_identity": f"{row['weekday']}:{row_position}",
+                        "person": "Nysha",
+                        "category": "school",
+                    },
+                }
+            )
+
+        existing = self._list_weekly_schedule_events(start_date, end_date, calendar_name)
+        used_ids: set[str] = set()
+        changes = []
+        for item in desired:
+            match = _match_schedule_event(existing, item, used_ids)
+            if match is None:
+                changes.append({"action": "add", "item": item})
+                continue
+            used_ids.add(str(match.get("id")))
+            if _schedule_event_differs(match, item):
+                changes.append({"action": "update", "event": match, "item": item})
+
+        removals = [
+            event
+            for event in existing
+            if event.get("id") not in used_ids
+            and read_metadata_from_event(event)[1].get("schedule_id") == NYSHA_SCHEDULE_ID
+        ]
+        payload = {
+            "calendar_name": calendar_name,
+            "school_year": str(school_year or start_date.year),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "desired": desired,
+            "changes": changes,
+            "removals": removals,
+        }
+        return payload
+
+    def _list_weekly_schedule_events(
+        self,
+        start_date: date,
+        end_date: date,
+        calendar_name: str,
+    ) -> list[dict[str, Any]]:
+        window_start = datetime.combine(start_date, datetime.min.time(), tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        window_end = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        response = self.tools.list_calendar_events(
+            time_min=window_start.isoformat(),
+            time_max=window_end.isoformat(),
+            max_results=2500,
+            calendar_name=calendar_name,
+            writable=True,
+        )
+        if response["status"] != "ok":
+            raise RuntimeError(response["message"])
+        events = response.get("data", {}).get("events", [])
+        masters: dict[str, dict[str, Any]] = {}
+        for event in events:
+            event_id = event.get("recurringEventId") or event.get("id")
+            if not event_id or event_id in masters:
+                continue
+            if event.get("recurringEventId"):
+                master_response = self.tools.get_calendar_event(
+                    event_id,
+                    calendar_id=event.get("calendarId"),
+                )
+                if master_response["status"] == "ok":
+                    event = master_response.get("data", {}).get("event", event)
+            masters[str(event_id)] = event
+        return list(masters.values())
+
+    def apply_weekly_schedule_sync(self, payload: dict[str, Any]) -> str:
+        changed = 0
+        undo_entry = {
+            "action": "restore_schedule_sync",
+            "created": [],
+            "updated": [
+                deepcopy(change["event"])
+                for change in payload.get("changes", [])
+                if change["action"] == "update"
+            ],
+            "deleted": [],
+        }
+        for change in payload.get("changes", []):
+            item = change["item"]
+            if change["action"] == "add":
+                metadata = write_metadata_to_private_extended_properties(item["metadata"])
+                response = self.tools.create_calendar_event(
+                    title=item["title"],
+                    start_time=item["start"],
+                    end_time=item["end"],
+                    timezone=DEFAULT_TIMEZONE,
+                    recurrence=item["recurrence"],
+                    calendar_name=payload["calendar_name"],
+                    private_extended_properties=metadata,
+                )
+            else:
+                event = change["event"]
+                _, existing_metadata = read_metadata_from_event(event)
+                metadata = write_metadata_to_private_extended_properties(
+                    {**existing_metadata, **item["metadata"]},
+                )
+                start_time, end_time = _existing_schedule_times(event, item)
+                response = self.tools.update_calendar_event(
+                    event_id=event["id"],
+                    title=item["title"],
+                    start_time=start_time,
+                    end_time=end_time,
+                    timezone=DEFAULT_TIMEZONE,
+                    recurrence=item["recurrence"],
+                    description=write_human_description(event.get("description")),
+                    location=event.get("location"),
+                    attendees=_event_attendees(event),
+                    calendar_id=event.get("calendarId"),
+                    private_extended_properties=metadata,
+                )
+            if response["status"] != "ok":
+                rollback = self._restore_schedule_sync(undo_entry)
+                return f"{response['message']} The partial schedule update was rolled back. {rollback}"
+            if change["action"] == "add":
+                created_event = response.get("data", {}).get("event")
+                if created_event:
+                    undo_entry["created"].append(created_event)
+            changed += 1
+
+        removed = 0
+        for event in payload.get("removals", []):
+            response = self.tools.delete_calendar_event(
+                event["id"],
+                calendar_id=event.get("calendarId"),
+            )
+            if response["status"] != "ok":
+                rollback = self._restore_schedule_sync(undo_entry)
+                return f"{response['message']} The partial schedule update was rolled back. {rollback}"
+            undo_entry["deleted"].append(deepcopy(event))
+            removed += 1
+
+        self.undo_stack.append(undo_entry)
+        return f"Updated Nysha's school schedule: {changed} event(s) added or changed, {removed} obsolete event(s) removed."
+
     def _should_extract_ai_fields(
         self,
         request: str,
@@ -1771,18 +2148,26 @@ class FamilyCalendarClaw:
             return intent
 
         try:
+            ai_request, labeled_notes = _split_event_instruction_and_notes(request)
+            baseline_intent = _intent_context_for_ai(intent)
+            if labeled_notes is not None:
+                baseline_intent.pop("description", None)
             extraction_context = {
                 "last_created_event": _event_context_for_ai(self.last_created_event),
             }
             if semantic_image_path:
                 extraction_context["semantic_image_path"] = semantic_image_path
             ai_fields = self.field_extractor.extract(
-                request,
+                ai_request,
                 now=reference_time,
-                baseline_intent=_intent_context_for_ai(intent),
+                baseline_intent=baseline_intent,
                 context=extraction_context,
             )
         except Exception:
+            logger.warning(
+                "Calendar AI field extraction failed; using deterministic calendar parsing.",
+                exc_info=True,
+            )
             return intent
         return merge_ai_calendar_fields(
             intent,
@@ -2786,6 +3171,11 @@ class FamilyCalendarClaw:
             print(message)
             return message
 
+        if action == "restore_schedule_sync":
+            message = self._restore_schedule_sync(undo)
+            print(message)
+            return message
+
         message = "I do not know how to undo that Family Calendar action."
         print(message)
         return message
@@ -2809,6 +3199,7 @@ class FamilyCalendarClaw:
             timezone=start.get("timeZone") or DEFAULT_TIMEZONE,
             description=write_human_description(event.get("description")),
             location=event.get("location"),
+            recurrence=event.get("recurrence"),
             attendees=_event_attendees(event),
             calendar_id=_event_calendar_id(event),
             private_extended_properties=_private_extended_properties_for_event(event),
@@ -2837,6 +3228,24 @@ class FamilyCalendarClaw:
             private_extended_properties=_private_extended_properties_for_event(event),
         )
 
+    def _restore_schedule_sync(self, undo_entry: dict[str, Any]) -> str:
+        for event in undo_entry.get("created", []):
+            response = self.tools.delete_calendar_event(
+                event.get("id"),
+                calendar_id=_event_calendar_id(event),
+            )
+            if response["status"] != "ok":
+                return response["message"]
+        for event in undo_entry.get("updated", []):
+            response = self._restore_calendar_event(event)
+            if response["status"] != "ok":
+                return response["message"]
+        for event in undo_entry.get("deleted", []):
+            response = self._recreate_calendar_event(event)
+            if response["status"] != "ok":
+                return response["message"]
+        return "Undid Nysha's school schedule update."
+
     def handle_pending_response(
         self,
         response: str,
@@ -2851,9 +3260,18 @@ class FamilyCalendarClaw:
 
         pending = self.pending_action
         if negative:
-            if pending.action in {"create", "confirm_create", "create_bulk", "confirm_create_bulk"}:
+            if pending.action in {
+                "create",
+                "confirm_create",
+                "create_bulk",
+                "confirm_create_bulk",
+                "confirm_schedule_sync",
+            }:
                 self.pending_action = None
-                print("Okay, I did not create anything.")
+                if pending.action == "confirm_schedule_sync":
+                    print("Okay, I did not change the school schedule.")
+                else:
+                    print("Okay, I did not create anything.")
                 return True
             self.pending_action = None
             print("Okay, I did not delete anything.")
@@ -3021,6 +3439,59 @@ class FamilyCalendarClaw:
                 print(_format_inferred_bulk_schedule_confirmation(merged))
                 return True
             print("Please reply yes to add all events, or no to cancel.")
+            return True
+
+        if pending.action == "confirm_schedule_sync":
+            if affirmative:
+                self.pending_action = None
+                message = self.apply_weekly_schedule_sync(pending.payload or {})
+                print(message)
+                return True
+
+            match = re.search(
+                r"\b(?P<weekday>monday|tuesday|wednesday|thursday|friday)\b\s*"
+                r"(?P<title>.*?)\s*"
+                r"\b(?:ends?|end)\s+at\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+                correction_response,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                weekday = match.group("weekday").lower()
+                end_time = _normalize_schedule_time(match.group("time"))
+                title_hint = _normalize_match_text(match.group("title"))
+                desired = (pending.payload or {}).get("desired", [])
+                matching_rows = [
+                    item
+                    for item in desired
+                    if item["weekday"] == weekday
+                    and (not title_hint or title_hint in _normalize_match_text(item["title"]))
+                ]
+                if end_time and len(matching_rows) == 1:
+                    target = matching_rows[0]
+                    rows = [
+                        {
+                            "weekday": item["weekday"],
+                            "start_time": item["start_time"],
+                            "end_time": end_time if item is target else item["end_time"],
+                            "title": item["title"],
+                            "confidence": item.get("confidence", 1.0),
+                        }
+                        for item in desired
+                    ]
+                    rows = _normalize_weekly_schedule_rows({"rows": rows})
+                else:
+                    rows = []
+                if rows:
+                    payload = self._build_weekly_schedule_sync_payload(
+                        rows,
+                        (pending.payload or {}).get("school_year"),
+                        reference_time,
+                        (pending.payload or {}).get("calendar_name", "Nysha school calendar"),
+                    )
+                    self.pending_action = PendingAction(action="confirm_schedule_sync", payload=payload)
+                    print(_format_weekly_schedule_preview(payload))
+                    return True
+            print("Please name one schedule row in the correction, such as Wednesday homework ends at 4:30 PM.")
             return True
 
         if pending.action == "create_bulk":

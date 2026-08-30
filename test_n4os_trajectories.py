@@ -74,6 +74,27 @@ class N4OSTrajectoriesTest(unittest.TestCase):
         self.assertEqual(len(summaries), 1)
         self.assertIn("school transition", summaries[0])
 
+    def test_reads_related_summaries_without_exact_word_overlap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            record_n4os_trajectory(
+                mode="ask",
+                user_text="Nysha logic ideas",
+                assistant_text="Use visual patterns and games.",
+                context_labels=[],
+                summary="Nysha engages with visual patterns and game-like logic practice.",
+                n4os_root=n4os_root,
+                captured_at=datetime(2026, 8, 8, 21, 15),
+            )
+
+            summaries = read_recent_trajectory_summaries(
+                n4os_root / "trajectories",
+                lowered_request="Nysha silly puzzles",
+            )
+
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("game-like logic", summaries[0])
+
     def test_review_signals_parse_trajectory_summaries(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             n4os_root = Path(tmpdir) / "n4os"

@@ -29,6 +29,8 @@ class HomeworkClaw:
             "list_homework": self.tools.list_homework,
             "list_class_schedules": self.tools.list_class_schedules,
             "homework_status": self.tools.homework_status,
+            "learning_review": self.tools.learning_review,
+            "add_parent_note": self.tools.add_parent_note,
         }
 
     def capture_from_request(
@@ -39,6 +41,7 @@ class HomeworkClaw:
         source: str = "telegram_text",
         photo_path: str | None = None,
         photo_sha256: str | None = None,
+        photo_assets: list[dict[str, Any]] | None = None,
     ) -> str:
         if self.pending_action is not None:
             pending_action = self.pending_action
@@ -70,6 +73,7 @@ class HomeworkClaw:
                 source=source,
                 photo_path=photo_path,
                 photo_sha256=photo_sha256,
+                photo_assets=photo_assets,
             )
         pending = response.get("data", {}).get("pending_action")
         self.pending_action = pending if isinstance(pending, dict) else None

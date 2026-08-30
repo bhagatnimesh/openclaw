@@ -83,6 +83,15 @@ class SQLiteHomeworkProvider:
                 connection.execute("ALTER TABLE homework_items ADD COLUMN metadata_json TEXT")
             if "content_fingerprint" not in item_columns:
                 connection.execute("ALTER TABLE homework_items ADD COLUMN content_fingerprint TEXT")
+            for name, definition in (
+                ("record_type", "TEXT NOT NULL DEFAULT 'homework'"),
+                ("class_name", "TEXT"),
+                ("lesson_identifier", "TEXT"),
+                ("parent_notes", "TEXT"),
+                ("metadata_version", "INTEGER NOT NULL DEFAULT 1"),
+            ):
+                if name not in item_columns:
+                    connection.execute(f"ALTER TABLE homework_items ADD COLUMN {name} {definition}")
             asset_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(homework_assets)").fetchall()
@@ -91,6 +100,24 @@ class SQLiteHomeworkProvider:
                 connection.execute("ALTER TABLE homework_assets ADD COLUMN content_fingerprint TEXT")
             if "photo_sha256" not in asset_columns:
                 connection.execute("ALTER TABLE homework_assets ADD COLUMN photo_sha256 TEXT")
+            if "page_index" not in asset_columns:
+                connection.execute("ALTER TABLE homework_assets ADD COLUMN page_index INTEGER")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS learning_observations (
+                    id TEXT PRIMARY KEY,
+                    homework_item_id TEXT NOT NULL REFERENCES homework_items(id) ON DELETE CASCADE,
+                    category TEXT NOT NULL,
+                    statement TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    origin TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('active', 'corrected', 'dismissed')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """,
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS homework_events (
@@ -164,6 +191,11 @@ class SQLiteHomeworkProvider:
         ocr_text: str | None = None,
         photo_sha256: str | None = None,
         created_at: str | None = None,
+        record_type: str = "homework",
+        class_name: str | None = None,
+        lesson_identifier: str | None = None,
+        parent_notes: str | None = None,
+        photo_assets: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         timestamp = created_at or datetime.now().astimezone().isoformat()
         metadata_json = _metadata_json(metadata)
@@ -184,6 +216,11 @@ class SQLiteHomeworkProvider:
             "raw_input": raw_input,
             "created_at": timestamp,
             "updated_at": timestamp,
+            "record_type": record_type if record_type in {"homework", "lesson"} else "homework",
+            "class_name": class_name,
+            "lesson_identifier": lesson_identifier,
+            "parent_notes": parent_notes,
+            "metadata_version": 1,
         }
         with self._connection() as connection:
             connection.execute(
@@ -191,29 +228,80 @@ class SQLiteHomeworkProvider:
                 INSERT INTO homework_items (
                     id, child, title, subject, assigned_date, due_date, status,
                     notes, grade, week_range, daily_work, metadata_json, content_fingerprint,
-                    raw_input, created_at, updated_at
+                    raw_input, created_at, updated_at, record_type, class_name,
+                    lesson_identifier, parent_notes, metadata_version
                 )
                 VALUES (
                     :id, :child, :title, :subject, :assigned_date, :due_date, :status,
                     :notes, :grade, :week_range, :daily_work, :metadata_json, :content_fingerprint,
-                    :raw_input, :created_at, :updated_at
+                    :raw_input, :created_at, :updated_at, :record_type, :class_name,
+                    :lesson_identifier, :parent_notes, :metadata_version
                 )
                 """,
                 item,
             )
             self._insert_event(connection, item["id"], "assigned", notes, timestamp)
-            self._insert_assets(
-                connection,
-                item["id"],
-                "assignment_photo",
-                source,
-                photo_path,
-                ocr_text,
-                timestamp,
-                content_fingerprint=content_fingerprint,
-                photo_sha256=photo_sha256,
-            )
+            if not photo_assets:
+                self._insert_assets(
+                    connection,
+                    item["id"],
+                    "assignment_photo",
+                    source,
+                    photo_path,
+                    ocr_text,
+                    timestamp,
+                    content_fingerprint=content_fingerprint,
+                    photo_sha256=photo_sha256,
+                )
+            for page_index, asset in enumerate(photo_assets or [], start=1):
+                self._insert_assets(
+                    connection, item["id"], "assignment_photo", source,
+                    asset.get("path"), asset.get("ocr_text"), timestamp,
+                    content_fingerprint=asset.get("content_fingerprint"),
+                    photo_sha256=asset.get("photo_sha256"), page_index=page_index,
+                )
         return item
+
+    def append_parent_note(self, *, homework_item_id: str, note: str, created_at: str | None = None) -> dict[str, Any] | None:
+        timestamp = created_at or datetime.now().astimezone().isoformat()
+        cleaned = " ".join(note.split()).strip()
+        if not cleaned:
+            return None
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM homework_items WHERE id = :id", {"id": homework_item_id}).fetchone()
+            if row is None:
+                return None
+            previous = str(row["parent_notes"] or "").strip()
+            parent_notes = f"{previous}\n{cleaned}" if previous else cleaned
+            connection.execute("UPDATE homework_items SET parent_notes = :parent_notes, updated_at = :updated_at WHERE id = :id", {"id": homework_item_id, "parent_notes": parent_notes, "updated_at": timestamp})
+            self._insert_event(connection, homework_item_id, "note", f"Parent note: {cleaned}", timestamp)
+            updated = connection.execute("SELECT * FROM homework_items WHERE id = :id", {"id": homework_item_id}).fetchone()
+        return dict(updated) if updated is not None else None
+
+    def replace_learning_observations(self, *, homework_item_id: str, observations: list[dict[str, Any]], created_at: str | None = None) -> None:
+        timestamp = created_at or datetime.now().astimezone().isoformat()
+        with self._connection() as connection:
+            connection.execute("DELETE FROM learning_observations WHERE homework_item_id = :id AND origin = 'ai'", {"id": homework_item_id})
+            for observation in observations:
+                connection.execute("""INSERT INTO learning_observations (id, homework_item_id, category, statement, evidence_json, confidence, origin, status, created_at, updated_at)
+                VALUES (:id, :homework_item_id, :category, :statement, :evidence_json, :confidence, 'ai', 'active', :created_at, :updated_at)""", {
+                    "id": uuid4().hex, "homework_item_id": homework_item_id,
+                    "category": str(observation.get("category") or "learning_observation"),
+                    "statement": str(observation.get("statement") or ""),
+                    "evidence_json": _metadata_json({"evidence": observation.get("evidence") or []}) or "{}",
+                    "confidence": max(0.0, min(float(observation.get("confidence") or 0), 1.0)),
+                    "created_at": timestamp, "updated_at": timestamp,
+                })
+
+    def list_learning_observations(self, homework_item_id: str | None = None, *, child: str | None = None) -> list[dict[str, Any]]:
+        where, params = "", {}
+        if homework_item_id:
+            where, params = "WHERE o.homework_item_id = :id", {"id": homework_item_id}
+        elif child:
+            where, params = "WHERE i.child = :child", {"child": child}
+        with self._connection() as connection:
+            rows = connection.execute("SELECT o.* FROM learning_observations o JOIN homework_items i ON i.id = o.homework_item_id " + where + " ORDER BY o.created_at DESC", params).fetchall()
+        return [dict(row) for row in rows]
 
     def attach_assignment_asset(
         self,
@@ -569,17 +657,18 @@ class SQLiteHomeworkProvider:
         *,
         content_fingerprint: str | None = None,
         photo_sha256: str | None = None,
+        page_index: int | None = None,
     ) -> None:
         if photo_path is not None:
             connection.execute(
                 """
                 INSERT INTO homework_assets (
                     id, homework_item_id, kind, path, ocr_text, content_fingerprint,
-                    photo_sha256, source, created_at
+                    photo_sha256, page_index, source, created_at
                 )
                 VALUES (
                     :id, :homework_item_id, :kind, :path, :ocr_text, :content_fingerprint,
-                    :photo_sha256, :source, :created_at
+                    :photo_sha256, :page_index, :source, :created_at
                 )
                 """,
                 {
@@ -590,6 +679,7 @@ class SQLiteHomeworkProvider:
                     "ocr_text": ocr_text,
                     "content_fingerprint": content_fingerprint,
                     "photo_sha256": photo_sha256,
+                    "page_index": page_index,
                     "source": source,
                     "created_at": created_at,
                 },

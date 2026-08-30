@@ -1,5 +1,8 @@
 import unittest
 
+from google.auth.exceptions import TimeoutError as GoogleAuthTimeoutError
+from google.auth.exceptions import TransportError
+
 from tools import DEFAULT_TIMEZONE, CalendarTools
 
 
@@ -244,6 +247,59 @@ class CalendarToolsTest(unittest.TestCase):
 
         self.assertEqual(response["status"], "error")
         self.assertEqual(response["data"]["error"], "google_calendar_request_failed")
+
+    def test_google_network_failures_report_operation_outcome(self):
+        cases = [
+            (
+                "create transport failure",
+                TransportError("network unavailable"),
+                lambda tools: tools.create_calendar_event(
+                    title="Dentist appointment",
+                    start_time="2026-12-04T15:30:00-08:00",
+                    end_time="2026-12-04T16:30:00-08:00",
+                ),
+                "the event was not added",
+            ),
+            (
+                "read timeout",
+                GoogleAuthTimeoutError("request timed out"),
+                lambda tools: tools.list_calendar_events(
+                    time_min="2026-12-04T00:00:00-08:00",
+                    time_max="2026-12-05T00:00:00-08:00",
+                ),
+                "I couldn't check your calendar",
+            ),
+            (
+                "update transport failure",
+                TransportError("network unavailable"),
+                lambda tools: tools.update_calendar_event(
+                    event_id="event-1",
+                    title="Dentist appointment",
+                    start_time="2026-12-04T15:30:00-08:00",
+                    end_time="2026-12-04T16:30:00-08:00",
+                ),
+                "the event was not changed",
+            ),
+            (
+                "delete timeout",
+                GoogleAuthTimeoutError("request timed out"),
+                lambda tools: tools.delete_calendar_event("event-1"),
+                "the event was not deleted",
+            ),
+        ]
+
+        for name, error, operation, outcome in cases:
+            with self.subTest(name):
+                response = operation(CalendarTools(FailingProvider(error)))
+
+                self.assertEqual(response["status"], "error")
+                self.assertEqual(response["data"]["error"], "google_calendar_unreachable")
+                self.assertEqual(
+                    response["message"],
+                    f"I couldn't reach Google Calendar, so {outcome}. "
+                    "Please try again in a minute. If it still fails, "
+                    "check the N4OS Mac's internet connection.",
+                )
 
 
 if __name__ == "__main__":

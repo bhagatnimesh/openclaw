@@ -6,11 +6,12 @@ from pathlib import Path
 import json
 import os
 import re
+import sqlite3
 import urllib.request
 from typing import Any, Callable
 
 from n4os_review import format_n4os_review
-from n4os_trajectories import read_recent_trajectory_summaries
+from n4os_trajectories import expand_n4os_query_terms, read_recent_trajectory_summaries
 
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parent
@@ -219,6 +220,7 @@ def _build_context(request: str, n4os_root: Path) -> dict[str, Any]:
         "observations": observations,
         "journal": journal,
         "reading_garden": _reading_garden_context(lowered),
+        "school_newsletters": _school_newsletter_context(n4os_root, lowered),
         "trajectories": read_recent_trajectory_summaries(
             n4os_root / "trajectories",
             lowered_request=lowered,
@@ -273,6 +275,7 @@ def format_n4os_knowledge_preview(
     journal = context.get("journal") or []
     trajectories = context.get("trajectories") or []
     reading_garden = context.get("reading_garden") or {}
+    school_newsletters = context.get("school_newsletters") or []
 
     lines = ["Knowledge selected", f"Sources: {', '.join(labels) if labels else 'None'}"]
     lines.append(
@@ -281,6 +284,8 @@ def format_n4os_knowledge_preview(
         f"{_counted(len(journal), 'journal note')}, "
         f"{_counted(len(trajectories), 'prior answer')}"
     )
+    if school_newsletters:
+        lines.append(f"Structured context: {_counted(len(school_newsletters), 'school newsletter')}")
     if isinstance(reading_garden, dict) and reading_garden.get("available"):
         lines.append("Live context: Reading Garden")
     if context.get("operations"):
@@ -325,7 +330,14 @@ def _school_context_files(n4os_root: Path, lowered_request: str) -> list[str]:
         "prompt",
         "practice",
         "resource",
+        "book",
+        "books",
         "lexia",
+        "newsletter",
+        "newsletters",
+        "letter",
+        "letters",
+        "imported",
     )
     if "nysha" not in lowered_request or not any(term in lowered_request for term in school_terms):
         return []
@@ -392,6 +404,115 @@ def _reading_garden_context(lowered_request: str) -> dict[str, Any]:
     }
 
 
+def _school_newsletter_context(n4os_root: Path, lowered_request: str) -> list[dict[str, Any]]:
+    mentions_newsletter = any(
+        term in lowered_request for term in ("newsletter", "newsletters", "letter", "letters", "imported")
+    )
+    child = "Nysha" if "nysha" in lowered_request or (mentions_newsletter and "navya" not in lowered_request) else ""
+    if not child or not any(
+        term in lowered_request
+        for term in (
+            "school",
+            "class",
+            "teacher",
+            "newsletter",
+            "newsletters",
+            "letter",
+            "letters",
+            "imported",
+            "book",
+            "books",
+            "reading",
+        )
+    ):
+        return []
+
+    db_path = n4os_root.parent / "data" / "n4os.db"
+    if not db_path.exists() and n4os_root == DEFAULT_N4OS_ROOT:
+        db_path = DEFAULT_REPO_ROOT / "data" / "n4os.db"
+    if not db_path.exists():
+        return []
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(db_path)
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT title, teacher, newsletter_date, source_url, parsed_json
+            FROM school_newsletter_imports
+            WHERE lower(child) = lower(?)
+                AND status IN ('saved', 'previewed')
+            ORDER BY newsletter_date ASC, updated_at ASC
+            """,
+            (child,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        if connection is not None:
+            connection.close()
+
+    newsletters: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        try:
+            parsed = json.loads(str(row["parsed_json"] or "{}"))
+        except ValueError:
+            continue
+        key = (str(row["newsletter_date"] or ""), str(row["source_url"] or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        newsletters.append(
+            {
+                "date": str(row["newsletter_date"] or parsed.get("newsletter_date") or ""),
+                "title": str(row["title"] or parsed.get("title") or "School Newsletter"),
+                "teacher": str(row["teacher"] or parsed.get("teacher") or ""),
+                "source_url": str(row["source_url"] or parsed.get("source_url") or ""),
+                "books": _newsletter_books_from_payload(parsed),
+                "topics": _limited_strings(_read_nested(parsed, "knowledge", "topics") or parsed.get("learning_context"), 10),
+                "skills": _limited_strings(_read_nested(parsed, "knowledge", "skills"), 8),
+                "routines": _limited_strings(_read_nested(parsed, "knowledge", "routines"), 6),
+                "recommendations": _limited_strings(_read_nested(parsed, "knowledge", "recommendations"), 6),
+                "conversation_prompts": _limited_strings(
+                    _read_nested(parsed, "knowledge", "conversation_prompts"),
+                    5,
+                ),
+            }
+        )
+    return newsletters[-8:]
+
+
+def _newsletter_books_from_payload(parsed: dict[str, Any]) -> list[str]:
+    books = _limited_strings(parsed.get("books"), 20)
+    resources = _read_nested(parsed, "knowledge", "resources")
+    if isinstance(resources, list):
+        for item in resources:
+            if not isinstance(item, dict) or str(item.get("kind") or "").casefold() != "book":
+                continue
+            label = str(item.get("label") or "").strip()
+            if label:
+                books.append(label)
+    return list(dict.fromkeys(books))
+
+
+def _read_nested(payload: dict[str, Any], *keys: str) -> Any:
+    current: Any = payload
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _limited_strings(value: Any, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items = [str(item).strip() for item in value if str(item).strip()]
+    return list(dict.fromkeys(items))[:limit]
+
+
 def _read_files(n4os_root: Path, paths: list[str]) -> list[dict[str, str]]:
     seen: set[str] = set()
     result: list[dict[str, str]] = []
@@ -431,6 +552,11 @@ def _recent_observations(observations_root: Path, lowered_request: str) -> list[
                 observation = line.removeprefix("- Observation: ").strip()
                 records.append(f"{current_date} {current_person}: {_plain_wiki_text(observation)}")
 
+    request_terms = _expanded_context_terms(lowered_request)
+    if request_terms:
+        relevant = [record for record in records if _matches_any_context_term(record, request_terms)]
+        if relevant:
+            return relevant[-12:]
     if "reading" in lowered_request or "book" in lowered_request:
         reading_terms = (
             "read",
@@ -465,6 +591,7 @@ def _recent_journal_entries(journal_root: Path, lowered_request: str) -> list[st
             wanted_terms.extend(terms)
 
     records: list[str] = []
+    request_terms = _expanded_context_terms(lowered_request)
     for path in sorted(journal_root.glob("*.md")):
         captured_on = path.stem
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -473,8 +600,36 @@ def _recent_journal_entries(journal_root: Path, lowered_request: str) -> list[st
             text = _plain_wiki_text(line.removeprefix("- ").strip())
             if wanted_terms and not any(term in text.lower() for term in wanted_terms):
                 continue
+            if request_terms and not _matches_any_context_term(text, request_terms):
+                continue
             records.append(f"{captured_on}: {text}")
     return records[-12:]
+
+
+def _expanded_context_terms(lowered_request: str) -> list[str]:
+    terms = re.findall(r"[a-z0-9']+", lowered_request.lower())
+    stopwords = {
+        "about",
+        "approach",
+        "does",
+        "give",
+        "have",
+        "help",
+        "n4os",
+        "should",
+        "what",
+        "when",
+        "where",
+        "which",
+        "with",
+    }
+    meaningful = [term for term in terms if len(term) >= 4 and term not in stopwords]
+    return expand_n4os_query_terms(meaningful)
+
+
+def _matches_any_context_term(text: str, terms: list[str]) -> bool:
+    lowered = text.lower()
+    return any(term in lowered for term in terms)
 
 
 def _try_openai_advice(
@@ -655,6 +810,10 @@ def _fallback_advice(request: str, context: dict[str, Any]) -> str:
         reading_answer = _fallback_reading_garden_answer(context)
         if reading_answer:
             return reading_answer
+    if _is_newsletter_books_lookup(lowered_request):
+        newsletter_answer = _fallback_newsletter_books_answer(context)
+        if newsletter_answer:
+            return newsletter_answer
     if not is_nysha_school_transition:
         lines.extend(["N4OS advice", ""])
     if is_nysha_school_transition:
@@ -779,6 +938,35 @@ def _is_current_books_lookup(lowered: str) -> bool:
             lowered,
         )
     )
+
+
+def _is_newsletter_books_lookup(lowered: str) -> bool:
+    return "book" in lowered and any(
+        term in lowered for term in ("newsletter", "newsletters", "letter", "letters", "imported", "mentioned")
+    )
+
+
+def _fallback_newsletter_books_answer(context: dict[str, Any]) -> str | None:
+    newsletters = context.get("school_newsletters")
+    if not isinstance(newsletters, list) or not newsletters:
+        return None
+
+    lines = ["Nysha's imported school newsletters mention these books:"]
+    found = False
+    for item in newsletters:
+        if not isinstance(item, dict):
+            continue
+        books = [str(book).strip() for book in item.get("books") or [] if str(book).strip()]
+        if not books:
+            continue
+        found = True
+        date = str(item.get("date") or "unknown date").strip()
+        lines.append(f"{date}:")
+        lines.extend(f"- {book}" for book in books[:12])
+    if not found:
+        return None
+    lines.extend(["", "Used: School Newsletters"])
+    return "\n".join(lines)
 
 
 def _fallback_reading_garden_answer(context: dict[str, Any]) -> str | None:

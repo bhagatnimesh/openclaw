@@ -13,6 +13,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parent
 DEFAULT_N4OS_ROOT = ROOT / "n4os"
 DEFAULT_DB_FILE = ROOT / "data" / "n4os.db"
+MAX_RECENT_MEMORY_WINDOW_DAYS = 365
 
 MemoryKind = Literal["dinner_pickup_event", "dinner_pickup_assignment", "note"]
 
@@ -496,6 +497,9 @@ class SQLiteStructuredMemoryStore:
 def is_structured_remember_message(text: str) -> bool:
     stripped = text.strip()
     if _parse_recent_memory_window(stripped):
+        return False
+    remember_body = _remember_recent_body(stripped)
+    if remember_body is not None and _looks_like_recent_memory_window_body(remember_body):
         return False
     return bool(REMEMBER_RE.match(stripped))
 
@@ -1124,9 +1128,23 @@ def _parse_recent_memory_body(body: str) -> RecentMemoryWindow | None:
     else:
         days = count * 30
         label_unit = "month" if count == 1 else "months"
+    days = min(days, MAX_RECENT_MEMORY_WINDOW_DAYS)
     if count == 1:
         return RecentMemoryWindow(days=days, label=f"the last {label_unit}")
     return RecentMemoryWindow(days=days, label=f"the last {count} {label_unit}")
+
+
+def _looks_like_recent_memory_window_body(body: str) -> bool:
+    normalized = body.strip().lower()
+    normalized = re.sub(r"^(?:in|from|for|during|within)\s+", "", normalized)
+    normalized = re.sub(r"^(?:the\s+)?", "", normalized)
+    return normalized in {"recent", "recently", "latest"} or bool(
+        re.search(
+            r"\b(?:last|past)\s+(?:\d+\s+)?(?:day|days|week|weeks|month|months)\b",
+            normalized,
+            flags=re.I,
+        )
+    )
 
 
 def _memory_query_terms(text: str) -> list[str]:

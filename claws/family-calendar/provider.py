@@ -246,6 +246,7 @@ class GoogleCalendarProvider:
         timezone="America/Los_Angeles",
         description=None,
         location=None,
+        recurrence=None,
         attendees=None,
         private_extended_properties=None,
         calendar_id=None,
@@ -269,6 +270,9 @@ class GoogleCalendarProvider:
 
         if location:
             event["location"] = location
+
+        if recurrence:
+            event["recurrence"] = recurrence
 
         if attendees:
             event["attendees"] = attendees

@@ -374,6 +374,8 @@ def _is_submission_request(text: str) -> bool:
 
 def is_homework_capture(text: str) -> bool:
     lowered = text.lower()
+    if re.search(r"^\s*/?lesson(?:@[A-Za-z0-9_]+)?\b", lowered):
+        return True
     if re.search(r"^\s*/?capture(?:@[A-Za-z0-9_]+)?\s+(?:submitted\s+)?homework\b", lowered):
         return True
     if re.search(
@@ -391,11 +393,15 @@ def is_homework_capture(text: str) -> bool:
 def has_homework_terms(text: str) -> bool:
     return bool(
         re.search(
-            r"\b(homework|worksheet|assignment|submitted\s+homework|turned\s+in|parent\s+signature)\b",
+            r"\b(homework|lesson|worksheet|assignment|submitted\s+homework|turned\s+in|parent\s+signature)\b",
             text,
             flags=re.IGNORECASE,
         )
     )
+
+
+def is_learning_review(text: str) -> bool:
+    return bool(re.search(r"^\s*/?learning(?:@[A-Za-z0-9_]+)?\s+(?:review|status)\b", text, flags=re.IGNORECASE))
 
 
 def extract_intent(request: str, now: datetime | None = None, *, source: str = "telegram_text", photo_path: str | None = None) -> dict[str, Any]:
@@ -411,6 +417,7 @@ def extract_intent(request: str, now: datetime | None = None, *, source: str = "
 
     children = _children(raw)
     subject = _extract_subject(raw)
+    is_lesson = bool(re.match(r"^\s*/?lesson(?:@[A-Za-z0-9_]+)?\b", raw, flags=re.IGNORECASE))
     status = "submitted" if _is_submission_request(raw) else "assigned"
     intent = "capture_submission" if status == "submitted" else "capture_assignment"
     return {
@@ -431,4 +438,6 @@ def extract_intent(request: str, now: datetime | None = None, *, source: str = "
         "source": source,
         "photo_path": photo_path,
         "raw_input": raw,
+        "record_type": "lesson" if is_lesson else "homework",
+        "lesson_identifier": _label_value(raw, ("lesson", "lesson number")) if is_lesson else None,
     }

@@ -15,6 +15,20 @@ links:
 
 ## Newsletter Updates
 
+<!-- n4os-school-newsletter:d0b7b767e7abf2b50b59870aa1925562c5fafd87988ec768713bcc395c360b9a:start -->
+### 2026-08-28 - Room 13 Newsletter
+
+- Room 13 Newsletter (https://docs.google.com/presentation/d/1c5pTvoBFzuHmZawd4p2hwPSNKb6kZC26p6vUqyl9KG0/edit?usp=drivesdk)
+- Teacher/class: Mrs. Thompson
+
+#### Books, Media, And Platforms
+
+- Book: The Recess Queen and discussed the central message
+- Book: The Sandwich Swap and discussed respect for different cultures
+- Book: One
+- Book: Your Fantastic Elastic Brain
+<!-- n4os-school-newsletter:d0b7b767e7abf2b50b59870aa1925562c5fafd87988ec768713bcc395c360b9a:end -->
+
 <!-- n4os-school-newsletter:44f25c7b3bbfce51888df77e5e83699ce6e662c1a9c2fbe979030b45dcfe5e87:start -->
 ### 2026-08-21 - Room 13 Newsletter
 

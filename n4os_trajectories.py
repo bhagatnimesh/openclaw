@@ -12,6 +12,53 @@ DEFAULT_N4OS_ROOT = DEFAULT_REPO_ROOT / "n4os"
 TRAJECTORY_TEXT_LIMIT = 8000
 SUMMARY_LIMIT = 420
 
+QUERY_EXPANSION_GROUPS: tuple[tuple[str, ...], ...] = (
+    (
+        "puzzle",
+        "puzzles",
+        "game",
+        "games",
+        "logic",
+        "logical",
+        "pattern",
+        "patterns",
+        "brain",
+        "teaser",
+        "teasers",
+        "playful",
+        "silly",
+    ),
+    (
+        "read",
+        "reading",
+        "book",
+        "books",
+        "story",
+        "stories",
+        "storytelling",
+        "teach",
+        "teaching",
+        "explain",
+        "explaining",
+    ),
+    (
+        "confidence",
+        "confident",
+        "hesitant",
+        "speaking",
+        "voice",
+        "public",
+        "greet",
+        "greeting",
+        "people",
+        "adult",
+        "adults",
+    ),
+    ("school", "class", "classroom", "classmates", "teacher", "transition"),
+    ("health", "sleep", "slept", "energy", "body", "pain", "movement", "recovery"),
+    ("attention", "scattered", "focus", "focused", "distracted", "reactive"),
+)
+
 
 @dataclass(frozen=True)
 class N4OSTrajectoryRecord:
@@ -272,7 +319,26 @@ def _topic_terms(lowered_request: str) -> list[str]:
         "what",
         "with",
     }
-    return [term for term in terms if len(term) >= 4 and term not in stopwords]
+    base_terms = [term for term in terms if len(term) >= 4 and term not in stopwords]
+    return expand_n4os_query_terms(base_terms)
+
+
+def expand_n4os_query_terms(terms: list[str]) -> list[str]:
+    expanded: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: str) -> None:
+        if term not in seen:
+            seen.add(term)
+            expanded.append(term)
+
+    for term in terms:
+        add(term)
+        for group in QUERY_EXPANSION_GROUPS:
+            if term in group:
+                for related in group:
+                    add(related)
+    return expanded
 
 
 def _summarize(text: str) -> str:

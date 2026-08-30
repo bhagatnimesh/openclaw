@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from google.auth.exceptions import TimeoutError as GoogleAuthTimeoutError
+from google.auth.exceptions import TransportError as GoogleAuthTransportError
 from typing import Any, Literal, Protocol, TypedDict
 
 
@@ -58,6 +60,7 @@ class CalendarProvider(Protocol):
         timezone: str = DEFAULT_TIMEZONE,
         description: str | None = None,
         location: str | None = None,
+        recurrence: list[str] | None = None,
         attendees: list[dict[str, Any]] | None = None,
         private_extended_properties: dict[str, str] | None = None,
         calendar_id: str | None = None,
@@ -92,7 +95,10 @@ def _missing_response(fields: list[str]) -> ToolResponse:
     }
 
 
-def _provider_error_response(error: Exception) -> ToolResponse:
+def _provider_error_response(
+    error: Exception,
+    operation: Literal["create", "read", "update", "delete"],
+) -> ToolResponse:
     error_text = str(error)
     is_revoked_google_token = "invalid_grant" in error_text and "expired or revoked" in error_text
     if is_revoked_google_token:
@@ -104,6 +110,22 @@ def _provider_error_response(error: Exception) -> ToolResponse:
                 "then restart the Telegram bot."
             ),
             "data": {"error": "google_calendar_auth_expired"},
+        }
+
+    if isinstance(error, (GoogleAuthTransportError, GoogleAuthTimeoutError)):
+        outcome = {
+            "create": "the event was not added",
+            "read": "I couldn't check your calendar",
+            "update": "the event was not changed",
+            "delete": "the event was not deleted",
+        }[operation]
+        return {
+            "status": "error",
+            "message": (
+                f"I couldn't reach Google Calendar, so {outcome}. "
+                "Please try again in a minute. If it still fails, check the N4OS Mac's internet connection."
+            ),
+            "data": {"error": "google_calendar_unreachable"},
         }
 
     return {
@@ -176,7 +198,7 @@ class CalendarTools:
                 event_label_background_color=_clean_optional(event_label_background_color),
             )
         except Exception as error:
-            return _provider_error_response(error)
+            return _provider_error_response(error, "create")
 
         return {
             "status": "ok",
@@ -219,7 +241,7 @@ class CalendarTools:
                 list_kwargs["query"] = _clean_optional(query)
             events = self.provider.list_events(**list_kwargs)
         except Exception as error:
-            return _provider_error_response(error)
+            return _provider_error_response(error, "read")
 
         return {
             "status": "ok",
@@ -241,7 +263,7 @@ class CalendarTools:
                 calendar_id=_clean_optional(calendar_id),
             )
         except Exception as error:
-            return _provider_error_response(error)
+            return _provider_error_response(error, "read")
         return {
             "status": "ok",
             "message": "Calendar event returned from Google Calendar.",
@@ -263,7 +285,7 @@ class CalendarTools:
                 calendar_id=_clean_optional(calendar_id),
             )
         except Exception as error:
-            return _provider_error_response(error)
+            return _provider_error_response(error, "delete")
 
         return {
             "status": "ok",
@@ -280,6 +302,7 @@ class CalendarTools:
         timezone: str | None = DEFAULT_TIMEZONE,
         description: str | None = None,
         location: str | None = None,
+        recurrence: list[str] | None = None,
         attendees: list[dict[str, Any]] | None = None,
         private_extended_properties: dict[str, str] | None = None,
         calendar_id: str | None = None,
@@ -304,21 +327,26 @@ class CalendarTools:
             return _missing_response(missing_fields)
 
         try:
+            update_kwargs = {
+                "event_id": cleaned_event_id,
+                "title": cleaned_title,
+                "start_time": cleaned_start,
+                "end_time": cleaned_end,
+                "timezone": _clean_optional(timezone) or DEFAULT_TIMEZONE,
+                "description": _clean_optional(description),
+                "location": _clean_optional(location),
+                "attendees": attendees,
+                "private_extended_properties": private_extended_properties,
+                "calendar_id": _clean_optional(calendar_id),
+                "notify_attendees": notify_attendees,
+            }
+            if recurrence is not None:
+                update_kwargs["recurrence"] = recurrence
             event = self.provider.update_event(
-                event_id=cleaned_event_id,
-                title=cleaned_title,
-                start_time=cleaned_start,
-                end_time=cleaned_end,
-                timezone=_clean_optional(timezone) or DEFAULT_TIMEZONE,
-                description=_clean_optional(description),
-                location=_clean_optional(location),
-                attendees=attendees,
-                private_extended_properties=private_extended_properties,
-                calendar_id=_clean_optional(calendar_id),
-                notify_attendees=notify_attendees,
+                **update_kwargs,
             )
         except Exception as error:
-            return _provider_error_response(error)
+            return _provider_error_response(error, "update")
 
         return {
             "status": "ok",

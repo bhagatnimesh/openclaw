@@ -117,6 +117,34 @@ class HomeworkToolsTest(unittest.TestCase):
         self.assertEqual(self.calendar.created[0]["end_time"], "2026-08-21T07:30:00-07:00")
         self.assertIn("Added due-date reminder", response["message"])
 
+    def test_lesson_capture_keeps_all_pages_and_learning_observations(self):
+        response = self.tools.capture_assignment(
+            "/lesson Nysha RSM Math lesson 01\n\nImage text:\nHomework title: Pattern practice\nVisible instructions: Solve addition equations",
+            source="telegram_photo",
+            photo_assets=[
+                {"path": "/static/dashboard/uploads/homework/one.jpg", "ocr_text": "Pattern practice", "photo_sha256": "one"},
+                {"path": "/static/dashboard/uploads/homework/two.jpg", "ocr_text": "Solve addition equations", "photo_sha256": "two"},
+            ],
+        )
+
+        self.assertEqual(response["status"], "ok")
+        item = response["data"]["item"]
+        self.assertEqual(item["record_type"], "lesson")
+        self.assertEqual(len(self.provider.list_assets(item["id"])), 2)
+        self.assertTrue(self.provider.list_learning_observations(item["id"]))
+
+    def test_parent_note_updates_learning_record_and_review(self):
+        captured = self.tools.capture_assignment("/lesson Nysha math\n\nImage text:\nVisible instructions: addition")
+        item = captured["data"]["item"]
+
+        note = self.tools.add_parent_note(str(item["id"]), "She enjoyed pictures but needed help starting.")
+        review = self.tools.learning_review(child="Nysha", subject="math")
+
+        self.assertEqual(note["status"], "ok")
+        self.assertIn("needed help starting", self.provider.list_items(child="Nysha")[0]["parent_notes"])
+        self.assertEqual(review["status"], "ok")
+        self.assertIn("Learning review for Nysha", review["message"])
+
     def test_explicit_due_time_overrides_default_calendar_time(self):
         self.tools.capture_assignment(
             "/capture homework Nysha math due August 18 at 8 pm",

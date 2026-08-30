@@ -18,6 +18,11 @@ from n4os_structured_memory import (
     mutate_structured_memory,
     remember_structured_memory,
 )
+from n4os_memory_search import (
+    format_broad_memory_search_query,
+    is_broad_memory_search_query,
+    search_broad_memory,
+)
 
 
 def assert_memory_reply(
@@ -40,6 +45,144 @@ def assert_memory_reply(
 
 
 class N4OSStructuredMemoryTest(unittest.TestCase):
+    def test_broad_memory_search_finds_captured_link_observation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            observations = n4os_root / "family" / "observations"
+            observations.mkdir(parents=True)
+            (observations / "2026-08.md").write_text(
+                "\n".join(
+                    [
+                        "# Observations",
+                        "",
+                        "## 2026-08-23",
+                        "",
+                        "### [[family/Nysha|Nysha]]",
+                        "- Observation: kids like silly puzzles here https://www.littleladoo.com/brain-teasers-for-kids/ [Link: https://www.littleladoo.com/brain-teasers-for-kids/; title: 60 Brain Teasers for kids {With Answers}]",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            matches = search_broad_memory(
+                "find memory everywhere silly puzzles",
+                n4os_root=n4os_root,
+            )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].path, "n4os/family/observations/2026-08.md")
+        self.assertEqual(matches[0].label, "2026-08-23 Nysha")
+        self.assertIn("littleladoo.com/brain-teasers-for-kids", matches[0].snippet)
+
+    def test_broad_memory_search_uses_expanded_related_terms(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            observations = n4os_root / "family" / "observations"
+            observations.mkdir(parents=True)
+            (observations / "2026-08.md").write_text(
+                "\n".join(
+                    [
+                        "# Observations",
+                        "",
+                        "## 2026-08-23",
+                        "",
+                        "### [[family/Nysha|Nysha]]",
+                        "- Observation: enjoys visual patterns and board games when they feel playful",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            matches = search_broad_memory(
+                "find memory everywhere silly puzzles",
+                n4os_root=n4os_root,
+            )
+
+        self.assertEqual(len(matches), 1)
+        self.assertIn("visual patterns and board games", matches[0].snippet)
+
+    def test_broad_memory_search_does_not_scan_arbitrary_repo_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            n4os_root = root / "n4os"
+            n4os_root.mkdir()
+            (root / "README.md").write_text(
+                "silly puzzles should not be searched from repo root",
+                encoding="utf-8",
+            )
+
+            matches = search_broad_memory(
+                "find memory everywhere silly puzzles",
+                n4os_root=n4os_root,
+            )
+
+        self.assertEqual(matches, [])
+
+    def test_broad_memory_query_combines_structured_and_file_matches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            observations = n4os_root / "family" / "observations"
+            observations.mkdir(parents=True)
+            (observations / "2026-08.md").write_text(
+                "\n".join(
+                    [
+                        "# Observations",
+                        "",
+                        "## 2026-08-23",
+                        "",
+                        "### Family",
+                        "- Observation: learning code came up during puzzle time",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            remember_structured_memory("/remember learning code 0816", n4os_root=n4os_root)
+
+            reply = format_broad_memory_search_query(
+                "find memory everywhere learning code",
+                n4os_root=n4os_root,
+            )
+
+        self.assertTrue(is_broad_memory_search_query("find memory everywhere learning code"))
+        self.assertIn("Remembered note: learning code 0816", reply)
+        self.assertIn("Broader N4OS memory matches:", reply)
+        self.assertIn("n4os/family/observations/2026-08.md:", reply)
+
+    def test_broad_memory_results_are_spaced_for_telegram_readability(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            observations = n4os_root / "family" / "observations"
+            observations.mkdir(parents=True)
+            (observations / "2026-08.md").write_text(
+                "\n".join(
+                    [
+                        "# Observations",
+                        "",
+                        "## 2026-08-23",
+                        "",
+                        "### Family",
+                        "- Observation: kids liked silly puzzles in the car",
+                        "- Observation: brain teaser games worked well after dinner",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            reply = format_broad_memory_search_query(
+                "find memory everywhere silly puzzles",
+                n4os_root=n4os_root,
+            )
+
+        self.assertIn(
+            "1. 2026-08-23 Family",
+            reply,
+        )
+        self.assertIn(
+            "\n\n2. 2026-08-23 Family",
+            reply,
+        )
+
     def test_recent_memory_query_lists_items_by_created_at_window(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             n4os_root = Path(tmpdir) / "n4os"
@@ -132,6 +275,77 @@ class N4OSStructuredMemoryTest(unittest.TestCase):
         self.assertEqual(recent_reply, "No structured memories stored in the last 7 days.")
         self.assertIn("Remembered in the last month:", month_reply)
         self.assertIn("camp form code is CAMP-9", month_reply)
+
+    def test_recent_memory_query_supports_custom_day_and_month_windows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            n4os_root = Path(tmpdir) / "n4os"
+            n4os_root.mkdir()
+            store = SQLiteStructuredMemoryStore(Path(tmpdir) / "data" / "n4os.db")
+            now = datetime.now().astimezone()
+            store.add_item(
+                kind="note",
+                subject="general",
+                actor=None,
+                value="recent month memory is visible",
+                happened_on=None,
+                applies_on=None,
+                status="active",
+                confidence="low",
+                source="Telegram",
+                text="recent month memory is visible",
+                created_at=now - timedelta(days=20),
+            )
+            store.add_item(
+                kind="note",
+                subject="general",
+                actor=None,
+                value="forty day memory is visible",
+                happened_on=None,
+                applies_on=None,
+                status="active",
+                confidence="low",
+                source="Telegram",
+                text="forty day memory is visible",
+                created_at=now - timedelta(days=40),
+            )
+            store.add_item(
+                kind="note",
+                subject="general",
+                actor=None,
+                value="five month memory is visible",
+                happened_on=None,
+                applies_on=None,
+                status="active",
+                confidence="low",
+                source="Telegram",
+                text="five month memory is visible",
+                created_at=now - timedelta(days=150),
+            )
+
+            day_reply = format_structured_memory_query(
+                "/remember last 45 days",
+                n4os_root=n4os_root,
+            )
+            month_reply = format_structured_memory_query(
+                "what did I remember in the last 6 months?",
+                n4os_root=n4os_root,
+            )
+            singular_reply = format_structured_memory_query(
+                "what did I remember in the last 1 month?",
+                n4os_root=n4os_root,
+            )
+
+        self.assertIn("Remembered in the last 45 days:", day_reply)
+        self.assertIn("forty day memory is visible", day_reply)
+        self.assertNotIn("five month memory is visible", day_reply)
+        self.assertIn("Remembered in the last 6 months:", month_reply)
+        self.assertIn("five month memory is visible", month_reply)
+        self.assertIn("Remembered in the last month:", singular_reply)
+        self.assertIn("recent month memory is visible", singular_reply)
+
+    def test_invalid_recent_memory_window_is_not_saved_as_memory(self):
+        self.assertFalse(is_structured_memory_query("/remember last 0 days"))
+        self.assertFalse(is_structured_remember_message("/remember last 0 days"))
 
     def test_recent_memory_query_truncates_after_default_limit(self):
         with tempfile.TemporaryDirectory() as tmpdir:

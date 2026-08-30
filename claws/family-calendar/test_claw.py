@@ -1436,7 +1436,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
 
         self.assertEqual(
             message,
-            "I found 2 dates for Swim class, Sep 18 through Sep 25, "
+            "I drafted 2 dates for Swim class, Sep 18 through Sep 25, "
             "5:30 PM–7:00 PM. Add all 2 events?",
         )
         self.assertEqual(provider.created, [])
@@ -1798,7 +1798,7 @@ class FamilyCalendarClawTest(unittest.TestCase):
         with redirect_stdout(StringIO()):
             message = claw.create_event_from_request(request, reference_time=reference)
 
-        self.assertIn("I found 3 dates", message)
+        self.assertIn("I drafted 3 dates", message)
         self.assertIn("Add all 3 events?", message)
         self.assertIsNotNone(claw.pending_action)
         self.assertEqual(claw.pending_action.action, "confirm_create_bulk")
@@ -3642,6 +3642,28 @@ class MilestoneOneRegressionTest(unittest.TestCase):
         self.assertEqual(provider.created_calendar_names, ["Nysha school calendar"])
         self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-08-11T16:30:00-07:00")
         self.assertIn("Created calendar event: Back to school night", output.getvalue())
+
+    def test_real_phrase_calendar_event_preview_reads_as_draft(self):
+        now = datetime(2026, 8, 24, 10, 4, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        provider = FakeProvider()
+        claw = FamilyCalendarClaw.from_provider(provider)
+
+        with redirect_stdout(StringIO()):
+            message = claw.create_event_from_request(
+                "Add calendar event Nile's Museum on August 30 Sunday 11 a.m. to 4 p.m.",
+                reference_time=now,
+            )
+
+        self.assertEqual(
+            message,
+            "Created calendar event: Nile's Museum on Sunday, August 30 from 11:00 AM "
+            "to 4:00 PM America/Los_Angeles "
+            "(open: https://calendar.google.com/calendar/event?eid=event-123).",
+        )
+        self.assertEqual(provider.created[0]["summary"], "Nile's Museum")
+        self.assertEqual(provider.created[0]["start"]["dateTime"], "2026-08-30T11:00:00-07:00")
+        self.assertEqual(provider.created[0]["end"]["dateTime"], "2026-08-30T16:00:00-07:00")
+        self.assertIsNone(claw.pending_action)
 
     def test_create_event_reports_expired_google_auth_without_raising(self):
         provider = FailingProvider(

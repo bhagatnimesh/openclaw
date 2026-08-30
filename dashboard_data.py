@@ -1153,6 +1153,7 @@ def _empty_homework() -> dict[str, Any]:
         "upcoming": [],
         "open_count": 0,
         "due_now_count": 0,
+        "learning": {"recent": [], "observation_count": 0},
     }
 
 
@@ -1261,6 +1262,8 @@ def _normalize_homework_item(item: dict[str, Any], today: date) -> dict[str, Any
         "notes": _clean_text(item.get("notes")),
         "grade": _clean_text(item.get("grade")),
         "week_range": _clean_text(item.get("week_range")),
+        "record_type": _clean_text(item.get("record_type"), "homework"),
+        "parent_notes": _clean_text(item.get("parent_notes")),
     }
 
 
@@ -1338,7 +1341,20 @@ def _homework_summary(sources: DashboardSources, today: date) -> tuple[dict[str,
         "due_now_count": len(
             [item for item in all_items if item["days_until_due"] is not None and item["days_until_due"] <= 0]
         ),
+        "learning": {"recent": [], "observation_count": 0},
     }
+    provider = getattr(tools, "provider", None)
+    if provider is not None:
+        try:
+            recent = []
+            observations = []
+            for child in HOMEWORK_CHILDREN:
+                recent.extend(_normalize_homework_item(item, today) for item in provider.list_items(child=child, limit=8))
+                observations.extend(provider.list_learning_observations(child=child))
+            recent.sort(key=lambda item: (item["assigned_date"], item["title"]), reverse=True)
+            summary["learning"] = {"recent": recent[:8], "observation_count": len([item for item in observations if item.get("status") == "active"])}
+        except Exception:
+            pass
     return summary, warnings
 
 

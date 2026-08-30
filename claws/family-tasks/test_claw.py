@@ -1813,6 +1813,30 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(task_list_id, "school-id")
 
+    def test_ai_default_task_list_hint_uses_default_alias(self):
+        provider = NamedListProvider()
+        extractor = FakeFieldExtractor(
+            {
+                "intent": "create_task",
+                "title": "Add sticker to the Sienna license",
+                "due": "2026-09-19",
+                "task_list_id_hint": "@default",
+                "metadata": {"owner": "unknown"},
+                "missing_fields": [],
+            }
+        )
+        claw = FamilyTasksClaw.from_provider(provider)
+        claw.field_extractor = extractor
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request(
+                "/task add sticker to the sienna license time: after 4 Saturdays"
+            )
+
+        self.assertIn("Created task", message)
+        self.assertEqual(provider.created[0]["title"], "Add sticker to the Sienna license")
+        self.assertEqual(provider.created_list_ids, ["@default"])
+
     def test_ai_create_preserves_default_owner_annotation(self):
         provider = FakeProvider()
         extractor = FakeFieldExtractor(

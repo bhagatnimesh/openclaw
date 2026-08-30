@@ -25,6 +25,171 @@ FAMILY_ATTENDEES = [
 
 
 class IntentExtractionTest(unittest.TestCase):
+    def test_spoken_description_does_not_override_weekly_recurrence(self):
+        now = datetime(2026, 8, 29, 12, 17, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        request = (
+            "Calendar add, title, homework plan for Nysha, when every Sunday 4 p.m. "
+            "Description, come up with a concrete plan, have it documented in a template, "
+            "discuss what is needed, know what materials are needed, and have a checklist "
+            "ready for every day, every week."
+        )
+        intent = extract_intent(request, now=now)
+
+        self.assertEqual(intent["title"], "Homework plan for Nysha")
+        self.assertEqual(intent["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SU"])
+        self.assertEqual(intent["recurrence_label"], "every Sunday")
+        self.assertEqual(
+            intent["description"],
+            "come up with a concrete plan, have it documented in a template, discuss what "
+            "is needed, know what materials are needed, and have a checklist ready for every "
+            "day, every week.",
+        )
+
+        refined = merge_ai_calendar_fields(
+            intent,
+            {
+                "action": "create_event",
+                "confidence": 0.95,
+                "slots": {
+                    "title": "Homework plan for Nysha",
+                    "start_time": "16:00",
+                    "description": intent["description"],
+                    "recurrence": ["RRULE:FREQ=DAILY"],
+                },
+                "missing_fields": [],
+            },
+            request,
+            now=now,
+            primary=True,
+        )
+
+        self.assertEqual(refined["title"], "Homework plan for Nysha")
+        self.assertEqual(refined["start_time"], "16:00")
+        self.assertEqual(refined["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SU"])
+        self.assertEqual(refined["recurrence_label"], "every Sunday")
+
+    def test_spoken_title_words_are_not_description_delimiters(self):
+        now = datetime(2026, 8, 29, 12, 17, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent(
+            "Calendar add, title, Release notes, when every Sunday 4 p.m. "
+            "Description, discuss changes.",
+            now=now,
+        )
+
+        self.assertEqual(intent["title"], "Release notes")
+        self.assertEqual(intent["recurrence"], ["RRULE:FREQ=WEEKLY;BYDAY=SU"])
+        self.assertEqual(intent["description"], "discuss changes.")
+
+    def test_newsletter_create_keeps_concise_title_and_monthly_ordinal_recurrence(self):
+        now = datetime(2026, 8, 28, 15, 9, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent(
+            "/calendar add\n"
+            "Dear Pioneer Families,\n\n"
+            "We invite you to join our monthly CFFA meetings, where we discuss updates, "
+            "upcoming events, and important decisions affecting our school community.\n\n"
+            "This week we will discuss preparation for upcoming events.\n\n"
+            "Meeting Details for the In person meeting:\n"
+            "* Frequency: Monthly (First Tuesday every month, starts on September 1st 2026)\n"
+            "* Location: At school, Room 1 (to the right of the office)\n"
+            "* Time: 7:00 PM sharp – 8:00 PM\n"
+            "* Who: All parents are welcome to join\n"
+            "Meeting Minutes link: https://www.cffaonline.org/meeting-minutes",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "CFFA monthly meeting")
+        self.assertEqual(intent["date"], "2026-09-01")
+        self.assertEqual(intent["start_time"], "19:00")
+        self.assertEqual(intent["duration_minutes"], 60)
+        self.assertEqual(intent["recurrence"], ["RRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=1"])
+        self.assertEqual(intent["recurrence_label"], "every first Tuesday")
+        self.assertEqual(intent["missing_fields"], [])
+
+    def test_primary_ai_newsletter_fields_are_repaired_before_creation(self):
+        now = datetime(2026, 8, 28, 15, 9, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        request = (
+            "/calendar add\nDear Pioneer Families,\n"
+            "We invite you to join our monthly CFFA meetings.\n"
+            "This briefing includes preparation for upcoming events.\n"
+            "Frequency: Monthly (First Tuesday every month, starts on September 1st 2026)\n"
+            "Time: 7:00 PM sharp – 8:00 PM"
+        )
+        intent = extract_intent(request, now=now)
+
+        refined = merge_ai_calendar_fields(
+            intent,
+            {
+                "action": "preparation_checklist",
+                "confidence": 0.95,
+                "slots": {
+                    "title": "Dear Pioneer Families We invite you to join our monthly CFFA meetings",
+                    "date": "2026-09-01",
+                    "start_time": "19:00",
+                    "duration_minutes": 60,
+                    "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TU"],
+                },
+                "missing_fields": [],
+            },
+            request,
+            now=now,
+            primary=True,
+        )
+
+        self.assertEqual(refined["intent"], "create_event")
+        self.assertEqual(refined["title"], "CFFA monthly meeting")
+        self.assertEqual(refined["recurrence"], ["RRULE:FREQ=MONTHLY;BYDAY=TU;BYSETPOS=1"])
+
+    def test_primary_ai_newsletter_title_does_not_override_command_title(self):
+        now = datetime(2026, 8, 28, 15, 9, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        request = (
+            "/calendar add planning session on September 1 at 7 PM\n"
+            "Notes: Guests: Mom. Zoom invitation title: We invite you to join our weekly CFFA meetings "
+            "every Tuesday."
+        )
+        intent = extract_intent(request, now=now)
+        self.assertEqual(intent["title"], "Planning session")
+        self.assertEqual(intent["attendees"], [])
+        self.assertIn("Guests: Mom", intent["description"])
+        self.assertIsNone(intent["recurrence"])
+
+        refined = merge_ai_calendar_fields(
+            intent,
+            {
+                "action": "create_event",
+                "confidence": 0.95,
+                "slots": {
+                    "title": "We invite you to join our weekly CFFA meetings",
+                    "description": "AI-generated description",
+                    "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=TU"],
+                },
+                "missing_fields": [],
+            },
+            request,
+            now=now,
+            primary=True,
+        )
+
+        self.assertEqual(refined["title"], "Planning session")
+        self.assertEqual(refined["description"], intent["description"])
+        self.assertIsNone(refined["recurrence"])
+
+    def test_labeled_notes_do_not_change_implicit_create_routing(self):
+        now = datetime(2026, 8, 28, 15, 9, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
+        intent = extract_intent(
+            "Dentist tomorrow at 3 PM\n"
+            "Notes: Noah help me prepare the forms, then list the follow-up questions",
+            now=now,
+        )
+
+        self.assertEqual(intent["intent"], "create_event")
+        self.assertEqual(intent["title"], "Dentist")
+        self.assertEqual(
+            intent["description"],
+            "Noah help me prepare the forms, then list the follow-up questions",
+        )
+        self.assertFalse(intent["metadata"]["assistant_help_needed"])
+
     def test_monthly_and_yearly_recurrence_dates_are_not_advanced_incorrectly(self):
         reference = datetime(2026, 8, 21, 20, 0, tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
 
