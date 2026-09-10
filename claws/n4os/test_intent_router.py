@@ -259,6 +259,78 @@ class FakeTasksClaw:
         return "Undid task action."
 
 
+class DiscussionTasksClaw(FakeTasksClaw):
+    def __init__(self):
+        super().__init__()
+        self.resolved_names = []
+        self.enforced_scope = []
+
+    def interpret_request(self, request, reference_time=None):
+        return _tasks_module().extract_intent(request, now=reference_time)
+
+    def _resolve_task_list(self, intent):
+        self.resolved_names.append(intent.get("task_list_name"))
+        return "discussions-id", None
+
+    def add_task_from_request(
+        self,
+        request,
+        reference_time=None,
+        semantic_intent=None,
+    ):
+        self.calls.append(("create", request, reference_time, semantic_intent))
+
+    def recommend_tasks_from_request(
+        self,
+        request,
+        reference_time=None,
+        semantic_intent=None,
+        task_list_id="@default",
+    ):
+        self.calls.append(("recommend", request, reference_time, task_list_id, semantic_intent))
+
+    def update_task_from_request(
+        self,
+        request,
+        task_id=None,
+        task_list_id="@default",
+        semantic_intent=None,
+        enforce_task_list_scope=False,
+    ):
+        self.enforced_scope.append(enforce_task_list_scope)
+        self.calls.append(("update", request, task_list_id, semantic_intent))
+
+    def complete_task_from_request(
+        self,
+        request,
+        task_id=None,
+        task_list_id="@default",
+        enforce_task_list_scope=False,
+        query=None,
+    ):
+        self.enforced_scope.append(enforce_task_list_scope)
+        return super().complete_task_from_request(
+            request,
+            task_id=task_id,
+            task_list_id=task_list_id,
+        )
+
+    def delete_task_from_request(
+        self,
+        request,
+        task_id=None,
+        task_list_id="@default",
+        enforce_task_list_scope=False,
+        query=None,
+    ):
+        self.enforced_scope.append(enforce_task_list_scope)
+        return super().delete_task_from_request(
+            request,
+            task_id=task_id,
+            task_list_id=task_list_id,
+        )
+
+
 class FailedTasksClaw(FakeTasksClaw):
     def update_task_from_request(self, request, task_id=None):
         self.target_ids.append(task_id)
@@ -1123,6 +1195,386 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(frame.route, "tasks")
         self.assertEqual(frame.action, "complete_task")
 
+    def test_command_like_speech_routes_full_lifecycle_without_previous_context(self):
+        cases = (
+            ("Calendar add Emery's birthday on September 21st", "calendar", "create_event"),
+            ("Calendar update Emery's birthday to September 22nd", "calendar", "update_event"),
+            ("Calendar delete Emery's birthday", "calendar", "delete_event"),
+            ("Task add RSVP for Emery's birthday", "tasks", "create_task"),
+            ("Task update RSVP owner mom", "tasks", "update_task"),
+            ("Task done RSVP", "tasks", "complete_task"),
+            ("Task delete RSVP", "tasks", "delete_task"),
+            ("Discussion add RSVP for Emery's birthday", "tasks", "create_task"),
+            ("Discussion recommend tasks for today", "tasks", "recommend_tasks"),
+            ("Discussion what is due today", "tasks", "recommend_tasks"),
+            ("Discussion update RSVP owner mom", "tasks", "update_task"),
+            ("Discussion done RSVP", "tasks", "complete_task"),
+            ("Discussion delete RSVP", "tasks", "delete_task"),
+        )
+
+        for request, route, action in cases:
+            with self.subTest(request=request):
+                frame = interpret_request(request, now=REFERENCE_TIME)
+
+                self.assertEqual(frame.route, route)
+                self.assertEqual(frame.action, action)
+                self.assertEqual(frame.decision_source, "explicit")
+
+    def test_spoken_slash_command_routes_explicitly(self):
+        frame = interpret_request(
+            "Slash discussion add RSVP for Emery's birthday",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(frame.route, "tasks")
+        self.assertEqual(frame.action, "create_task")
+        self.assertEqual(frame.decision_source, "explicit")
+        self.assertEqual(frame.slots.get("task_list_name"), "Discussions")
+
+    def test_spoken_slash_command_requires_alias_boundary(self):
+        for request in (
+            "Slash discussiondelete school enrollment",
+            "Slash calendaradd dentist tomorrow at 3",
+        ):
+            with self.subTest(request=request):
+                frame = interpret_request(request, now=REFERENCE_TIME)
+                self.assertNotEqual(frame.decision_source, "explicit")
+
+    def test_discussion_create_extracts_topic_participants_due_and_list(self):
+        frame = interpret_request(
+            "/discussion add talk about Navaya's class drop of time enrollment. "
+            "Nimesh & Niyati. When: Today",
+            now=datetime(2026, 9, 9, 10, 0, tzinfo=ZoneInfo("America/Los_Angeles")),
+        )
+
+        self.assertEqual(frame.route, "tasks")
+        self.assertEqual(frame.action, "create_task")
+        self.assertEqual(
+            frame.slots.get("title"),
+            "Talk about Navaya's class drop of time enrollment",
+        )
+        self.assertEqual(frame.slots.get("notes"), "Participants: Nimesh & Niyati")
+        self.assertEqual(frame.slots.get("due"), "2026-09-09")
+        self.assertEqual(frame.slots.get("metadata", {}).get("owner"), "both")
+        self.assertEqual(frame.slots.get("task_list_name"), "Discussions")
+
+    def test_discussion_routes_full_lifecycle_variants(self):
+        cases = (
+            ("/discussion create call the school", "create_task"),
+            ("/discussion new call the school", "create_task"),
+            ("/discussion list", "recommend_tasks"),
+            ("/discussion show today", "recommend_tasks"),
+            ("/discussion update school enrollment to Friday", "update_task"),
+            ("/discussion change school enrollment to Friday", "update_task"),
+            ("/discussion edit school enrollment to Friday", "update_task"),
+            ("/discussion reschedule school enrollment to Friday", "update_task"),
+            ("/discussion assign school enrollment to Nimesh", "update_task"),
+            ("/discussion done school enrollment", "complete_task"),
+            ("/discussion complete school enrollment", "complete_task"),
+            ("/discussion completed school enrollment", "complete_task"),
+            ("/discussion finished school enrollment", "complete_task"),
+            ("/discussion mark done school enrollment", "complete_task"),
+            ("/discussion delete school enrollment", "delete_task"),
+            ("/discussion remove school enrollment", "delete_task"),
+        )
+
+        for request, action in cases:
+            with self.subTest(request=request):
+                frame = interpret_request(request, now=REFERENCE_TIME)
+                self.assertEqual(frame.route, "tasks")
+                self.assertEqual(frame.action, action)
+                self.assertEqual(frame.slots.get("task_list_name"), "Discussions")
+
+    def test_discussion_unknown_participants_stay_notes_without_guessed_owner(self):
+        frame = interpret_request(
+            "/discussion add review enrollment. Participants: Teacher Patel. When: tomorrow",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(frame.slots.get("title"), "Review enrollment")
+        self.assertEqual(frame.slots.get("notes"), "Participants: Teacher Patel")
+        self.assertEqual(frame.slots.get("metadata", {}).get("owner"), "unknown")
+
+    def test_discussion_participants_append_to_explicit_notes(self):
+        frame = interpret_request(
+            "/discussion add title: Review enrollment. Notes: Bring paperwork. "
+            "Participants: Nimesh",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(
+            frame.slots.get("notes"),
+            "Bring paperwork\n\nParticipants: Nimesh",
+        )
+
+    def test_discussion_create_merges_missing_title_and_due(self):
+        frame = interpret_request(
+            "/discussion add When: nonsense",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(frame.missing_fields, ["title", "due"])
+
+    def test_unsupported_discussion_command_returns_clarification(self):
+        for request in (
+            "/discussion frobnicate",
+            "/discussion frobnicate records tomorrow at 3",
+        ):
+            with self.subTest(request=request):
+                frame = interpret_request(request, now=REFERENCE_TIME)
+                self.assertEqual(frame.route, "unknown")
+                self.assertEqual(frame.action, "unknown")
+                self.assertEqual(frame.followup_kind, "clarification")
+                self.assertIn("/discussion help", frame.clarification_question or "")
+
+    def test_discussion_reschedule_extracts_due_update_without_ai(self):
+        frame = interpret_request(
+            "/discussion reschedule school enrollment to next Friday",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(frame.action, "update_task")
+        self.assertEqual(frame.slots.get("query"), "school enrollment")
+        self.assertEqual(frame.slots.get("update", {}).get("due"), "2026-07-10")
+
+    def test_discussion_due_on_keeps_due_out_of_target(self):
+        frame = interpret_request(
+            "/discussion update school enrollment due on Friday",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(frame.slots.get("query"), "school enrollment")
+        self.assertEqual(frame.slots.get("update", {}).get("due"), "2026-07-03")
+
+    def test_discussion_owner_update_extracts_named_target_without_ai(self):
+        for request in (
+            "Discussion update RSVP owner mom",
+            "Discussion assign RSVP to Niyati",
+            "Discussion change RSVP to mom",
+        ):
+            with self.subTest(request=request):
+                frame = interpret_request(request, now=REFERENCE_TIME)
+
+                self.assertEqual(frame.action, "update_task")
+                self.assertEqual(frame.slots.get("query"), "RSVP")
+                self.assertEqual(frame.slots.get("update", {}).get("owner"), "mom")
+
+    def test_discussion_owner_update_is_not_reparsed_as_due_update(self):
+        frame = interpret_request(
+            "/discussion assign call school on Friday to Niyati",
+            now=REFERENCE_TIME,
+        )
+
+        self.assertEqual(frame.slots.get("query"), "call school on Friday")
+        self.assertEqual(frame.slots.get("update"), {"owner": "mom"})
+
+    def test_discussion_dispatch_scopes_every_operation_to_discussions_list(self):
+        cases = (
+            ("/discussion add call the school", "create"),
+            ("/discussion list", "recommend"),
+            ("/discussion update call the school owner mom", "update"),
+            ("/discussion done call the school", "complete"),
+            ("/discussion delete call the school", "delete"),
+        )
+
+        for request, operation in cases:
+            with self.subTest(request=request):
+                tasks = DiscussionTasksClaw()
+                claw = N4OSClaw(calendar_claw=FakeCalendarClaw(), tasks_claw=tasks)
+                with redirect_stdout(StringIO()):
+                    decision = claw.handle_request(request, reference_time=REFERENCE_TIME)
+
+                self.assertEqual(decision["route"], "tasks")
+                self.assertEqual(tasks.resolved_names, ["Discussions"])
+                self.assertEqual(tasks.calls[0][0], operation)
+                if operation == "create":
+                    self.assertEqual(tasks.calls[0][3]["task_list_name"], "Discussions")
+                elif operation == "recommend":
+                    self.assertEqual(tasks.calls[0][3], "discussions-id")
+                elif operation in {"complete", "delete"}:
+                    self.assertEqual(tasks.task_list_ids, ["discussions-id"])
+                else:
+                    self.assertEqual(tasks.calls[0][2], "discussions-id")
+                    self.assertEqual(tasks.calls[0][3]["query"], "call the school")
+                    self.assertEqual(tasks.calls[0][3]["update"]["owner"], "mom")
+                if operation in {"update", "complete", "delete"}:
+                    self.assertEqual(tasks.enforced_scope, [True])
+
+    def test_discussion_dispatch_preserves_ai_normalized_assignment_target(self):
+        class RefinedDiscussionTasksClaw(DiscussionTasksClaw):
+            def interpret_request(self, request, reference_time=None):
+                return {
+                    "intent": "update_task",
+                    "query": "corrected enrollment title",
+                    "update": {"owner": "mom"},
+                    "missing_fields": [],
+                }
+
+        tasks = RefinedDiscussionTasksClaw()
+        claw = N4OSClaw(calendar_claw=FakeCalendarClaw(), tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            claw.handle_request(
+                "/discussion assign school enrollment to Nimesh",
+                reference_time=REFERENCE_TIME,
+            )
+
+        semantic_intent = tasks.calls[0][3]
+        self.assertEqual(semantic_intent["query"], "corrected enrollment title")
+        self.assertEqual(semantic_intent["update"], {"owner": "mom"})
+        self.assertEqual(semantic_intent["task_list_name"], "Discussions")
+
+    def test_discussion_merge_removes_satisfied_semantic_missing_title(self):
+        class MissingTitleDiscussionTasksClaw(DiscussionTasksClaw):
+            def interpret_request(self, request, reference_time=None):
+                return {
+                    "intent": "create_task",
+                    "title": None,
+                    "metadata": {"owner": "unknown"},
+                    "missing_fields": ["title"],
+                }
+
+        tasks = MissingTitleDiscussionTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            claw.handle_request(
+                "/discussion add call the school",
+                reference_time=REFERENCE_TIME,
+            )
+
+        semantic_intent = tasks.calls[0][3]
+        self.assertEqual(semantic_intent["title"], "Call the school")
+        self.assertEqual(semantic_intent["missing_fields"], [])
+
+    def test_discussion_create_reaches_google_provider_with_discussions_list_id(self):
+        class Provider:
+            def __init__(self):
+                self.created = []
+
+            def list_task_lists(self):
+                return [{"id": "discussions-id", "title": "Discussions"}]
+
+            def create_task(
+                self,
+                title,
+                notes=None,
+                due=None,
+                task_list_id="@default",
+            ):
+                self.created.append(
+                    {
+                        "title": title,
+                        "notes": notes,
+                        "due": due,
+                        "task_list_id": task_list_id,
+                    }
+                )
+                return {"id": "discussion-1", "title": title, "notes": notes, "due": due}
+
+        provider = Provider()
+        tasks = _tasks_module().FamilyTasksClaw.from_provider(provider)
+        tasks.auto_run_assistant_help = False
+        claw = N4OSClaw(calendar_claw=FakeCalendarClaw(), tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "/discussion add talk about enrollment. Nimesh & Niyati. When: Today",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(len(provider.created), 1)
+        created = provider.created[0]
+        self.assertEqual(created["task_list_id"], "discussions-id")
+        self.assertEqual(created["title"], "Talk about enrollment")
+        self.assertEqual(created["due"], "2026-07-03")
+        self.assertIn("Participants: Nimesh & Niyati", created["notes"])
+
+    def test_discussion_reschedule_updates_google_task_without_ai(self):
+        class Provider:
+            def __init__(self):
+                self.updated = []
+
+            def list_task_lists(self):
+                return [{"id": "discussions-id", "title": "Discussions"}]
+
+            def list_tasks(self, task_list_id="@default", show_completed=False):
+                return [
+                    {
+                        "id": "discussion-1",
+                        "title": "School enrollment",
+                        "notes": None,
+                        "due": None,
+                        "status": "needsAction",
+                    }
+                ]
+
+            def update_task(
+                self,
+                task_id,
+                title=None,
+                notes=None,
+                due=None,
+                status=None,
+                task_list_id="@default",
+            ):
+                self.updated.append(
+                    {
+                        "task_id": task_id,
+                        "due": due,
+                        "task_list_id": task_list_id,
+                    }
+                )
+                return {
+                    "id": task_id,
+                    "title": title or "School enrollment",
+                    "notes": notes,
+                    "due": due,
+                    "status": status or "needsAction",
+                }
+
+        provider = Provider()
+        tasks = _tasks_module().FamilyTasksClaw.from_provider(provider)
+        claw = N4OSClaw(calendar_claw=FakeCalendarClaw(), tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "/discussion reschedule school enrollment to next Friday",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(decision["route"], "tasks")
+        self.assertEqual(
+            provider.updated,
+            [
+                {
+                    "task_id": "discussion-1",
+                    "due": "2026-07-10",
+                    "task_list_id": "discussions-id",
+                }
+            ],
+        )
+
+    def test_discussion_missing_list_never_falls_back_or_mutates(self):
+        class MissingDiscussionTasksClaw(DiscussionTasksClaw):
+            def _resolve_task_list(self, intent):
+                self.resolved_names.append(intent.get("task_list_name"))
+                return "@default", "I couldn't uniquely find the task list Discussions."
+
+        tasks = MissingDiscussionTasksClaw()
+        claw = N4OSClaw(calendar_claw=FakeCalendarClaw(), tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            decision = claw.handle_request(
+                "/discussion add call the school",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(tasks.resolved_names, ["Discussions"])
+        self.assertEqual(tasks.calls, [])
+        self.assertIn("couldn't uniquely find", decision["response"])
+
     def test_as_task_phrase_routes_to_task_creation_not_decision(self):
         frame = interpret_request("create a plan as a task", now=REFERENCE_TIME)
 
@@ -1626,6 +2078,92 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(second["route"], "tasks")
         self.assertEqual(tasks.calls[-1], ("update", "assign it to nimesh", None))
         self.assertEqual(home_board.calls, [])
+
+    def test_add_name_as_owner_still_modifies_previous_task(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            claw.handle_request(
+                "Add task replace furnace filter",
+                reference_time=REFERENCE_TIME,
+            )
+            result = claw.handle_request(
+                "add Nimesh as owner",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(result["action"], "update_task")
+        self.assertEqual(tasks.calls[-1], ("update", "add Nimesh as owner", None))
+
+    def test_spoken_discussion_create_does_not_modify_previous_task(self):
+        tasks = DiscussionTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            claw.handle_request(
+                "Add task Discuss if Navya's time needs to change to 8:35 am",
+                reference_time=REFERENCE_TIME,
+            )
+            result = claw.handle_request(
+                "Discussion add Emery's birthday for Navya on September 21st RSVP.",
+                reference_time=REFERENCE_TIME,
+                source="telegram_voice",
+            )
+
+        self.assertEqual(result["route"], "tasks")
+        self.assertEqual(result["action"], "create_task")
+        self.assertEqual(tasks.resolved_names, ["Discussions"])
+        self.assertEqual(tasks.calls[-1][0], "create")
+        self.assertEqual(tasks.calls[-1][3]["task_list_name"], "Discussions")
+
+    def test_command_like_creates_do_not_modify_previous_objects(self):
+        tasks = FakeTasksClaw()
+        task_claw = N4OSClaw(tasks_claw=tasks)
+        calendar = FakeCalendarClaw()
+        calendar_claw = N4OSClaw(calendar_claw=calendar)
+
+        with redirect_stdout(StringIO()):
+            task_claw.handle_request(
+                "Add task replace furnace filter",
+                reference_time=REFERENCE_TIME,
+            )
+            task_result = task_claw.handle_request(
+                "Task add RSVP for Navya",
+                reference_time=REFERENCE_TIME,
+                source="telegram_voice",
+            )
+            calendar_claw.handle_request(
+                "Add calendar event dentist tomorrow at 3 PM",
+                reference_time=REFERENCE_TIME,
+            )
+            calendar_result = calendar_claw.handle_request(
+                "Calendar add Emery's birthday for Navya on September 21st",
+                reference_time=REFERENCE_TIME,
+                source="telegram_voice",
+            )
+
+        self.assertEqual(task_result["action"], "create_task")
+        self.assertEqual([call[0] for call in tasks.calls], ["create", "create"])
+        self.assertEqual(calendar_result["action"], "create_event")
+        self.assertEqual([call[0] for call in calendar.calls], ["create", "create"])
+
+    def test_unqualified_add_for_name_never_mutates_previous_task(self):
+        tasks = FakeTasksClaw()
+        claw = N4OSClaw(tasks_claw=tasks)
+
+        with redirect_stdout(StringIO()):
+            claw.handle_request(
+                "Add task replace furnace filter",
+                reference_time=REFERENCE_TIME,
+            )
+            result = claw.handle_request(
+                "Add RSVP for Navya",
+                reference_time=REFERENCE_TIME,
+            )
+
+        self.assertEqual(result["route"], "unknown")
+        self.assertEqual(tasks.calls, [("create", "Add task replace furnace filter", REFERENCE_TIME)])
 
     def test_task_note_followup_modifies_previous_task(self):
         tasks = FakeTasksClaw()

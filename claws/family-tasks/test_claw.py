@@ -1759,6 +1759,97 @@ class FamilyTasksClawTest(unittest.TestCase):
         self.assertEqual(provider.listed_list_ids, ["school-id"])
         self.assertEqual(provider.deleted_list_ids, ["school-id"])
 
+    def test_enforced_list_scope_rejects_pronoun_delete_from_another_list(self):
+        provider = NamedListProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        claw.last_created_task = {
+            "id": "school-task",
+            "title": "School task",
+            "_n4os_task_list_id": "school-id",
+        }
+
+        with redirect_stdout(StringIO()):
+            message = claw.delete_task_from_request(
+                "delete it",
+                task_list_id="default-id",
+                query="it",
+                enforce_task_list_scope=True,
+            )
+
+        self.assertIn("in that task list", message)
+        self.assertEqual(provider.listed_list_ids, [])
+        self.assertEqual(provider.deleted_list_ids, [])
+
+    def test_enforced_list_scope_rejects_pronoun_completion_from_another_list(self):
+        provider = NamedListProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        claw.last_created_task = {
+            "id": "school-task",
+            "title": "School task",
+            "_n4os_task_list_id": "school-id",
+        }
+
+        with redirect_stdout(StringIO()):
+            message = claw.complete_task_from_request(
+                "complete it",
+                task_list_id="default-id",
+                query="it",
+                enforce_task_list_scope=True,
+            )
+
+        self.assertIn("in that task list", message)
+        self.assertEqual(provider.listed_list_ids, [])
+        self.assertEqual(provider.completed, [])
+
+    def test_enforced_list_scope_rejects_targetless_update_from_another_list(self):
+        provider = NamedListProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        claw.last_created_task = {
+            "id": "school-task",
+            "title": "School task",
+            "_n4os_task_list_id": "school-id",
+        }
+
+        with redirect_stdout(StringIO()):
+            message = claw.update_task_from_request(
+                "owner is nimesh",
+                task_list_id="default-id",
+                enforce_task_list_scope=True,
+            )
+
+        self.assertIn("in that task list", message)
+        self.assertEqual(provider.updated_list_ids, [])
+
+    def test_enforced_list_scope_accepts_pronoun_update_in_same_list(self):
+        provider = NamedListProvider()
+        task = {
+            "id": "school-task",
+            "title": "School task",
+            "notes": None,
+            "due": None,
+            "status": "needsAction",
+            "_n4os_task_list_id": "school-id",
+        }
+        provider.tasks = [task]
+        claw = FamilyTasksClaw.from_provider(provider)
+        claw.last_created_task = task
+        semantic_intent = {
+            "intent": "update_task",
+            "query": "it",
+            "update": {"due": "2026-08-28"},
+        }
+
+        with redirect_stdout(StringIO()):
+            message = claw.update_task_from_request(
+                "reschedule it to Friday",
+                task_list_id="school-id",
+                semantic_intent=semantic_intent,
+                enforce_task_list_scope=True,
+            )
+
+        self.assertIn("due=2026-08-28", message)
+        self.assertEqual(provider.updated_list_ids, ["school-id"])
+
     def test_local_create_resolves_named_task_list_without_ai(self):
         provider = NamedListProvider()
         claw = FamilyTasksClaw.from_provider(provider)
@@ -1804,6 +1895,101 @@ class FamilyTasksClawTest(unittest.TestCase):
 
         self.assertEqual(intent["task_list_name"], "School")
         self.assertIsNone(intent["task_list_id_hint"])
+
+    def test_new_task_does_not_inherit_previous_task_as_list(self):
+        provider = NamedListProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        claw.last_created_task = {
+            "id": "previous-task",
+            "title": "Add mobile screen",
+            "_n4os_task_list_id": "school-id",
+        }
+        claw.field_extractor = FakeFieldExtractor(
+            {
+                "intent": "create_task",
+                "title": "Return wheels",
+                "task_list_name": "Add mobile screen",
+                "task_list_id_hint": "school-id",
+                "metadata": {"owner": "unknown"},
+                "missing_fields": [],
+            }
+        )
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request("/task return wheels")
+
+        self.assertIn("Created task: Return wheels", message)
+        self.assertEqual(provider.created_list_ids, ["@default"])
+
+    def test_first_task_preserves_explicit_ai_task_list_id(self):
+        provider = NamedListProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        claw.field_extractor = FakeFieldExtractor(
+            {
+                "intent": "create_task",
+                "title": "Return wheels",
+                "task_list_name": None,
+                "task_list_id_hint": "school-id",
+                "metadata": {"owner": "unknown"},
+                "missing_fields": [],
+            }
+        )
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request("/task return wheels")
+
+        self.assertIn("Created task: Return wheels", message)
+        self.assertEqual(provider.created_list_ids, ["school-id"])
+
+    def test_new_task_does_not_inherit_previous_task_list_id_only(self):
+        provider = NamedListProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        claw.last_created_task = {
+            "id": "previous-task",
+            "title": "Previous task",
+            "_n4os_task_list_id": "school-id",
+        }
+        claw.field_extractor = FakeFieldExtractor(
+            {
+                "intent": "create_task",
+                "title": "Return wheels",
+                "task_list_name": None,
+                "task_list_id_hint": "school-id",
+                "metadata": {"owner": "unknown"},
+                "missing_fields": [],
+            }
+        )
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request("/task return wheels")
+
+        self.assertIn("Created task: Return wheels", message)
+        self.assertEqual(provider.created_list_ids, ["@default"])
+
+    def test_new_task_preserves_explicit_named_list_with_previous_list_id(self):
+        provider = NamedListProvider()
+        claw = FamilyTasksClaw.from_provider(provider)
+        claw.last_created_task = {
+            "id": "previous-task",
+            "title": "Previous task",
+            "_n4os_task_list_id": "school-id",
+        }
+        claw.field_extractor = FakeFieldExtractor(
+            {
+                "intent": "create_task",
+                "title": "Return wheels",
+                "task_list_name": "School",
+                "task_list_id_hint": "school-id",
+                "metadata": {"owner": "unknown"},
+                "missing_fields": [],
+            }
+        )
+
+        with redirect_stdout(StringIO()):
+            message = claw.add_task_from_request("Add task return wheels under School")
+
+        self.assertIn("Created task: Return wheels", message)
+        self.assertEqual(provider.created_list_ids, ["school-id"])
 
     def test_task_list_resolution_accepts_list_suffix(self):
         claw = FamilyTasksClaw.from_provider(NamedListProvider())

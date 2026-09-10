@@ -27,6 +27,7 @@ These slash aliases route directly into a domain claw.
 | Capture | `/capture`, `/note`, `/mem`, `/mem-inbox` | Capture family observations, journal notes, and Markdown learning notes. |
 | Calendar | `/calendar`, `/calender`, `/calnedar`, `/event`, `/schedule` | Create, list, move/update, delete/cancel events, add guests, family briefings, preparation checklists, and Nysha timetable photo updates. |
 | Tasks | `/task`, `/tasks`, `/todo`, `/todos` | Create, recommend/list, update, complete, delete tasks, run Noah assistant help. |
+| Discussions | `/discussion` | Create, list, update, complete, and delete items in the `Discussions` Google Tasks list. |
 | Shopping | `/cart`, `/shop`, `/shopping` | List lists/items, add, check off, uncheck, delete, move, or clear shopping items. |
 | Home Board | `/home`, `/homeboard`, `/home-board` | Add/list home board items, bulk add items, mark items done. |
 | Decisions | `/decision`, `/decisions`, `/backlog` | Add backlog items, list backlog/decisions, add notes/options/evidence/next steps, position/move/pin/park/close items, record decisions. |
@@ -89,6 +90,7 @@ These are supported without slash commands when the intent is clear.
 | --- | --- |
 | Calendar | `add event dentist tomorrow at 4 PM`, `move dinner to Saturday`, `show tomorrow's calendar`, `give me today's briefing`, `Update Nysha school calendar from this image` |
 | Tasks | `add task call FUSD tomorrow morning`, `complete task call FUSD`, `delete task call FUSD`, `show urgent tasks due this week` |
+| Discussions | `/discussion add talk about school enrollment. Nimesh & Niyati. When: Today`, `/discussion list`, `/discussion done school enrollment` |
 | Homework | `homework status`, send a homework photo with a homework caption, `cancel` for pending duplicate prompts |
 | Shopping | `add milk to Costco`, `Indian grocery done`, `what's on my Whole Foods list?` |
 | Reading Garden | `Nysha read 8 pages of Mercy Watson by herself`, `library checkout: Mercy Watson, Frog and Toad`, `Delete Nysha latest reading entry` |

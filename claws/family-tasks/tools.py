@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import errno
+import ssl
 from typing import Any, Literal, Protocol, TypedDict
+
+from google.auth.exceptions import TransportError
+from httplib2 import HttpLib2Error
 
 from constants import DEFAULT_TASK_LIST_ID
 from intent import normalize_metadata, write_human_notes, write_metadata_to_notes
@@ -96,15 +101,69 @@ def _confirmation_response(action: str, task_id: str) -> ToolResponse:
     }
 
 
-def _provider_error_response(error: Exception) -> ToolResponse:
+def _is_transport_error(error: Exception) -> bool:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (ConnectionError, TimeoutError, ssl.SSLError, TransportError, HttpLib2Error)):
+            return True
+        if isinstance(current, OSError) and current.errno in {
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+            errno.EPIPE,
+            errno.ETIMEDOUT,
+        }:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _http_status(error: Exception) -> int | None:
+    status = getattr(getattr(error, "resp", None), "status", None)
+    return status if isinstance(status, int) else None
+
+
+def _provider_error_response(
+    error: Exception,
+    *,
+    operation: Literal["read", "create", "change"] = "read",
+) -> ToolResponse:
     error_text = str(error)
-    if "invalid_scope" in error_text:
+    if "invalid_grant" in error_text:
+        message = (
+            "Google Tasks needs to be reconnected. Run python3 get_google_token.py, "
+            "complete the browser sign-in, then restart the Telegram bot."
+        )
+    elif "invalid_scope" in error_text:
         message = (
             "Google OAuth token is missing the Tasks scope. Run "
-            "`python get_google_token.py`, complete the browser consent, then retry."
+            "python3 get_google_token.py, complete the browser consent, then retry."
         )
+    elif _is_transport_error(error) or _http_status(error) in {429, 500, 502, 503, 504}:
+        # A transport failure can arrive after Google accepted a write. Do not
+        # invite a blind retry because Tasks inserts have no idempotency key.
+        if operation == "create":
+            message = (
+                "I couldn't confirm whether Google Tasks created it. Check Google "
+                "Tasks before retrying so you don't create a duplicate."
+            )
+        elif operation == "change":
+            message = (
+                "I couldn't confirm the change with Google Tasks. Check the task's "
+                "current state before retrying."
+            )
+        else:
+            message = "I couldn't reach Google Tasks just now. Please try again."
+    elif _http_status(error) in {401, 403}:
+        message = "Google Tasks access needs attention. Reconnect Google, then try again."
+    elif _http_status(error) == 404:
+        message = "Google Tasks couldn't find that task or list. Refresh your tasks and try again."
+    elif _http_status(error) == 400:
+        message = "Google Tasks couldn't accept that request. Check the task details and try again."
     else:
-        message = f"Google Tasks request failed: {error_text}"
+        message = "Google Tasks couldn't complete that request. Please try again."
 
     return {
         "status": "error",
@@ -157,7 +216,7 @@ class FamilyTaskTools:
                 task_list_id=task_list_id,
             )
         except Exception as error:
-            return _provider_error_response(error)
+            return _provider_error_response(error, operation="create")
 
         if metadata is not None:
             task["_n4os_metadata"] = normalize_metadata(metadata)
@@ -229,7 +288,7 @@ class FamilyTaskTools:
                 task_list_id=task_list_id,
             )
         except Exception as error:
-            return _provider_error_response(error)
+            return _provider_error_response(error, operation="change")
 
         if metadata is not None:
             task["_n4os_metadata"] = normalize_metadata(metadata)
@@ -258,7 +317,7 @@ class FamilyTaskTools:
                 task_list_id=task_list_id,
             )
         except Exception as error:
-            return _provider_error_response(error)
+            return _provider_error_response(error, operation="change")
 
         return {
             "status": "ok",
@@ -284,7 +343,7 @@ class FamilyTaskTools:
                 task_list_id=task_list_id,
             )
         except Exception as error:
-            return _provider_error_response(error)
+            return _provider_error_response(error, operation="change")
 
         return {
             "status": "ok",

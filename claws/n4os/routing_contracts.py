@@ -17,6 +17,7 @@ RouteId = Literal[
     "both",
     "unknown",
 ]
+DISCUSSION_TASK_LIST_NAME = "Discussions"
 DecisionSource = Literal["explicit", "rules", "llm", "clarification"]
 OperationStatus = Literal["success", "clarification", "failure", "noop"]
 
@@ -70,7 +71,7 @@ ROUTE_SPECS: tuple[RouteSpec, ...] = (
                 "run_assistant_help",
             }
         ),
-        command_aliases=("task", "tasks", "todo", "todos"),
+        command_aliases=("task", "tasks", "todo", "todos", "discussion"),
         mutating_actions=frozenset(
             {"create_task", "update_task", "complete_task", "delete_task", "run_assistant_help"}
         ),
@@ -197,6 +198,27 @@ COMMAND_RE = re.compile(
     r"(?:\s+|:\s*)?(?P<body>.*)$",
     re.DOTALL,
 )
+COMMAND_ALIAS_PATTERN = "|".join(
+    sorted((re.escape(alias) for alias in COMMAND_ROUTES), key=len, reverse=True)
+)
+COMMAND_ACTION_PATTERN = (
+    r"add|append|assign|brief|cancel|change|check|clear|close|complete|completed|"
+    r"can|create|delete|done|edit|find|finish|finished|give|help|how|list|lookup|mark|"
+    r"move|new|open|park|pin|plan|prepare|recommend|record|remove|reschedule|"
+    r"search|set|show|status|uncheck|update|view|what|which"
+)
+# Speech recognition commonly omits "/". Require a lifecycle verb before
+# treating a bare domain name as a command so ordinary prose keeps rule routing.
+SPOKEN_SLASH_COMMAND_RE = re.compile(
+    rf"^\s*slash\s+(?P<command>{COMMAND_ALIAS_PATTERN})"
+    rf"(?:(?:\s+|:\s*)(?P<body>.*))?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+COMMAND_ACTION_RE = re.compile(
+    rf"^\s*(?P<command>{COMMAND_ALIAS_PATTERN})(?:\s+|:\s*)"
+    rf"(?P<body>(?:{COMMAND_ACTION_PATTERN})\b.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -266,14 +288,22 @@ class OperationResult:
 
 
 def parse_explicit_route(text: str) -> ExplicitRoute | None:
-    match = COMMAND_RE.match(text)
+    match = (
+        COMMAND_RE.match(text)
+        or SPOKEN_SLASH_COMMAND_RE.match(text)
+        or COMMAND_ACTION_RE.match(text)
+    )
     if match is None:
         return None
     command = match.group("command").lower()
     route = COMMAND_ROUTES.get(command)
     if route is None:
         return None
-    return ExplicitRoute(route=route, command=command, body=match.group("body").strip())
+    return ExplicitRoute(
+        route=route,
+        command=command,
+        body=(match.group("body") or "").strip(),
+    )
 
 
 def is_valid_route_action(route: str, action: str) -> bool:

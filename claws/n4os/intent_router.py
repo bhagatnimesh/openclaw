@@ -14,6 +14,7 @@ try:
     from .input_normalizer import improve_entered_text
     from .prompts import CLARIFICATION_PROMPT
     from .routing_contracts import (
+        DISCUSSION_TASK_LIST_NAME,
         DecisionSource,
         ROUTE_REGISTRY,
         RouteCandidate,
@@ -26,6 +27,7 @@ except ImportError:
     from input_normalizer import improve_entered_text
     from prompts import CLARIFICATION_PROMPT
     from routing_contracts import (
+        DISCUSSION_TASK_LIST_NAME,
         DecisionSource,
         ROUTE_REGISTRY,
         RouteCandidate,
@@ -68,6 +70,191 @@ VALID_ROUTES = {
     for route, spec in ROUTE_REGISTRY.items()
     if spec.model_routable
 }
+
+
+def _normalize_discussion_body(body: str) -> str:
+    normalized = body.strip() or "list"
+    update_normalized = re.sub(
+        r"^\s*(?:change|edit|reschedule)(?=\s|$)",
+        "update",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"^\s*(?:new)(?=\s|$)",
+        "add",
+        update_normalized,
+        flags=re.IGNORECASE,
+    )
+
+
+def _is_supported_discussion_body(body: str) -> bool:
+    return re.match(
+        r"^\s*(?:add|create|new|show|list|what|which|recommend|give|"
+        r"update|change|edit|reschedule|assign|set|make|put|"
+        r"complete|completed|finish|finished|done|mark\s+(?:task\s+)?done|"
+        r"delete|remove|help|how\s+do\s+i|how\s+to|what\s+command|commands?|\?)\b",
+        body,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _discussion_participant_owner(participants: str, tasks_module: ModuleType) -> str | None:
+    aliases = getattr(tasks_module, "OWNER_ALIASES", {})
+    if not isinstance(aliases, dict):
+        return None
+    names = [
+        value.strip().lower()
+        for value in re.split(r"\s*(?:&|,|\band\b)\s*", participants, flags=re.IGNORECASE)
+        if value.strip()
+    ]
+    owners = {str(aliases.get(name) or "") for name in names}
+    if not names or "" in owners:
+        return None
+    if owners == {"dad", "mom"}:
+        return "both"
+    if len(owners) == 1:
+        return owners.pop()
+    return None
+
+
+def _discussion_create_intent(
+    body: str,
+    now: datetime | None,
+    tasks_module: ModuleType,
+) -> tuple[str, dict[str, Any]]:
+    content = re.sub(
+        r"^\s*(?:add|create|new)\b(?:\s+(?:a\s+)?discussion\b)?\s*",
+        "",
+        body,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+    due_match = re.search(
+        r"(?:^|[.!?]\s+|\n)when\s*:\s*(?P<when>.+?)\s*$",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    when_text = due_match.group("when").strip(" .") if due_match else None
+    discussion_text = content[: due_match.start()].rstrip(" .") if due_match else content
+
+    participants_match = re.search(
+        r"(?:^|[.!?]\s+|\n)participants?\s*:\s*(?P<participants>.+?)\s*$",
+        discussion_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    participants = None
+    if participants_match:
+        participants = participants_match.group("participants").strip(" .")
+        discussion_text = discussion_text[: participants_match.start()].rstrip(" .")
+    else:
+        trailing_sentence = re.match(
+            r"^(?P<topic>.+?)[.!?]\s+(?P<participants>[^.!?]+)[.!?]?$",
+            discussion_text,
+            flags=re.DOTALL,
+        )
+        if trailing_sentence:
+            candidate = trailing_sentence.group("participants").strip()
+            if _discussion_participant_owner(candidate, tasks_module) is not None:
+                participants = candidate
+                discussion_text = trailing_sentence.group("topic").strip()
+
+    domain_request = f"add task: {discussion_text}".strip()
+    intent = tasks_module.extract_intent(domain_request, now=now)
+    if when_text:
+        due_intent = tasks_module.extract_intent(f"add task placeholder {when_text}", now=now)
+        intent["due"] = due_intent.get("due")
+        if intent["due"] is None:
+            missing_fields = list(intent.get("missing_fields") or [])
+            if "due" not in missing_fields:
+                missing_fields.append("due")
+            intent["missing_fields"] = missing_fields
+    if participants:
+        participant_notes = f"Participants: {participants}"
+        existing_notes = str(intent.get("notes") or "").strip()
+        intent["notes"] = (
+            f"{existing_notes}\n\n{participant_notes}" if existing_notes else participant_notes
+        )
+        owner = _discussion_participant_owner(participants, tasks_module)
+        if owner is not None:
+            metadata = dict(intent.get("metadata") or {})
+            metadata["owner"] = owner
+            intent["metadata"] = metadata
+    intent["task_list_name"] = DISCUSSION_TASK_LIST_NAME
+    intent["task_list_id_hint"] = None
+    return domain_request, intent
+
+
+def _add_discussion_owner_update(
+    intent: dict[str, Any],
+    request: str,
+    tasks_module: ModuleType,
+) -> None:
+    aliases = getattr(tasks_module, "OWNER_ALIASES", {})
+    if not isinstance(aliases, dict):
+        return
+    known_aliases = [alias for alias, owner in aliases.items() if owner != "unknown"]
+    owner_pattern = "|".join(
+        re.escape(alias) for alias in sorted(known_aliases, key=len, reverse=True)
+    )
+    if not owner_pattern:
+        return
+
+    assign_match = re.match(
+        rf"^\s*assign\s+(?P<target>.+?)\s+to\s+(?P<owner>{owner_pattern})\s*\.?$",
+        request,
+        flags=re.IGNORECASE,
+    )
+    update_match = re.match(
+        rf"^\s*(?:update|change|edit|set|make|put)\s+(?P<target>.+?)\s+"
+        rf"(?:(?:owner(?:\s+(?:is|to|as))?|owned\s+by|assigned\s+to|belongs\s+to)"
+        rf"\s*:?\s*|(?:to|for)\s+)(?P<owner>{owner_pattern})\s*\.?$",
+        request,
+        flags=re.IGNORECASE,
+    )
+    match = assign_match or update_match
+    if match is None:
+        return
+
+    owner = str(aliases.get(match.group("owner").lower()) or "")
+    if not owner:
+        return
+    intent["query"] = match.group("target").strip()
+    intent["update"] = {"owner": owner}
+
+
+def _add_discussion_due_update(
+    intent: dict[str, Any],
+    now: datetime | None,
+    tasks_module: ModuleType,
+) -> None:
+    if intent.get("update"):
+        return
+    query = str(intent.get("query") or "").strip()
+    match = re.match(
+        r"^(?P<target>.+)\s+(?:to|for|by|due(?:\s+on)?|(?<!due\s)on)\s+"
+        r"(?P<date>.+)$",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return
+    due_intent = tasks_module.extract_intent(
+        f"add task placeholder due {match.group('date')}",
+        now=now,
+    )
+    due = due_intent.get("due")
+    if not due:
+        return
+    intent["query"] = match.group("target").strip()
+    intent["update"] = {
+        "title": None,
+        "due": due,
+        "notes": None,
+        "owner": None,
+        "tags": [],
+        "assistant_help_request": None,
+    }
 VALID_FOLLOWUP_KINDS = {
     "none",
     "clarification",
@@ -144,11 +331,16 @@ ASSISTANT_HELP_MARKER_LINE_RE = re.compile(
     rf"(?:to\s+help|for\s+help)|(?:{ASSISTANT_NAME_PATTERN})\s*,?\s+help)\.?\s*$",
     re.IGNORECASE,
 )
+# A broad "add ... for ..." may be a new object. Only field-specific add
+# phrases may borrow the previous object as their implicit target.
 OBJECT_UPDATE_RE = re.compile(
     r"\b(?:assign|make|set|put|change|update)\b.*\b(?:to|for)\s+[\w'. -]+\s*$|"
-    r"\b(?:assign|add|append|modify|edit|update|set|make|change|put)\b"
+    r"\b(?:assign|append|modify|edit|update|set|make|change|put)\b"
     r".*\b(?:owner|owned|for|note|notes|description|context|"
     r"noah|novah|assistant|help)\b|"
+    r"\badd\s+(?:(?:an?|the)\s+)?(?:owner|note|notes|description|context|"
+    r"noah|novah|assistant|help)\b|"
+    r"\badd\s+[\w'. -]+\s+as\s+(?:the\s+)?owner\b|"
     r"\b(?:owner|owned\s+by|notes?|description|context)\s*"
     r"(?:(?:is|are)\b|:)|"
     r"\b(?:assign(?:ed)?\s+to|belongs\s+to)\b",
@@ -1146,7 +1338,21 @@ def _explicit_intent_frame(
             intent = {**intent, "intent": calendar_action_by_verb[direct_verb]}
     elif explicit.route == "tasks":
         tasks_module = _tasks_intent_module()
-        task_control_candidates = tasks_module.score_task_command_candidates(body, now=now)
+        is_discussion = explicit.command == "discussion"
+        if is_discussion and body.strip() and not _is_supported_discussion_body(body):
+            return N4OSIntentFrame(
+                route="unknown",
+                action="unknown",
+                confidence=0.0,
+                followup_kind="clarification",
+                missing_fields=["request"],
+                normalized_request=request,
+                clarification_question="Use /discussion help to see discussion commands.",
+                decision_source="clarification",
+            )
+        task_body = _normalize_discussion_body(body) if is_discussion else body
+        task_request = f"/task {task_body}" if is_discussion else body
+        task_control_candidates = tasks_module.score_task_command_candidates(task_request, now=now)
         if task_control_candidates and task_control_candidates[0].get("action") == "help_task":
             return N4OSIntentFrame(
                 route="unknown",
@@ -1154,7 +1360,11 @@ def _explicit_intent_frame(
                 confidence=0.0,
                 followup_kind="clarification",
                 normalized_request=request,
-                clarification_question="Use /task help to see task commands.",
+                clarification_question=(
+                    "Use /discussion help to see discussion commands."
+                    if is_discussion
+                    else "Use /task help to see task commands."
+                ),
                 decision_source="clarification",
                 candidates=(
                     RouteCandidate(
@@ -1172,13 +1382,38 @@ def _explicit_intent_frame(
         ]
         task_action = task_action_candidates[0] if task_action_candidates else None
         task_action_name = str(task_action.get("action") or "") if task_action is not None else ""
-        if task_action_name in {"complete_task", "delete_task", "update_task", "run_assistant_help"}:
+        if is_discussion and task_action is None:
+            return N4OSIntentFrame(
+                route="unknown",
+                action="unknown",
+                confidence=0.0,
+                followup_kind="clarification",
+                missing_fields=["request"],
+                normalized_request=request,
+                clarification_question="Use /discussion help to see discussion commands.",
+                decision_source="clarification",
+            )
+        if is_discussion and task_action_name == "create_task":
+            domain_request, intent = _discussion_create_intent(body, now, tasks_module)
+        elif task_action_name in {
+            "complete_task",
+            "delete_task",
+            "update_task",
+            "run_assistant_help",
+        } or is_discussion:
             domain_request = str(task_action.get("normalized_request"))
+            intent = tasks_module.extract_intent(domain_request, now=now)
         else:
             domain_request = improve_entered_text(request)
-        intent = tasks_module.extract_intent(domain_request, now=now)
+            intent = tasks_module.extract_intent(domain_request, now=now)
         if task_action_name == "update_task":
             intent = {**intent, "intent": task_action_name}
+            if is_discussion:
+                _add_discussion_owner_update(intent, domain_request, tasks_module)
+                _add_discussion_due_update(intent, now, tasks_module)
+        if is_discussion:
+            intent["task_list_name"] = DISCUSSION_TASK_LIST_NAME
+            intent["task_list_id_hint"] = None
     elif explicit.route == "shopping":
         domain_request = request
         intent = _shopping_intent_module().extract_intent(domain_request, now=now)

@@ -5360,6 +5360,45 @@ class TelegramBotTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Noah assistant help", HOW_TO_HELP["task"])
         self.assertEqual(claw.requests, [])
 
+    async def test_discussion_slash_help_lists_scoped_task_commands(self):
+        claw = FakeClaw()
+        bot = N4OSTelegramBot(
+            TelegramConfig(token="token", allowed_user_id=12345),
+            claw,
+            logger=QuietLogger(),
+        )
+        message = FakeMessage("/discussion help")
+
+        await bot.handle_message(FakeUpdate(12345, message), None)
+
+        self.assertEqual(message.replies, [HOW_TO_HELP["discussion"]])
+        self.assertIn("Discussions Google Tasks list", HOW_TO_HELP["discussion"])
+        self.assertIn("/discussion update", HOW_TO_HELP["discussion"])
+        self.assertEqual(claw.requests, [])
+
+    def test_command_like_discussion_help_uses_discussion_topic(self):
+        for request in (
+            "Discussion help",
+            "Slash discussion help",
+            "Discussion how do I update an item?",
+            "Discussion can I update an item?",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(
+                    _telegram_how_to_reply(request),
+                    HOW_TO_HELP["discussion"],
+                )
+
+    def test_command_like_natural_help_does_not_become_an_action(self):
+        self.assertEqual(
+            _telegram_how_to_reply("Calendar how do I add an event?"),
+            HOW_TO_HELP["event"],
+        )
+        self.assertEqual(
+            _telegram_how_to_reply("Note how to restart the dashboard"),
+            HOW_TO_HELP["note"],
+        )
+
     async def test_task_slash_help_question_gets_task_help_without_creating_task(self):
         claw = FakeClaw()
         bot = N4OSTelegramBot(

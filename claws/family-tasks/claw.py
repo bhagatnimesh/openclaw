@@ -910,6 +910,38 @@ class FamilyTasksClaw:
             if local_task_list_name:
                 extracted["task_list_name"] = local_task_list_name
                 extracted["task_list_id_hint"] = None
+            else:
+                inferred_list_name = _normalized_task_list_name(
+                    str(extracted.get("task_list_name") or "")
+                )
+                previous_task_title = _normalized_task_list_name(
+                    str((self.last_created_task or {}).get("title") or "")
+                )
+                inferred_list_id = str(extracted.get("task_list_id_hint") or "").strip()
+                previous_list_id = str(
+                    (self.last_created_task or {}).get(TASK_LIST_CONTEXT_KEY) or ""
+                ).strip()
+                inherited_list_id = bool(
+                    not inferred_list_name
+                    and inferred_list_id
+                    and previous_list_id
+                    and inferred_list_id == previous_list_id
+                    and inferred_list_id.lower() not in request.lower()
+                )
+                if (
+                    baseline.get("intent") == "create_task"
+                    and (
+                        inherited_list_id
+                        or (
+                            inferred_list_name
+                            and inferred_list_name in {"@default", previous_task_title}
+                        )
+                    )
+                ):
+                    # The semantic pass sees the previous task for true follow-ups,
+                    # but a new create must not reuse that task as its destination.
+                    extracted["task_list_name"] = None
+                    extracted["task_list_id_hint"] = None
             return extracted
         except Exception:
             return baseline
@@ -1310,6 +1342,7 @@ class FamilyTasksClaw:
         *,
         task_id: str | None = None,
         semantic_intent: dict[str, Any] | None = None,
+        enforce_task_list_scope: bool = False,
     ) -> str:
         self.last_result = {"status": "needs_information"}
         semantic_update = (
@@ -1352,13 +1385,19 @@ class FamilyTasksClaw:
                 return message
             return self._update_task(task, update, task_list_id)
 
-        if update.target is None:
+        normalized_target = " ".join(str(update.target or "").lower().split())
+        if update.target is None or normalized_target in PRONOUN_TARGETS:
             task = self.last_created_task
             if task is None:
                 message = "I do not know which task to update."
                 print(message)
                 return message
-            task_list_id = str(task.get(TASK_LIST_CONTEXT_KEY) or task_list_id)
+            remembered_list_id = str(task.get(TASK_LIST_CONTEXT_KEY) or "") or None
+            if enforce_task_list_scope and remembered_list_id != task_list_id:
+                message = "I couldn't find a matching task in that task list."
+                print(message)
+                return message
+            task_list_id = remembered_list_id or task_list_id
             return self._update_task(task, update, task_list_id)
 
         response = self.tools.list_tasks(task_list_id=task_list_id)
@@ -1683,6 +1722,7 @@ class FamilyTasksClaw:
         *,
         task_id: str | None = None,
         query: str | None = None,
+        enforce_task_list_scope: bool = False,
     ) -> str:
         return self._destructive_task_from_request(
             request=request,
@@ -1690,6 +1730,7 @@ class FamilyTasksClaw:
             task_list_id=task_list_id,
             task_id=task_id,
             query=query,
+            enforce_task_list_scope=enforce_task_list_scope,
         )
 
     def delete_task_from_request(
@@ -1699,6 +1740,7 @@ class FamilyTasksClaw:
         *,
         task_id: str | None = None,
         query: str | None = None,
+        enforce_task_list_scope: bool = False,
     ) -> str:
         return self._destructive_task_from_request(
             request=request,
@@ -1706,6 +1748,7 @@ class FamilyTasksClaw:
             task_list_id=task_list_id,
             task_id=task_id,
             query=query,
+            enforce_task_list_scope=enforce_task_list_scope,
         )
 
     def _destructive_task_from_request(
@@ -1715,16 +1758,22 @@ class FamilyTasksClaw:
         task_list_id: str,
         task_id: str | None = None,
         query: str | None = None,
+        enforce_task_list_scope: bool = False,
     ) -> str:
         self.last_result = {"status": "needs_information"}
         intent = extract_intent(request)
         query = query or intent.get("query")
         normalized_query = " ".join(str(query or "").lower().split())
         if not task_id and normalized_query in PRONOUN_TARGETS and self.last_created_task:
-            task_id = str(self.last_created_task.get("id") or "") or None
-            task_list_id = str(
-                self.last_created_task.get(TASK_LIST_CONTEXT_KEY) or task_list_id,
+            remembered_list_id = (
+                str(self.last_created_task.get(TASK_LIST_CONTEXT_KEY) or "") or None
             )
+            if enforce_task_list_scope and remembered_list_id != task_list_id:
+                message = "I couldn't find a matching task in that task list."
+                print(message)
+                return message
+            task_id = str(self.last_created_task.get("id") or "") or None
+            task_list_id = remembered_list_id or task_list_id
         if not query and not task_id:
             message = f"Please provide which task to {action}."
             print(message)

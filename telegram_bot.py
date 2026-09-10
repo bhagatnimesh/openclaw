@@ -43,7 +43,7 @@ else:
     TELEGRAM_IMPORT_ERROR = None
 
 from claws.n4os.claw import N4OSClaw
-from claws.n4os.routing_contracts import ROUTE_SPECS
+from claws.n4os.routing_contracts import ROUTE_SPECS, parse_explicit_route
 from claws.homework import HomeworkClaw
 from claws.homework.intent import extract_intent, has_homework_terms, is_homework_capture, is_learning_review
 from claws.school_coach import CoachProvenance, SchoolCoachClaw
@@ -303,6 +303,15 @@ HOW_TO_HELP = {
         "Delete: delete task call FUSD\n"
         "See: show urgent tasks due this week\n"
         "See: list all tasks for drive"
+    ),
+    "discussion": (
+        "Discussions are tasks kept in the Discussions Google Tasks list.\n\n"
+        "Send one of these:\n"
+        "Add: /discussion add talk about school enrollment. Nimesh & Niyati. When: Today\n"
+        "See: /discussion list or /discussion show today\n"
+        "Change: /discussion update school enrollment to Friday\n"
+        "Done: /discussion done school enrollment\n"
+        "Delete: /discussion delete school enrollment"
     ),
     "homework": (
         "Homework captures assignments, due dates, worksheet photos, and submissions.\n\n"
@@ -1172,6 +1181,7 @@ HELP_TOPIC_ALIASES = {
     "coach": "n4os_advice",
     "decision": "decision",
     "decisions": "decision",
+    "discussion": "discussion",
     "event": "event",
     "experiment": "science_lab",
     "experiments": "science_lab",
@@ -1255,6 +1265,21 @@ def _telegram_how_to_reply(text: str, help_answerer: Any | None = None) -> str |
     slash_help = _telegram_slash_help_reply(text, help_answerer)
     if slash_help is not None:
         return slash_help
+
+    routed_command = parse_explicit_route(text)
+    if routed_command is not None:
+        normalized_body = " ".join(routed_command.body.lower().split())
+        natural_help = not text.lstrip().startswith("/") and re.match(
+            r"^(?:how\s+do\s+i|how\s+to|can\s+i|what\s+command|which\s+command|commands?)\b",
+            normalized_body,
+        ) is not None
+        if (
+            normalized_body in {"help", "-h", "--help", "?"}
+            or normalized_body.startswith("help ")
+            or natural_help
+        ):
+            return _help_topic_reply(routed_command.command)
+        return None
 
     lowered = text.lower().strip()
     explicit_command = re.match(r"^/(?P<command>[a-z][a-z0-9_-]*)", lowered)

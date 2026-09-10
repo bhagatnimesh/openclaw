@@ -33,6 +33,7 @@ try:
     from .note_capture import capture_note
     from .prompts import CLARIFICATION_PROMPT, SYSTEM_PROMPT
     from .routing_contracts import (
+        DISCUSSION_TASK_LIST_NAME,
         OperationResult,
         PreparedCommand,
         ROUTE_REGISTRY,
@@ -63,6 +64,7 @@ except ImportError:
     from note_capture import capture_note
     from prompts import CLARIFICATION_PROMPT, SYSTEM_PROMPT
     from routing_contracts import (
+        DISCUSSION_TASK_LIST_NAME,
         OperationResult,
         PreparedCommand,
         ROUTE_REGISTRY,
@@ -555,6 +557,76 @@ def _prepared_owner(fields: dict[str, Any] | None) -> str | None:
         return None
     owner = str(slots.get("owner") or "").strip().lower()
     return owner if owner in DEFAULT_OWNER_VALUES else None
+
+
+def _prepared_discussion_intent(fields: dict[str, Any] | None) -> dict[str, Any] | None:
+    if (fields or {}).get("decision_source") != "explicit":
+        return None
+    slots = (fields or {}).get("slots")
+    if not isinstance(slots, dict) or slots.get("task_list_name") != DISCUSSION_TASK_LIST_NAME:
+        return None
+    prepared = {
+        "task_list_name": DISCUSSION_TASK_LIST_NAME,
+        "task_list_id_hint": None,
+    }
+    if "title" in slots:
+        for key in ("title", "notes", "due", "metadata", "missing_fields"):
+            if key in slots:
+                prepared[key] = slots[key]
+    elif "update" in slots:
+        prepared["update"] = slots["update"]
+        prepared["query"] = slots.get("query")
+    return prepared
+
+
+def _merge_discussion_intent(
+    intent: dict[str, Any],
+    prepared: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(intent)
+    merged["task_list_name"] = DISCUSSION_TASK_LIST_NAME
+    merged["task_list_id_hint"] = None
+    for key in ("title", "due", "query", "update"):
+        if not merged.get(key) and prepared.get(key):
+            merged[key] = prepared[key]
+
+    prepared_notes = str(prepared.get("notes") or "").strip()
+    semantic_notes = str(merged.get("notes") or "").strip()
+    participant_sections = [
+        section
+        for section in prepared_notes.split("\n\n")
+        if section.lower().startswith("participants:")
+    ]
+    for section in participant_sections:
+        if section not in semantic_notes:
+            semantic_notes = f"{semantic_notes}\n\n{section}" if semantic_notes else section
+    if semantic_notes:
+        merged["notes"] = semantic_notes
+
+    prepared_metadata = prepared.get("metadata")
+    if isinstance(prepared_metadata, dict):
+        metadata = dict(merged.get("metadata") or {})
+        if metadata.get("owner") in {None, "", "unknown"} and prepared_metadata.get("owner"):
+            metadata["owner"] = prepared_metadata["owner"]
+        merged["metadata"] = metadata
+
+    missing_fields = list(merged.get("missing_fields") or [])
+    for field in prepared.get("missing_fields") or []:
+        if field not in missing_fields:
+            missing_fields.append(field)
+    satisfied_fields = {
+        "due": bool(merged.get("due")),
+        "list": True,
+        "query": bool(merged.get("query")),
+        "target": bool(merged.get("query")),
+        "task_list": True,
+        "task_list_name": True,
+        "title": bool(merged.get("title")),
+    }
+    merged["missing_fields"] = [
+        field for field in missing_fields if not satisfied_fields.get(field, False)
+    ]
+    return merged
 
 
 @dataclass
@@ -1437,6 +1509,9 @@ class N4OSClaw:
             if callable(interpret_tasks)
             else module.extract_intent(request, now=reference_time)
         )
+        discussion_intent = _prepared_discussion_intent(prepared_fields)
+        if discussion_intent is not None:
+            intent = _merge_discussion_intent(intent, discussion_intent)
         action = action or intent["intent"]
         if intent.get("intent") != action:
             semantic_destination = {
@@ -1496,6 +1571,8 @@ class N4OSClaw:
                     update_kwargs["task_list_id"] = task_list_id
                 if _supports_keyword(claw.update_task_from_request, "semantic_intent"):
                     update_kwargs["semantic_intent"] = intent
+                if _supports_keyword(claw.update_task_from_request, "enforce_task_list_scope"):
+                    update_kwargs["enforce_task_list_scope"] = discussion_intent is not None
                 return claw.update_task_from_request(request, **update_kwargs)
             else:
                 return claw.assign_owner_from_request(request)
@@ -1505,6 +1582,8 @@ class N4OSClaw:
                 complete_kwargs["task_list_id"] = task_list_id
             if _supports_keyword(claw.complete_task_from_request, "query"):
                 complete_kwargs["query"] = intent.get("query")
+            if _supports_keyword(claw.complete_task_from_request, "enforce_task_list_scope"):
+                complete_kwargs["enforce_task_list_scope"] = discussion_intent is not None
             return claw.complete_task_from_request(request, **complete_kwargs)
         elif action == "delete_task":
             delete_kwargs = {"task_id": task_id}
@@ -1512,6 +1591,8 @@ class N4OSClaw:
                 delete_kwargs["task_list_id"] = task_list_id
             if _supports_keyword(claw.delete_task_from_request, "query"):
                 delete_kwargs["query"] = intent.get("query")
+            if _supports_keyword(claw.delete_task_from_request, "enforce_task_list_scope"):
+                delete_kwargs["enforce_task_list_scope"] = discussion_intent is not None
             return claw.delete_task_from_request(request, **delete_kwargs)
         elif action == "run_assistant_help":
             assistant_kwargs = {"reference_time": reference_time}
